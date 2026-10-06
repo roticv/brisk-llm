@@ -1,0 +1,5 @@
+threads,mb_per_thread,read_gb_per_s
+1,128,4.32
+2,128,4.27
+3,128,4.07
+4,128,3.99
