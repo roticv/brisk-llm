@@ -11,7 +11,8 @@ namespace brisk {
 constexpr std::size_t kBlockSize = 32;  // weights per block for Q4_0 and Q8_0
 
 // Storage formats of weight matrices that the engine can multiply by.
-enum class WeightFormat { F32, Q4_0, Q4_1, Q4_K, Q6_K };
+// Q4_0x4 is Q4_0 repacked at load time (see BlockQ4_0x4); it never appears in files.
+enum class WeightFormat { F32, Q4_0, Q4_1, Q4_K, Q6_K, Q4_0x4 };
 
 // Weights per block and bytes per block of a quantised format.
 std::size_t block_elements(WeightFormat format);
@@ -26,6 +27,22 @@ struct BlockQ4_0 {
     std::uint8_t qs[kBlockSize / 2];
 };
 static_assert(sizeof(BlockQ4_0) == 18);
+
+// One block from each of four consecutive rows, interleaved for the NEON
+// kernels: 16-byte vector k (k = 0..3) covers rows 2(k/2) and 2(k/2)+1. Its
+// bytes 0-7 hold row 2(k/2)'s elements 8(k%2)..+7 in the low nibbles and
+// elements 16+8(k%2)..+7 in the high nibbles; bytes 8-15 the same for the
+// next row. So one load, one AND and one shift give two vectors each holding
+// [8 elements of row a | 8 elements of row b], the shape smmla and sdot want.
+struct BlockQ4_0x4 {
+    std::uint16_t d[4];
+    std::uint8_t qs[64];
+};
+static_assert(sizeof(BlockQ4_0x4) == 72);
+
+// Repacks `rows` (a multiple of 4) rows of `blocks` Q4_0 blocks each.
+void repack_q4_0x4(const BlockQ4_0* in, std::size_t rows, std::size_t blocks, BlockQ4_0x4* out);
+void dequantize_q4_0x4_row(const BlockQ4_0x4* group, std::size_t row_in_group, float* out, std::size_t count);
 
 // 32 values as signed 8-bit with a shared half-precision scale: value = q * d.
 // Activations are quantised to this format before the integer dot products.
@@ -87,7 +104,9 @@ void dequantize_q6_k(const BlockQ6_K* blocks, float* out, std::size_t count);
 
 template <typename Block>
 constexpr std::size_t block_elements_of() {
-    return sizeof(Block) == sizeof(BlockQ4_0) || sizeof(Block) == sizeof(BlockQ4_1) ? kBlockSize : kSuperBlockSize;
+    return sizeof(Block) == sizeof(BlockQ4_0) || sizeof(Block) == sizeof(BlockQ4_1) || sizeof(Block) == sizeof(BlockQ4_0x4)
+               ? kBlockSize
+               : kSuperBlockSize;
 }
 
 // Decodes the 256 6-bit values of a Q6_K block, offset removed, in weight order.
@@ -95,6 +114,8 @@ void unpack_q6_k(const BlockQ6_K& block, std::int8_t* q);
 
 // Dot products of one weight row with quantised activations, over `blocks` blocks.
 float dot_q4_0_q8_0(const BlockQ4_0* w, const BlockQ8_0* x, std::size_t blocks);
+// All four rows of a packed group at once: out[0..3].
+void dot_q4_0x4_q8_0(const BlockQ4_0x4* w, const BlockQ8_0* x, std::size_t blocks, float out[4]);
 float dot_q4_1_q8_0(const BlockQ4_1* w, const BlockQ8_0* x, std::size_t blocks);
 float dot_q4_k_q8_k(const BlockQ4_K* w, const BlockQ8_K* x, std::size_t blocks);
 float dot_q6_k_q8_k(const BlockQ6_K* w, const BlockQ8_K* x, std::size_t blocks);

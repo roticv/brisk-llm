@@ -2,6 +2,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <fstream>
@@ -205,6 +206,12 @@ int cmd_generate(const GenerateOptions& options) {
         if (generated.size() < options.max_tokens) logits = session.eval(next);
     }
     const double generate_seconds = seconds_since(generate_start);
+
+    if (std::getenv("BRISK_PROFILE") != nullptr) {
+        const brisk::Session::Profile& p = session.profile();
+        std::fprintf(stderr, "profile: matmul %.2f s | quantize %.2f s | attention %.2f s | norm+rope %.2f s | activation %.2f s\n",
+                     p.matmul - p.quantize, p.quantize, p.attention, p.norm_rope, p.activation);
+    }
 
     if (options.print_ids) print_ids(generated);
     else std::printf("\n");

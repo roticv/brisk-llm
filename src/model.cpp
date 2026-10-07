@@ -1,8 +1,10 @@
 #include "model.h"
 
 #include "kernels.h"
+#include "kernels_f32.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <optional>
@@ -22,23 +24,8 @@ float bfloat_to_float(std::uint16_t b) {
     return out;
 }
 
-// Independent partial sums let the compiler vectorise the loop without
-// needing permission to reorder floating-point additions.
-float dot(const float* a, const float* b, std::size_t n) {
-    constexpr std::size_t kLanes = 16;
-    float lanes[kLanes] = {};
-    std::size_t i = 0;
-    for (; i + kLanes <= n; i += kLanes) {
-        for (std::size_t j = 0; j < kLanes; ++j) lanes[j] += a[i + j] * b[i + j];
-    }
-    float sum = 0.0f;
-    for (; i < n; ++i) sum += a[i] * b[i];
-    for (const float lane : lanes) sum += lane;
-    return sum;
-}
-
 void embedding_row(const Matrix& m, std::size_t r, std::span<float> out) {
-    const std::byte* row = m.format == WeightFormat::F32 ? nullptr : m.row(r);
+    const std::byte* row = m.format == WeightFormat::F32 || m.format == WeightFormat::Q4_0x4 ? nullptr : m.row(r);
     switch (m.format) {
         case WeightFormat::F32: {
             const auto f32 = m.f32_row(r);
@@ -46,6 +33,10 @@ void embedding_row(const Matrix& m, std::size_t r, std::span<float> out) {
             break;
         }
         case WeightFormat::Q4_0: dequantize_q4_0(reinterpret_cast<const BlockQ4_0*>(row), out.data(), m.cols); break;
+        case WeightFormat::Q4_0x4:
+            dequantize_q4_0x4_row(reinterpret_cast<const BlockQ4_0x4*>(m.bytes.data() + (r / 4) * 4 * m.row_bytes()),
+                                  r % 4, out.data(), m.cols);
+            break;
         case WeightFormat::Q4_1: dequantize_q4_1(reinterpret_cast<const BlockQ4_1*>(row), out.data(), m.cols); break;
         case WeightFormat::Q4_K: dequantize_q4_k(reinterpret_cast<const BlockQ4_K*>(row), out.data(), m.cols); break;
         case WeightFormat::Q6_K: dequantize_q6_k(reinterpret_cast<const BlockQ6_K*>(row), out.data(), m.cols); break;
@@ -83,17 +74,6 @@ void apply_rope(std::span<float> head, std::span<const float> rope) {
         head[i] = x0 * c - x1 * s;
         head[i + half] = x0 * s + x1 * c;
     }
-}
-
-void softmax(std::span<float> x) {
-    const float max = *std::max_element(x.begin(), x.end());
-    double sum = 0.0;
-    for (float& v : x) {
-        v = std::exp(v - max);
-        sum += v;
-    }
-    const float scale = static_cast<float>(1.0 / sum);
-    for (float& v : x) v *= scale;
 }
 
 float silu(float x) { return x / (1.0f + std::exp(-x)); }
@@ -137,7 +117,7 @@ Model::Model(const GgufFile& file) {
     // Qwen3 sets the head size explicitly; it is not always embedding_dim / head_count.
     config_.head_dim = file.get<std::uint32_t>(prefix + "attention.key_length")
                            .value_or(config_.embedding_dim / config_.head_count);
-    if (config_.head_dim == 0 || config_.head_dim % 2 != 0) fail("head size must be even and non-zero");
+    if (config_.head_dim == 0 || config_.head_dim % 32 != 0) fail("head size must be a non-zero multiple of 32");
     if (file.get<std::uint32_t>(prefix + "attention.value_length").value_or(config_.head_dim) != config_.head_dim) {
         fail("key and value head sizes differ");
     }
@@ -230,6 +210,15 @@ Matrix Model::load_matrix(const GgufFile& file, std::string_view name, std::size
             fail("tensor '" + std::string(name) + "' has unexpected quantised data");
         }
         m.bytes = info->data;
+        if (m.format == WeightFormat::Q4_0 && rows % 4 == 0 && kernels::prefers_q4_0x4()) {
+            // Interleave four rows per block for the NEON matrix kernels.
+            const std::size_t blocks = cols / kBlockSize;
+            std::vector<std::byte>& packed = packed_.emplace_back(rows / 4 * blocks * sizeof(BlockQ4_0x4));
+            repack_q4_0x4(reinterpret_cast<const BlockQ4_0*>(info->data.data()), rows, blocks,
+                          reinterpret_cast<BlockQ4_0x4*>(packed.data()));
+            m.format = WeightFormat::Q4_0x4;
+            m.bytes = packed;
+        }
     } else {
         m.f32 = load(file, name, rows * cols);
     }
@@ -239,18 +228,34 @@ Matrix Model::load_matrix(const GgufFile& file, std::string_view name, std::size
 // The most tokens processed in one pass; bounds the scratch memory.
 constexpr std::size_t kMaxBatch = 256;
 
+// Adds the time from its construction to its destruction to a profile counter.
+class Timed {
+public:
+    explicit Timed(double& counter) : counter_(counter), start_(std::chrono::steady_clock::now()) {}
+    ~Timed() { counter_ += std::chrono::duration<double>(std::chrono::steady_clock::now() - start_).count(); }
+
+private:
+    double& counter_;
+    std::chrono::steady_clock::time_point start_;
+};
+
 void Session::multiply(const Matrix& m, const float* x, std::size_t n, float* out) {
     // Enough tasks that the threads stay balanced, but each large enough that
     // handing it out costs nothing next to doing it.
-    const std::size_t chunk = std::clamp<std::size_t>(m.rows / (pool_.size() * 8), 16, 256);
+    // Chunks are multiples of 4 rows so the grouped Q4_0x4 layout never splits a group.
+    // Single-row passes stream the weights, so big chunks keep the streams long;
+    // batched passes are compute-bound, so smaller chunks balance the threads.
+    const std::size_t chunk = (n == 1 ? std::clamp<std::size_t>(m.rows / (pool_.size() * 8), 16, 256)
+                                      : std::clamp<std::size_t>(m.rows / (pool_.size() * 4), 4, 64)) / 4 * 4;
     const std::size_t tasks = (m.rows + chunk - 1) / chunk;
 
+    const Timed timed(profile_.matmul);
     if (m.format == WeightFormat::F32) {
         pool_.run(tasks, [&](std::size_t task) {
             const std::size_t end = std::min(m.rows, (task + 1) * chunk);
             for (std::size_t r = task * chunk; r < end; ++r) {
                 for (std::size_t t = 0; t < n; ++t) {
-                    out[t * m.rows + r] = dot(m.f32.data() + r * m.cols, x + t * m.cols, m.cols);
+                    out[t * m.rows + r] = kernels::dot_f32(m.f32.data() + r * m.cols, x + t * m.cols, m.cols);
                 }
             }
         });
@@ -260,6 +265,7 @@ void Session::multiply(const Matrix& m, const float* x, std::size_t n, float* ou
     // Quantise the activations to the format the weights' kernels take.
     const std::size_t blocks = m.cols / block_elements(m.format);
     const void* activations = nullptr;
+    const auto quantize_start = std::chrono::steady_clock::now();
     if (takes_q8_k(m.format)) {
         q8_k_.resize(n * blocks);
         pool_.run(n, [&](std::size_t t) { quantize_q8_k(x + t * m.cols, q8_k_.data() + t * blocks, m.cols); });
@@ -270,7 +276,13 @@ void Session::multiply(const Matrix& m, const float* x, std::size_t n, float* ou
         activations = q8_0_.data();
     }
 
+    profile_.quantize += std::chrono::duration<double>(std::chrono::steady_clock::now() - quantize_start).count();
     const kernels::KernelSet k = kernels::kernels_for(m.format);
+    if (n > 1 && k.prepare != nullptr) {
+        prepared_.resize(k.prepared_bytes(n, blocks));
+        k.prepare(activations, n, blocks, prepared_.data());
+        activations = prepared_.data();
+    }
     if (n == 1) {
         pool_.run(tasks, [&](std::size_t task) {
             const std::size_t begin = task * chunk;
@@ -283,7 +295,7 @@ void Session::multiply(const Matrix& m, const float* x, std::size_t n, float* ou
         const std::size_t begin = task * chunk;
         const std::size_t end = std::min(m.rows, begin + chunk);
         // The kernel writes a dense (n x rows-in-chunk) block; scatter it into out's stride.
-        float local[kMaxBatch * 256];
+        float local[kMaxBatch * 64];
         k.matmul(m.row(begin), end - begin, m.cols, activations, n, local);
         for (std::size_t t = 0; t < n; ++t) {
             std::copy_n(local + t * (end - begin), end - begin, out + t * m.rows + begin);
@@ -390,13 +402,17 @@ void Session::eval_batch(std::span<const Token> tokens, bool all_logits) {
         float* new_keys = keys.data() + position_ * kv_dim;  // this batch's rows, contiguous
         float* new_values = values.data() + position_ * kv_dim;
 
-        pool_.run(n, [&](std::size_t t) {
-            rms_norm(rows(hidden_, t, embd), layer.attention_norm, c.rms_epsilon, rows(normed_, t, embd));
-        });
+        {
+            const Timed timed(profile_.norm_rope);
+            pool_.run(n, [&](std::size_t t) {
+                rms_norm(rows(hidden_, t, embd), layer.attention_norm, c.rms_epsilon, rows(normed_, t, embd));
+            });
+        }
         multiply(layer.query, normed_.data(), n, query_.data());
         multiply(layer.key, normed_.data(), n, new_keys);
         multiply(layer.value, normed_.data(), n, new_values);
 
+        Timed* phase = new Timed(profile_.norm_rope);
         pool_.run(n, [&](std::size_t t) {
             const std::span<const float> rope(rope_.data() + t * head_dim, head_dim);
             for (std::size_t h = 0; h < c.head_count; ++h) {
@@ -411,57 +427,76 @@ void Session::eval_batch(std::span<const Token> tokens, bool all_logits) {
             }
         });
 
+        delete phase;
+        phase = new Timed(profile_.attention);
         // Causal attention: token t of the batch sees positions 0 to position_ + t.
-        // One task covers the query heads that share a key/value head, so each
-        // cached row is read once for all of them.
-        pool_.run(n * c.kv_head_count, [&](std::size_t task) {
-            const std::size_t t = task / c.kv_head_count;
+        // One task covers a key/value head and up to kTokenTile consecutive
+        // tokens, so each cached row is read once for all their query heads.
+        constexpr std::size_t kTokenTile = 4;
+        const std::size_t token_tiles = (n + kTokenTile - 1) / kTokenTile;
+        pool_.run(token_tiles * c.kv_head_count, [&](std::size_t task) {
+            const std::size_t tile = task / c.kv_head_count;
             const std::size_t kv = task % c.kv_head_count;
-            const std::size_t visible = position_ + t + 1;
+            const std::size_t t0 = tile * kTokenTile;
+            const std::size_t t1 = std::min(n, t0 + kTokenTile);
             const std::size_t kv_offset = kv * head_dim;
-            const float* q = query_.data() + t * query_dim + kv * heads_per_kv * head_dim;
-            float* scores = scores_.data() + task * heads_per_kv * length;  // one row per query head
+            const std::size_t visible_last = position_ + t1;  // positions seen by the tile's last token
+            // Scores: one row per (token, query head) of the tile.
+            float* scores = scores_.data() + (t0 * c.head_count + kv * heads_per_kv) * length;
+            auto score_row = [&](std::size_t t, std::size_t g) {
+                return scores + ((t - t0) * c.head_count + g) * length;
+            };
 
-            for (std::size_t p = 0; p < visible; ++p) {
+            for (std::size_t p = 0; p < visible_last; ++p) {
                 const float* k = keys.data() + p * kv_dim + kv_offset;
-                for (std::size_t g = 0; g < heads_per_kv; ++g) {
-                    scores[g * length + p] = dot(q + g * head_dim, k, head_dim) * attention_scale;
+                for (std::size_t t = t0; t < t1; ++t) {
+                    if (p > position_ + t) continue;  // later tokens of the tile see further than this one
+                    const float* q = query_.data() + t * query_dim + kv * heads_per_kv * head_dim;
+                    for (std::size_t g = 0; g < heads_per_kv; ++g) {
+                        score_row(t, g)[p] = kernels::dot_f32(q + g * head_dim, k, head_dim) * attention_scale;
+                    }
                 }
             }
-            for (std::size_t g = 0; g < heads_per_kv; ++g) softmax(std::span<float>(scores + g * length, visible));
-
-            float* out = attended_.data() + t * query_dim + kv * heads_per_kv * head_dim;
-            std::fill_n(out, heads_per_kv * head_dim, 0.0f);
-            for (std::size_t p = 0; p < visible; ++p) {
-                const float* v = values.data() + p * kv_dim + kv_offset;
+            for (std::size_t t = t0; t < t1; ++t) {
+                const std::size_t visible = position_ + t + 1;
                 for (std::size_t g = 0; g < heads_per_kv; ++g) {
-                    const float weight = scores[g * length + p];
-                    float* o = out + g * head_dim;
-                    for (std::size_t i = 0; i < head_dim; ++i) o[i] += weight * v[i];
+                    kernels::softmax_f32(std::span<float>(score_row(t, g), visible));
                 }
+                kernels::weighted_sum_f32(values.data() + kv_offset, kv_dim, visible, score_row(t, 0), length,
+                                          heads_per_kv, head_dim,
+                                          attended_.data() + t * query_dim + kv * heads_per_kv * head_dim);
             }
         });
-
+        delete phase;
         multiply(layer.attention_output, attended_.data(), n, projected_.data());
-        pool_.run(n, [&](std::size_t t) {
-            float* h = hidden_.data() + t * embd;
-            const float* p = projected_.data() + t * embd;
-            for (std::size_t i = 0; i < embd; ++i) h[i] += p[i];
-            rms_norm(rows(hidden_, t, embd), layer.feed_forward_norm, c.rms_epsilon, rows(normed_, t, embd));
-        });
+        {
+            const Timed timed(profile_.norm_rope);
+            pool_.run(n, [&](std::size_t t) {
+                float* h = hidden_.data() + t * embd;
+                const float* p = projected_.data() + t * embd;
+                for (std::size_t i = 0; i < embd; ++i) h[i] += p[i];
+                rms_norm(rows(hidden_, t, embd), layer.feed_forward_norm, c.rms_epsilon, rows(normed_, t, embd));
+            });
+        }
         multiply(layer.gate, normed_.data(), n, gate_.data());
         multiply(layer.up, normed_.data(), n, up_.data());
-        pool_.run(n, [&](std::size_t t) {
-            float* g = gate_.data() + t * c.feed_forward_dim;
-            const float* u = up_.data() + t * c.feed_forward_dim;
-            for (std::size_t i = 0; i < c.feed_forward_dim; ++i) g[i] = silu(g[i]) * u[i];
-        });
+        {
+            const Timed timed(profile_.activation);
+            pool_.run(n, [&](std::size_t t) {
+                float* g = gate_.data() + t * c.feed_forward_dim;
+                const float* u = up_.data() + t * c.feed_forward_dim;
+                for (std::size_t i = 0; i < c.feed_forward_dim; ++i) g[i] = silu(g[i]) * u[i];
+            });
+        }
         multiply(layer.down, gate_.data(), n, projected_.data());
-        pool_.run(n, [&](std::size_t t) {
-            float* h = hidden_.data() + t * embd;
-            const float* p = projected_.data() + t * embd;
-            for (std::size_t i = 0; i < embd; ++i) h[i] += p[i];
-        });
+        {
+            const Timed timed(profile_.norm_rope);
+            pool_.run(n, [&](std::size_t t) {
+                float* h = hidden_.data() + t * embd;
+                const float* p = projected_.data() + t * embd;
+                for (std::size_t i = 0; i < embd; ++i) h[i] += p[i];
+            });
+        }
     }
 
     if (all_logits) {

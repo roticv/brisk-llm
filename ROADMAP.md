@@ -48,14 +48,14 @@ Rules: same model file, same prompt, same thread count as the baseline. On the A
 - Tokenizer matches llama.cpp on 2,060 test strings; greedy output matches token for token on eight prompts with logits within 0.04; float32 perplexity matches to four decimals.
 - Not done: cross-compilation to the Pi from the Mac. The Pi builds natively with its own GCC for now.
 
-## Phase 2: Reach llama.cpp on 4-bit models — done on the Pi, open on the Mac
+## Phase 2: Reach llama.cpp on 4-bit models — done for Q4_0
 
 - Done: Q4_0, Q4_1, Q4_K and Q6_K weights with 8-bit activations; NEON kernels (baseline and `dotprod`) chosen at startup; thread pool with dynamic chunks; batched prompt processing; GGUF parser fuzzer (`tests/gguf_fuzz.cpp`); `brisk perplexity` and `tests/compare_perplexity.py` as the correctness check for quantised models (per-logit comparison is chaotic for 8-bit arithmetic, so perplexity is the yardstick: brisk matches llama.cpp within about 1%).
 - Pi results: generation at or slightly above llama.cpp on every file; prompt processing within 12% on the 0.6B and 5% on the 1.7B (`bench/RESULTS.md`).
-- Mac results (`bench/RESULTS.md`): generation 10-12% behind llama.cpp's CPU path at 4 threads, ahead of it at 10 threads (1.7B: 73 vs 66-71); prompt processing 2.3-3.4x behind, because llama.cpp uses `i8mm` matrix kernels and an interleaved weight layout that brisk lacks.
-- Not done: `i8mm` (smmla) batched kernels and a row-interleaved weight layout for the M4, needed to close the prompt gap and the last 10% of generation; attention over a long context is still scalar code and costs about 30% of generation speed after a 500-token prompt.
+- Mac results (`bench/RESULTS.md`): with `i8mm` (smmla) batched kernels, a four-row interleaved Q4_0 layout repacked at load, and NEON attention, Qwen3-1.7B generation is 7% behind llama.cpp's CPU path at 4 threads and 21% ahead at 10 (80 vs 66, also ahead of Metal's 69); prompt processing is 30% behind at 4 threads and 16% behind at 10.
+- Not done: the K-quants (Q4_K, Q6_K) have no batched tiles or interleaved layout, so Q4_K_M files trail llama.cpp on the Mac; per-token thread-pool synchronisation (about 360 dispatches per token) is the next generation overhead.
 
-**Done when:** Qwen3-1.7B generation is within 10% of llama.cpp on both machines and prompt processing is within 25%, with perplexity matching. On the Mac, generation with all 10 cores should beat llama.cpp's 4-core number. Met on the Pi; on the Mac the 10-thread generation target is met but the 4-thread and prompt targets are not.
+**Done when:** Qwen3-1.7B generation is within 10% of llama.cpp on both machines and prompt processing is within 25%, with perplexity matching. On the Mac, generation with all 10 cores should beat llama.cpp's 4-core number. Met on the Pi and, for Q4_0, on the Mac except prompt processing at 4 threads (30% behind).
 
 ## Phase 3: Fewer bytes per token
 

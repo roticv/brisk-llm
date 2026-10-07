@@ -23,14 +23,24 @@ using Matvec = void (*)(const void* w, std::size_t rows, std::size_t cols, const
 // this is compute-bound where the single-row version is memory-bound.
 using Matmul = void (*)(const void* w, std::size_t rows, std::size_t cols, const void* x, std::size_t n, float* out);
 
+// Some batched kernels want the activations rearranged first. `prepare`
+// writes `prepared_bytes(n, blocks)` bytes that `matmul` then takes as `x`
+// in place of the raw activation rows; both are null when not needed.
+using Prepare = void (*)(const void* x, std::size_t n, std::size_t blocks, void* out);
+using PreparedBytes = std::size_t (*)(std::size_t n, std::size_t blocks);
+
 struct KernelSet {
     Matvec matvec;
     Matmul matmul;
+    Prepare prepare = nullptr;
+    PreparedBytes prepared_bytes = nullptr;
 };
 
 // The best kernels for `format` on this CPU. Throws std::runtime_error for F32.
 KernelSet kernels_for(WeightFormat format);
-std::string_view kernel_set_name();  // "generic", "neon" or "dotprod"
+std::string_view kernel_set_name();  // "generic", "neon", "dotprod" or "i8mm"
+// True when Q4_0 matrices should be repacked to Q4_0x4 at load for this CPU.
+bool prefers_q4_0x4();
 
 // Implementations, for tests and benchmarks. Generic ones exist for every
 // format on every platform; NEON ones only where listed.
@@ -40,6 +50,11 @@ void matvec_q4_0_neon(const void* w, std::size_t rows, std::size_t cols, const v
 void matmul_q4_0_neon(const void* w, std::size_t rows, std::size_t cols, const void* x, std::size_t n, float* out);
 void matvec_q4_0_dotprod(const void* w, std::size_t rows, std::size_t cols, const void* x, float* out);
 void matmul_q4_0_dotprod(const void* w, std::size_t rows, std::size_t cols, const void* x, std::size_t n, float* out);
+void matmul_q4_0_i8mm(const void* w, std::size_t rows, std::size_t cols, const void* x, std::size_t n, float* out);
+void matvec_q4_0x4_dotprod(const void* w, std::size_t rows, std::size_t cols, const void* x, float* out);
+void matmul_q4_0x4_i8mm(const void* w, std::size_t rows, std::size_t cols, const void* x, std::size_t n, float* out);
+void prepare_q4_0x4_i8mm(const void* x, std::size_t n, std::size_t blocks, void* out);
+std::size_t prepared_bytes_q4_0x4_i8mm(std::size_t n, std::size_t blocks);
 void matvec_q4_k_neon(const void* w, std::size_t rows, std::size_t cols, const void* x, float* out);
 void matmul_q4_k_neon(const void* w, std::size_t rows, std::size_t cols, const void* x, std::size_t n, float* out);
 void matvec_q4_k_dotprod(const void* w, std::size_t rows, std::size_t cols, const void* x, float* out);

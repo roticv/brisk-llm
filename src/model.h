@@ -38,6 +38,7 @@ struct Matrix {
 
     std::size_t row_bytes() const { return cols / block_elements(format) * block_bytes(format); }
     std::span<const float> f32_row(std::size_t r) const { return f32.subspan(r * cols, cols); }
+    // Start of row r's data; for Q4_0x4, r must be a multiple of 4 (rows are grouped).
     const std::byte* row(std::size_t r) const { return bytes.data() + r * row_bytes(); }
 };
 
@@ -82,6 +83,7 @@ private:
     std::span<const float> output_norm_;
     std::vector<Layer> layers_;
     std::deque<std::vector<float>> owned_;  // widened tensors; deque keeps them at stable addresses
+    std::deque<std::vector<std::byte>> packed_;  // repacked quantised tensors
 };
 
 // One sequence being generated: the key/value cache plus scratch space.
@@ -105,6 +107,12 @@ public:
 
     std::size_t position() const { return position_; }
 
+    // Seconds spent in each phase of the forward pass so far, for profiling.
+    struct Profile {
+        double matmul = 0, quantize = 0, attention = 0, norm_rope = 0, activation = 0;
+    };
+    const Profile& profile() const { return profile_; }
+
 private:
     // Processes up to kMaxBatch tokens starting at position_. With
     // `all_logits` set, logits_ receives one row per token instead of only
@@ -116,6 +124,7 @@ private:
     const Model& model_;
     ThreadPool pool_;
     std::size_t position_ = 0;
+    Profile profile_;
 
     // Per layer, one entry per position: kv_head_count * head_dim floats.
     std::vector<std::vector<float>> key_cache_;
@@ -134,6 +143,7 @@ private:
     std::vector<float> logits_;
     std::vector<BlockQ8_0> q8_0_;  // activations quantised for the 32-block formats
     std::vector<BlockQ8_K> q8_k_;  // and for the K-quants
+    std::vector<std::byte> prepared_;  // activations rearranged for a batched kernel
 };
 
 }  // namespace brisk

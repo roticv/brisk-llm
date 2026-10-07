@@ -25,6 +25,7 @@ add_library(brisk
     src/cpu_features.cpp
     src/gguf.cpp
     src/kernels.cpp
+    src/kernels_f32.cpp
     src/mapped_file.cpp
     src/model.cpp
     src/quant.cpp
@@ -36,8 +37,9 @@ add_library(brisk
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")
     # Each instruction-set variant lives in its own file built with its own
     # flags; the right one is picked at runtime (src/kernels.cpp).
-    target_sources(brisk PRIVATE src/kernels_neon.cpp src/kernels_dotprod.cpp)
+    target_sources(brisk PRIVATE src/kernels_neon.cpp src/kernels_dotprod.cpp src/kernels_i8mm.cpp)
     set_source_files_properties(src/kernels_dotprod.cpp PROPERTIES COMPILE_OPTIONS "-march=armv8.2-a+dotprod")
+    set_source_files_properties(src/kernels_i8mm.cpp PROPERTIES COMPILE_OPTIONS "-march=armv8.2-a+dotprod+i8mm")
 endif()
 target_include_directories(brisk PUBLIC src)
 target_link_libraries(brisk PUBLIC Threads::Threads)
