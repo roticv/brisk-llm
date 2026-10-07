@@ -61,7 +61,7 @@ std::uint32_t ascii_lower(std::uint32_t cp) { return cp >= 'A' && cp <= 'Z' ? cp
 
 // This mirrors llama.cpp's hand-written matcher for the same regex, including
 // its treatment of edge cases, so both engines split text identically.
-std::vector<std::string_view> pretokenize_qwen2(std::string_view text) {
+std::vector<std::string_view> pretokenize(std::string_view text, PreTokenizer pre) {
     constexpr std::uint32_t kOutOfRange = 0xFFFFFFFF;
     struct Flags {
         bool present = false;
@@ -125,9 +125,12 @@ std::vector<std::string_view> pretokenize_qwen2(std::string_view text) {
             continue;
         }
 
-        // \p{N}
+        // \p{N} (Qwen2) or \p{N}{1,3} (Llama 3)
         if (flags.number) {
             ++pos;
+            if (pre == PreTokenizer::Llama3) {
+                while (flags_at(pos).number && pos - begin < 3) ++pos;
+            }
             emit(begin, pos);
             continue;
         }
@@ -178,7 +181,9 @@ Tokenizer::Tokenizer(const GgufFile& file) {
     const auto model = file.get<std::string_view>("tokenizer.ggml.model");
     const auto pre = file.get<std::string_view>("tokenizer.ggml.pre");
     if (model != "gpt2") fail("unsupported tokenizer model '" + std::string(model.value_or("(none)")) + "'");
-    if (pre != "qwen2") fail("unsupported pre-tokenizer '" + std::string(pre.value_or("(none)")) + "'");
+    if (pre == "qwen2") pre_ = PreTokenizer::Qwen2;
+    else if (pre == "llama-bpe") pre_ = PreTokenizer::Llama3;
+    else fail("unsupported pre-tokenizer '" + std::string(pre.value_or("(none)")) + "'");
 
     const auto tokens = file.get<GgufArray>("tokenizer.ggml.tokens");
     if (!tokens) fail("missing tokenizer.ggml.tokens");
@@ -238,7 +243,13 @@ Tokenizer::Tokenizer(const GgufFile& file) {
     };
     if (const auto eos = file.get<std::uint32_t>("tokenizer.ggml.eos_token_id")) add_end_token(static_cast<Token>(*eos));
     for (const Special& special : specials_) {
-        if (special.text == "<|endoftext|>" || special.text == "<|im_end|>") add_end_token(special.id);
+        if (special.text == "<|endoftext|>" || special.text == "<|im_end|>" || special.text == "<|eot_id|>" ||
+            special.text == "<|end_of_text|>") {
+            add_end_token(special.id);
+        }
+    }
+    if (file.get<bool>("tokenizer.ggml.add_bos_token").value_or(false)) {
+        if (const auto bos = file.get<std::uint32_t>("tokenizer.ggml.bos_token_id")) bos_ = static_cast<Token>(*bos);
     }
 }
 
@@ -340,7 +351,7 @@ std::vector<Token> Tokenizer::encode(std::string_view text, bool parse_special) 
             out.push_back(fragment.token);
             continue;
         }
-        for (const std::string_view word : pretokenize_qwen2(fragment.text)) encode_word(word, out);
+        for (const std::string_view word : pretokenize(fragment.text, pre_)) encode_word(word, out);
     }
     return out;
 }

@@ -236,6 +236,55 @@ inline void dot_rows_q4_k(const BlockQ4_K* w, const BlockQ8_K* const* xs, std::s
     for (std::size_t t = 0; t < n; ++t) out[t] = sums[t];
 }
 
+// Decodes a TQ2_0 block into 16 vectors of 16 values 0..2 in weight order.
+inline void unpack_tq2_0(const BlockTQ2_0& block, int8x16_t q[16]) {
+    const uint8x16_t mask = vdupq_n_u8(3);
+    for (int j = 0; j < 2; ++j) {
+        const uint8x16_t v0 = vld1q_u8(block.qs + 32 * j);
+        const uint8x16_t v1 = vld1q_u8(block.qs + 32 * j + 16);
+        q[8 * j + 0] = vreinterpretq_s8_u8(vandq_u8(v0, mask));
+        q[8 * j + 1] = vreinterpretq_s8_u8(vandq_u8(v1, mask));
+        q[8 * j + 2] = vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(v0, 2), mask));
+        q[8 * j + 3] = vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(v1, 2), mask));
+        q[8 * j + 4] = vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(v0, 4), mask));
+        q[8 * j + 5] = vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(v1, 4), mask));
+        q[8 * j + 6] = vreinterpretq_s8_u8(vshrq_n_u8(v0, 6));
+        q[8 * j + 7] = vreinterpretq_s8_u8(vshrq_n_u8(v1, 6));
+    }
+}
+
+// Weight row of TQ2_0 blocks against up to 4 activation rows.
+// Dot16Acc(acc, w, x) adds the 16 products of w and x into acc's four lanes.
+template <typename Dot16Acc>
+inline void dot_rows_tq2_0(const BlockTQ2_0* w, const BlockQ8_K* const* xs, std::size_t n, std::size_t blocks,
+                           float* out, Dot16Acc dot16) {
+    float sums[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    for (std::size_t b = 0; b < blocks; ++b) {
+        int8x16_t q[16];
+        unpack_tq2_0(w[b], q);
+        const float d = vgetq_lane_f32(half4_to_float(w[b].d), 0);
+        for (std::size_t t = 0; t < n; ++t) {
+            const BlockQ8_K& x = xs[t][b];
+            int32x4_t acc0 = vdupq_n_s32(0);
+            int32x4_t acc1 = vdupq_n_s32(0);
+            int32x4_t acc2 = vdupq_n_s32(0);
+            int32x4_t acc3 = vdupq_n_s32(0);
+            for (int g = 0; g < 16; g += 4) {
+                acc0 = dot16(acc0, q[g], vld1q_s8(x.qs + 16 * g));
+                acc1 = dot16(acc1, q[g + 1], vld1q_s8(x.qs + 16 * g + 16));
+                acc2 = dot16(acc2, q[g + 2], vld1q_s8(x.qs + 16 * g + 32));
+                acc3 = dot16(acc3, q[g + 3], vld1q_s8(x.qs + 16 * g + 48));
+            }
+            acc0 = vaddq_s32(vaddq_s32(acc0, acc1), vaddq_s32(acc2, acc3));
+            // sum((q - 1) x) = sum(q x) - sum(x)
+            const int16x8_t bsums = vaddq_s16(vld1q_s16(x.bsums), vld1q_s16(x.bsums + 8));
+            const std::int32_t xsum = vaddlvq_s16(bsums);
+            sums[t] += x.d * d * static_cast<float>(vaddvq_s32(acc0) - xsum);
+        }
+    }
+    for (std::size_t t = 0; t < n; ++t) out[t] = sums[t];
+}
+
 // Generic driver for the K-quant kernels: `dot_rows(w_row, xs, n, blocks, out)`.
 template <typename Block, typename DotRows>
 inline void matmul_k(const Block* w, std::size_t rows, std::size_t cols, const BlockQ8_K* x, std::size_t n, float* out,

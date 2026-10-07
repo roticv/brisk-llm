@@ -39,7 +39,8 @@ struct KernelSet {
 // The best kernels for `format` on this CPU. Throws std::runtime_error for F32.
 KernelSet kernels_for(WeightFormat format);
 std::string_view kernel_set_name();  // "generic", "neon", "dotprod" or "i8mm"
-// True when Q4_0 matrices should be repacked to Q4_0x4 at load for this CPU.
+// True when Q4_0 (TQ2_0) matrices should be repacked to the four-row
+// interleaved layout at load for this CPU.
 bool prefers_q4_0x4();
 
 // Implementations, for tests and benchmarks. Generic ones exist for every
@@ -51,6 +52,10 @@ void matmul_q4_0_neon(const void* w, std::size_t rows, std::size_t cols, const v
 void matvec_q4_0_dotprod(const void* w, std::size_t rows, std::size_t cols, const void* x, float* out);
 void matmul_q4_0_dotprod(const void* w, std::size_t rows, std::size_t cols, const void* x, std::size_t n, float* out);
 void matmul_q4_0_i8mm(const void* w, std::size_t rows, std::size_t cols, const void* x, std::size_t n, float* out);
+void matvec_tq2_0x4_dotprod(const void* w, std::size_t rows, std::size_t cols, const void* x, float* out);
+void matmul_tq2_0x4_i8mm(const void* w, std::size_t rows, std::size_t cols, const void* x, std::size_t n, float* out);
+void prepare_tq2_0x4_i8mm(const void* x, std::size_t n, std::size_t blocks, void* out);
+std::size_t prepared_bytes_tq2_0x4_i8mm(std::size_t n, std::size_t blocks);
 void matvec_q4_0x4_dotprod(const void* w, std::size_t rows, std::size_t cols, const void* x, float* out);
 void matmul_q4_0x4_i8mm(const void* w, std::size_t rows, std::size_t cols, const void* x, std::size_t n, float* out);
 void prepare_q4_0x4_i8mm(const void* x, std::size_t n, std::size_t blocks, void* out);
@@ -59,6 +64,10 @@ void matvec_q4_k_neon(const void* w, std::size_t rows, std::size_t cols, const v
 void matmul_q4_k_neon(const void* w, std::size_t rows, std::size_t cols, const void* x, std::size_t n, float* out);
 void matvec_q4_k_dotprod(const void* w, std::size_t rows, std::size_t cols, const void* x, float* out);
 void matmul_q4_k_dotprod(const void* w, std::size_t rows, std::size_t cols, const void* x, std::size_t n, float* out);
+void matvec_tq2_0_neon(const void* w, std::size_t rows, std::size_t cols, const void* x, float* out);
+void matmul_tq2_0_neon(const void* w, std::size_t rows, std::size_t cols, const void* x, std::size_t n, float* out);
+void matvec_tq2_0_dotprod(const void* w, std::size_t rows, std::size_t cols, const void* x, float* out);
+void matmul_tq2_0_dotprod(const void* w, std::size_t rows, std::size_t cols, const void* x, std::size_t n, float* out);
 void matvec_q6_k_neon(const void* w, std::size_t rows, std::size_t cols, const void* x, float* out);
 void matmul_q6_k_neon(const void* w, std::size_t rows, std::size_t cols, const void* x, std::size_t n, float* out);
 void matvec_q6_k_dotprod(const void* w, std::size_t rows, std::size_t cols, const void* x, float* out);

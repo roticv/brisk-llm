@@ -57,7 +57,18 @@ Rules: same model file, same prompt, same thread count as the baseline. On the A
 
 **Done when:** Qwen3-1.7B generation is within 10% of llama.cpp on both machines and prompt processing is within 25%, with perplexity matching. On the Mac, generation with all 10 cores should beat llama.cpp's 4-core number. Met on the Pi and, for Q4_0, on the Mac except prompt processing at 4 threads (30% behind).
 
-## Phase 3: Fewer bytes per token
+## Phase 3: Fewer bytes per token — in progress
+
+Status so far (details in `bench/RESULTS.md`):
+
+- **BitNet b1.58 2B4T runs in brisk** (Llama 3 tokenizer, squared-ReLU feed-forward, sub-norms, TQ2_0 ternary kernels with a four-row interleaved layout and an smmla prompt tile). Perplexity matches llama.cpp within 0.13%. The baseline is mainline llama.cpp with a one-line local patch (its BitNet graph uses SiLU; this model uses squared ReLU); bitnet.cpp's generic ternary kernel has no NEON path and its ARM path needs a different conversion and generated kernels.
+- **The "0.4 GB" model reads 0.72-0.81 GB per token**, because its 128k-token embedding/output layer is 185-269 MB on its own. That is 25% fewer bytes than Qwen3-1.7B Q4_0, not 3x. Vocabulary pruning and the output-layer shortcut are therefore part of the BitNet work, not separate from it.
+- **On the M4 ternary does not pay:** generation is compute-bound (four times the work per byte of Q4_0) and the fanless Air throttles, so sustained generation is 35-40 tokens/s against 66 for Qwen3-1.7B Q4_0. brisk is still ahead of llama.cpp on the same file (30-36, with large variance).
+- **On the Pi it does, modestly:** 4.6 tokens/s against 3.6 for Qwen3-1.7B Q4_0, for a model with 40% more parameters.
+- **Speculative decoding is built and exact** (`--draft lookup` or `--draft <model>`), but with Qwen3-0.6B drafting the 1.7B it is slower than plain decoding (42 vs 70 tokens/s): the draft costs a third of a target token per guess. Lookup drafting is free and gives 2-2.4x on text that repeats its context, nothing on fresh text. Model drafting needs a draft under a tenth of the target's cost, which no Qwen3 pair offers.
+
+Remaining in this phase: vocabulary pruning, the output-layer shortcut, and sequential layout; these matter most for BitNet on the Pi.
+
 
 This is the phase that can move the ceiling, so it comes before any kernel polishing.
 

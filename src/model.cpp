@@ -25,7 +25,8 @@ float bfloat_to_float(std::uint16_t b) {
 }
 
 void embedding_row(const Matrix& m, std::size_t r, std::span<float> out) {
-    const std::byte* row = m.format == WeightFormat::F32 || m.format == WeightFormat::Q4_0x4 ? nullptr : m.row(r);
+    const bool grouped = m.format == WeightFormat::Q4_0x4 || m.format == WeightFormat::TQ2_0x4;
+    const std::byte* row = m.format == WeightFormat::F32 || grouped ? nullptr : m.row(r);
     switch (m.format) {
         case WeightFormat::F32: {
             const auto f32 = m.f32_row(r);
@@ -40,6 +41,11 @@ void embedding_row(const Matrix& m, std::size_t r, std::span<float> out) {
         case WeightFormat::Q4_1: dequantize_q4_1(reinterpret_cast<const BlockQ4_1*>(row), out.data(), m.cols); break;
         case WeightFormat::Q4_K: dequantize_q4_k(reinterpret_cast<const BlockQ4_K*>(row), out.data(), m.cols); break;
         case WeightFormat::Q6_K: dequantize_q6_k(reinterpret_cast<const BlockQ6_K*>(row), out.data(), m.cols); break;
+        case WeightFormat::TQ2_0: dequantize_tq2_0(reinterpret_cast<const BlockTQ2_0*>(row), out.data(), m.cols); break;
+        case WeightFormat::TQ2_0x4:
+            dequantize_tq2_0x4_row(reinterpret_cast<const BlockTQ2_0x4*>(m.bytes.data() + (r / 4) * 4 * m.row_bytes()),
+                                   r % 4, out.data(), m.cols);
+            break;
     }
 }
 
@@ -49,6 +55,7 @@ std::optional<WeightFormat> weight_format(TensorType type) {
         case TensorType::Q4_1: return WeightFormat::Q4_1;
         case TensorType::Q4_K: return WeightFormat::Q4_K;
         case TensorType::Q6_K: return WeightFormat::Q6_K;
+        case TensorType::TQ2_0: return WeightFormat::TQ2_0;
         default: return std::nullopt;
     }
 }
@@ -94,10 +101,11 @@ float require_f32(const GgufFile& file, const std::string& key) {
 
 Model::Model(const GgufFile& file) {
     const auto architecture = file.get<std::string_view>("general.architecture");
-    if (architecture != "qwen3") {
-        fail("unsupported architecture '" + std::string(architecture.value_or("(none)")) + "'; only qwen3 is supported");
-    }
-    const std::string prefix = "qwen3.";
+    if (architecture == "qwen3") config_.architecture = Architecture::Qwen3;
+    else if (architecture == "bitnet" || architecture == "bitnet-b1.58") config_.architecture = Architecture::BitNet;
+    else fail("unsupported architecture '" + std::string(architecture.value_or("(none)")) + "'; qwen3 and bitnet are supported");
+    const std::string prefix = std::string(*architecture) + ".";
+    const bool bitnet = config_.architecture == Architecture::BitNet;
 
     config_.embedding_dim = require_u32(file, prefix + "embedding_length");
     config_.layer_count = require_u32(file, prefix + "block_count");
@@ -149,8 +157,13 @@ Model::Model(const GgufFile& file) {
         layer.query = load_matrix(file, block + "attn_q.weight", query_dim, embd);
         layer.key = load_matrix(file, block + "attn_k.weight", kv_dim, embd);
         layer.value = load_matrix(file, block + "attn_v.weight", kv_dim, embd);
-        layer.query_norm = load(file, block + "attn_q_norm.weight", config_.head_dim);
-        layer.key_norm = load(file, block + "attn_k_norm.weight", config_.head_dim);
+        if (bitnet) {
+            layer.attention_sub_norm = load(file, block + "attn_sub_norm.weight", embd);
+            layer.feed_forward_sub_norm = load(file, block + "ffn_sub_norm.weight", ff);
+        } else {
+            layer.query_norm = load(file, block + "attn_q_norm.weight", config_.head_dim);
+            layer.key_norm = load(file, block + "attn_k_norm.weight", config_.head_dim);
+        }
         layer.attention_output = load_matrix(file, block + "attn_output.weight", embd, query_dim);
         layer.feed_forward_norm = load(file, block + "ffn_norm.weight", embd);
         layer.gate = load_matrix(file, block + "ffn_gate.weight", ff, embd);
@@ -217,6 +230,13 @@ Matrix Model::load_matrix(const GgufFile& file, std::string_view name, std::size
             repack_q4_0x4(reinterpret_cast<const BlockQ4_0*>(info->data.data()), rows, blocks,
                           reinterpret_cast<BlockQ4_0x4*>(packed.data()));
             m.format = WeightFormat::Q4_0x4;
+            m.bytes = packed;
+        } else if (m.format == WeightFormat::TQ2_0 && rows % 4 == 0 && kernels::prefers_q4_0x4()) {
+            const std::size_t blocks = cols / kSuperBlockSize;
+            std::vector<std::byte>& packed = packed_.emplace_back(rows / 4 * blocks * sizeof(BlockTQ2_0x4));
+            repack_tq2_0x4(reinterpret_cast<const BlockTQ2_0*>(info->data.data()), rows, blocks,
+                           reinterpret_cast<BlockTQ2_0x4*>(packed.data()));
+            m.format = WeightFormat::TQ2_0x4;
             m.bytes = packed;
         }
     } else {
@@ -333,6 +353,22 @@ std::span<const float> Session::eval(std::span<const Token> tokens) {
     return std::span<const float>(logits_.data(), c.vocab_size);
 }
 
+std::span<const float> Session::eval_all(std::span<const Token> tokens) {
+    const ModelConfig& c = model_.config();
+    if (tokens.empty() || tokens.size() > kMaxScoredTokens) fail("eval_all takes 1 to 64 tokens");
+    for (const Token token : tokens) {
+        if (token < 0 || static_cast<std::uint32_t>(token) >= c.vocab_size) fail("token id out of range");
+    }
+    if (tokens.size() > c.context_length - position_) fail("context length exceeded");
+    eval_batch(tokens, true);
+    return std::span<const float>(logits_.data(), tokens.size() * c.vocab_size);
+}
+
+void Session::rollback(std::size_t position) {
+    if (position > position_) fail("cannot roll forward");
+    position_ = position;  // the caches keep their storage; later entries are simply overwritten
+}
+
 double Session::log_likelihood(std::span<const Token> tokens) {
     const ModelConfig& c = model_.config();
     if (tokens.size() < 2) fail("need at least two tokens to score");
@@ -342,7 +378,7 @@ double Session::log_likelihood(std::span<const Token> tokens) {
     if (tokens.size() > c.context_length - position_) fail("context length exceeded");
 
     // Smaller batches than eval(): every token's logits are kept, vocab_size floats each.
-    constexpr std::size_t kScoreBatch = 64;
+    constexpr std::size_t kScoreBatch = kMaxScoredTokens;
     double total = 0.0;
     for (std::size_t begin = 0; begin < tokens.size(); begin += kScoreBatch) {
         const std::size_t n = std::min(kScoreBatch, tokens.size() - begin);
@@ -417,12 +453,12 @@ void Session::eval_batch(std::span<const Token> tokens, bool all_logits) {
             const std::span<const float> rope(rope_.data() + t * head_dim, head_dim);
             for (std::size_t h = 0; h < c.head_count; ++h) {
                 const std::span<float> q(query_.data() + t * query_dim + h * head_dim, head_dim);
-                rms_norm(q, layer.query_norm, c.rms_epsilon, q);
+                if (!layer.query_norm.empty()) rms_norm(q, layer.query_norm, c.rms_epsilon, q);
                 apply_rope(q, rope);
             }
             for (std::size_t h = 0; h < c.kv_head_count; ++h) {
                 const std::span<float> k(new_keys + t * kv_dim + h * head_dim, head_dim);
-                rms_norm(k, layer.key_norm, c.rms_epsilon, k);
+                if (!layer.key_norm.empty()) rms_norm(k, layer.key_norm, c.rms_epsilon, k);
                 apply_rope(k, rope);
             }
         });
@@ -468,6 +504,13 @@ void Session::eval_batch(std::span<const Token> tokens, bool all_logits) {
             }
         });
         delete phase;
+        if (!layer.attention_sub_norm.empty()) {
+            const Timed timed(profile_.norm_rope);
+            pool_.run(n, [&](std::size_t t) {
+                const std::span<float> a(attended_.data() + t * query_dim, query_dim);
+                rms_norm(a, layer.attention_sub_norm, c.rms_epsilon, a);
+            });
+        }
         multiply(layer.attention_output, attended_.data(), n, projected_.data());
         {
             const Timed timed(profile_.norm_rope);
@@ -485,7 +528,18 @@ void Session::eval_batch(std::span<const Token> tokens, bool all_logits) {
             pool_.run(n, [&](std::size_t t) {
                 float* g = gate_.data() + t * c.feed_forward_dim;
                 const float* u = up_.data() + t * c.feed_forward_dim;
-                for (std::size_t i = 0; i < c.feed_forward_dim; ++i) g[i] = silu(g[i]) * u[i];
+                if (c.architecture == Architecture::BitNet) {
+                    for (std::size_t i = 0; i < c.feed_forward_dim; ++i) {
+                        const float r = std::max(g[i], 0.0f);
+                        g[i] = r * r * u[i];
+                    }
+                } else {
+                    for (std::size_t i = 0; i < c.feed_forward_dim; ++i) g[i] = silu(g[i]) * u[i];
+                }
+                if (!layer.feed_forward_sub_norm.empty()) {
+                    const std::span<float> gs(g, c.feed_forward_dim);
+                    rms_norm(gs, layer.feed_forward_sub_norm, c.rms_epsilon, gs);
+                }
             });
         }
         multiply(layer.down, gate_.data(), n, projected_.data());

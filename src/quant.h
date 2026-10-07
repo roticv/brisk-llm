@@ -12,7 +12,7 @@ constexpr std::size_t kBlockSize = 32;  // weights per block for Q4_0 and Q8_0
 
 // Storage formats of weight matrices that the engine can multiply by.
 // Q4_0x4 is Q4_0 repacked at load time (see BlockQ4_0x4); it never appears in files.
-enum class WeightFormat { F32, Q4_0, Q4_1, Q4_K, Q6_K, Q4_0x4 };
+enum class WeightFormat { F32, Q4_0, Q4_1, Q4_K, Q6_K, Q4_0x4, TQ2_0, TQ2_0x4 };
 
 // Weights per block and bytes per block of a quantised format.
 std::size_t block_elements(WeightFormat format);
@@ -82,6 +82,29 @@ struct BlockQ6_K {
 };
 static_assert(sizeof(BlockQ6_K) == 210);
 
+// 256 ternary weights (-1, 0, 1) as 2-bit values 0..2 with a half-precision
+// scale: weight = (q - 1) * d. Bytes j..j+31 (j = 0 or 32) hold, in bit pairs
+// 2l..2l+1 (l = 0..3), elements 128(j/32) + 32l + m for byte j + m.
+struct BlockTQ2_0 {
+    std::uint8_t qs[kSuperBlockSize / 4];
+    std::uint16_t d;
+};
+static_assert(sizeof(BlockTQ2_0) == 66);
+
+// One TQ2_0 block from each of four consecutive rows, interleaved for smmla.
+// For row pair rp (rows 2rp, 2rp+1), vector v (0..7) of qs[128 * rp ..] packs
+// four chunks: bit pair 2l..2l+1 (l = 0..3) of its 16 bytes holds chunk
+// c = 4v + l, i.e. [row 2rp elements 8c..8c+7 | row 2rp+1 elements 8c..8c+7].
+struct BlockTQ2_0x4 {
+    std::uint8_t qs[256];
+    std::uint16_t d[4];
+};
+static_assert(sizeof(BlockTQ2_0x4) == 264);
+
+// Repacks `rows` (a multiple of 4) rows of `blocks` TQ2_0 blocks each.
+void repack_tq2_0x4(const BlockTQ2_0* in, std::size_t rows, std::size_t blocks, BlockTQ2_0x4* out);
+void dequantize_tq2_0x4_row(const BlockTQ2_0x4* group, std::size_t row_in_group, float* out, std::size_t count);
+
 // Activations for the K-quants: 256 signed 8-bit values with a float scale,
 // plus the sum of each group of 16, which the kernels need for the offsets.
 struct BlockQ8_K {
@@ -101,12 +124,13 @@ void dequantize_q4_0(const BlockQ4_0* blocks, float* out, std::size_t count);
 void dequantize_q4_1(const BlockQ4_1* blocks, float* out, std::size_t count);
 void dequantize_q4_k(const BlockQ4_K* blocks, float* out, std::size_t count);
 void dequantize_q6_k(const BlockQ6_K* blocks, float* out, std::size_t count);
+void dequantize_tq2_0(const BlockTQ2_0* blocks, float* out, std::size_t count);
 
 template <typename Block>
 constexpr std::size_t block_elements_of() {
     return sizeof(Block) == sizeof(BlockQ4_0) || sizeof(Block) == sizeof(BlockQ4_1) || sizeof(Block) == sizeof(BlockQ4_0x4)
                ? kBlockSize
-               : kSuperBlockSize;
+               : kSuperBlockSize;  // Q4_K, Q6_K, TQ2_0, TQ2_0x4
 }
 
 // Decodes the 256 6-bit values of a Q6_K block, offset removed, in weight order.
@@ -119,6 +143,9 @@ void dot_q4_0x4_q8_0(const BlockQ4_0x4* w, const BlockQ8_0* x, std::size_t block
 float dot_q4_1_q8_0(const BlockQ4_1* w, const BlockQ8_0* x, std::size_t blocks);
 float dot_q4_k_q8_k(const BlockQ4_K* w, const BlockQ8_K* x, std::size_t blocks);
 float dot_q6_k_q8_k(const BlockQ6_K* w, const BlockQ8_K* x, std::size_t blocks);
+float dot_tq2_0_q8_k(const BlockTQ2_0* w, const BlockQ8_K* x, std::size_t blocks);
+// All four rows of a packed ternary group at once: out[0..3].
+void dot_tq2_0x4_q8_k(const BlockTQ2_0x4* w, const BlockQ8_K* x, std::size_t blocks, float out[4]);
 
 // Unpacks the 6-bit scale and minimum of sub-block j (0-7) of a Q4_K block.
 inline void q4_k_scale_min(const std::uint8_t* scales, int j, std::uint8_t& scale, std::uint8_t& min) {

@@ -241,4 +241,130 @@ void matmul_q4_0x4_i8mm(const void* w, std::size_t rows, std::size_t cols, const
     }
 }
 
+// ---- TQ2_0x4 ----------------------------------------------------------------
+
+namespace {
+
+// A pair of tokens' 256-element block for the ternary tile: 32 chunk vectors of
+// [token a 8 elements | token b 8 elements], the pair's scales [da db da db],
+// and (da sum qa, db sum qb, ...) for removing the ternary offset of 1.
+struct TernaryTokenPairBlock {
+    int8x16_t b[32];
+    float32x4_t scales;
+    float32x4_t offset;
+};
+
+struct TernaryPrepared {
+    const TernaryTokenPairBlock* pairs;
+    const BlockQ8_K* rows;
+};
+
+inline TernaryPrepared view_ternary_prepared(const void* x, std::size_t n, std::size_t blocks) {
+    const auto* pairs = static_cast<const TernaryTokenPairBlock*>(x);
+    return {pairs, reinterpret_cast<const BlockQ8_K*>(pairs + (n / 2) * blocks)};
+}
+
+template <int kShift>
+inline uint8x16_t ternary_layer_u8(uint8x16_t packed) {
+    if constexpr (kShift == 0) return vandq_u8(packed, vdupq_n_u8(3));
+    else if constexpr (kShift == 6) return vshrq_n_u8(packed, 6);
+    else return vandq_u8(vshrq_n_u8(packed, kShift), vdupq_n_u8(3));
+}
+
+// 4 packed ternary rows x (2 * kPairs) tokens over a whole row of blocks.
+// Weights stay 0..2; the offset of 1 is removed per block: sum((q-1) x) = sum(q x) - sum(x).
+template <int kPairs>
+void ternary_tile(const BlockTQ2_0x4* group, std::size_t blocks, const TernaryTokenPairBlock* pair_blocks, float* out,
+                  std::size_t out_stride) {
+    float32x4_t accf[2][kPairs];
+    for (int rp = 0; rp < 2; ++rp) {
+        for (int tp = 0; tp < kPairs; ++tp) accf[rp][tp] = vdupq_n_f32(0.0f);
+    }
+    for (std::size_t blk = 0; blk < blocks; ++blk) {
+        const BlockTQ2_0x4& wb = group[blk];
+        int32x4_t acc[2][kPairs];
+        for (int rp = 0; rp < 2; ++rp) {
+            for (int tp = 0; tp < kPairs; ++tp) acc[rp][tp] = vdupq_n_s32(0);
+        }
+        for (int v = 0; v < 8; ++v) {
+            const uint8x16_t w0 = vld1q_u8(wb.qs + 16 * v);
+            const uint8x16_t w1 = vld1q_u8(wb.qs + 128 + 16 * v);
+            const uint8x16_t a[2][4] = {
+                {ternary_layer_u8<0>(w0), ternary_layer_u8<2>(w0), ternary_layer_u8<4>(w0), ternary_layer_u8<6>(w0)},
+                {ternary_layer_u8<0>(w1), ternary_layer_u8<2>(w1), ternary_layer_u8<4>(w1), ternary_layer_u8<6>(w1)}};
+            for (int tp = 0; tp < kPairs; ++tp) {
+                const int8x16_t* b = pair_blocks[static_cast<std::size_t>(tp) * blocks + blk].b + 4 * v;
+                for (int l = 0; l < 4; ++l) {
+                    acc[0][tp] = vusmmlaq_s32(acc[0][tp], a[0][l], b[l]);
+                    acc[1][tp] = vusmmlaq_s32(acc[1][tp], a[1][l], b[l]);
+                }
+            }
+        }
+        const float32x4_t d = vcvt_f32_f16(vreinterpret_f16_u16(vld1_u16(wb.d)));
+        const float32x4_t rs[2] = {vzip1q_f32(d, d), vzip2q_f32(d, d)};
+        for (int tp = 0; tp < kPairs; ++tp) {
+            const TernaryTokenPairBlock& pair = pair_blocks[static_cast<std::size_t>(tp) * blocks + blk];
+            for (int rp = 0; rp < 2; ++rp) {
+                accf[rp][tp] = vmlaq_f32(accf[rp][tp], vcvtq_f32_s32(acc[rp][tp]), vmulq_f32(rs[rp], pair.scales));
+                accf[rp][tp] = vmlsq_f32(accf[rp][tp], rs[rp], pair.offset);
+            }
+        }
+    }
+    for (std::size_t rp = 0; rp < 2; ++rp) {
+        for (std::size_t tp = 0; tp < kPairs; ++tp) {
+            float* o = out + 2 * tp * out_stride + 2 * rp;
+            o[0] = vgetq_lane_f32(accf[rp][tp], 0);
+            o[out_stride] = vgetq_lane_f32(accf[rp][tp], 1);
+            o[1] = vgetq_lane_f32(accf[rp][tp], 2);
+            o[out_stride + 1] = vgetq_lane_f32(accf[rp][tp], 3);
+        }
+    }
+}
+
+}  // namespace
+
+std::size_t prepared_bytes_tq2_0x4_i8mm(std::size_t n, std::size_t blocks) {
+    return (n / 2) * blocks * sizeof(TernaryTokenPairBlock) + n * blocks * sizeof(BlockQ8_K);
+}
+
+void prepare_tq2_0x4_i8mm(const void* x_raw, std::size_t n, std::size_t blocks, void* out_raw) {
+    const auto* x = static_cast<const BlockQ8_K*>(x_raw);
+    auto* prepared = static_cast<TernaryTokenPairBlock*>(out_raw);
+    const std::size_t pairs = n / 2;
+    std::memcpy(prepared + pairs * blocks, x, n * blocks * sizeof(BlockQ8_K));
+    for (std::size_t p = 0; p < pairs; ++p) {
+        const BlockQ8_K* ta = x + (2 * p) * blocks;
+        const BlockQ8_K* tb = ta + blocks;
+        for (std::size_t blk = 0; blk < blocks; ++blk) {
+            TernaryTokenPairBlock& out = prepared[p * blocks + blk];
+            for (int c = 0; c < 32; ++c) out.b[c] = vcombine_s8(vld1_s8(ta[blk].qs + 8 * c), vld1_s8(tb[blk].qs + 8 * c));
+            const float32x2_t d = vset_lane_f32(tb[blk].d, vdup_n_f32(ta[blk].d), 1);
+            out.scales = vcombine_f32(d, d);
+            std::int32_t sum_a = 0, sum_b = 0;
+            for (const std::int16_t v : ta[blk].bsums) sum_a += v;
+            for (const std::int16_t v : tb[blk].bsums) sum_b += v;
+            const float32x2_t sums = vset_lane_f32(static_cast<float>(sum_b), vdup_n_f32(static_cast<float>(sum_a)), 1);
+            out.offset = vmulq_f32(out.scales, vcombine_f32(sums, sums));
+        }
+    }
+}
+
+void matmul_tq2_0x4_i8mm(const void* w, std::size_t rows, std::size_t cols, const void* x, std::size_t n, float* out) {
+    const auto* weights = static_cast<const BlockTQ2_0x4*>(w);
+    const std::size_t blocks = cols / kSuperBlockSize;
+    const TernaryPrepared prepared = view_ternary_prepared(x, n, blocks);
+    for (std::size_t g = 0; g < rows / 4; ++g) {
+        std::size_t t = 0;
+        for (; t + 8 <= n; t += 8) {
+            ternary_tile<4>(weights + g * blocks, blocks, prepared.pairs + (t / 2) * blocks, out + t * rows + 4 * g, rows);
+        }
+        for (; t + 4 <= n; t += 4) {
+            ternary_tile<2>(weights + g * blocks, blocks, prepared.pairs + (t / 2) * blocks, out + t * rows + 4 * g, rows);
+        }
+        for (; t < n; ++t) {
+            matvec_tq2_0x4_dotprod(weights + g * blocks, 4, cols, prepared.rows + t * blocks, out + t * rows + 4 * g);
+        }
+    }
+}
+
 }  // namespace brisk::kernels

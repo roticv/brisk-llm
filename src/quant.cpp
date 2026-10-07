@@ -4,6 +4,10 @@
 #include <cmath>
 #include <cstring>
 
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
+
 namespace brisk {
 
 std::size_t block_elements(WeightFormat format) {
@@ -13,7 +17,9 @@ std::size_t block_elements(WeightFormat format) {
         case WeightFormat::Q4_0x4:
         case WeightFormat::Q4_1: return kBlockSize;
         case WeightFormat::Q4_K:
-        case WeightFormat::Q6_K: return kSuperBlockSize;
+        case WeightFormat::Q6_K:
+        case WeightFormat::TQ2_0:
+        case WeightFormat::TQ2_0x4: return kSuperBlockSize;
     }
     return 1;
 }
@@ -26,11 +32,16 @@ std::size_t block_bytes(WeightFormat format) {
         case WeightFormat::Q4_1: return sizeof(BlockQ4_1);
         case WeightFormat::Q4_K: return sizeof(BlockQ4_K);
         case WeightFormat::Q6_K: return sizeof(BlockQ6_K);
+        case WeightFormat::TQ2_0: return sizeof(BlockTQ2_0);
+        case WeightFormat::TQ2_0x4: return sizeof(BlockTQ2_0x4) / 4;  // per row
     }
     return 0;
 }
 
-bool takes_q8_k(WeightFormat format) { return format == WeightFormat::Q4_K || format == WeightFormat::Q6_K; }
+bool takes_q8_k(WeightFormat format) {
+    return format == WeightFormat::Q4_K || format == WeightFormat::Q6_K || format == WeightFormat::TQ2_0 ||
+           format == WeightFormat::TQ2_0x4;
+}
 
 float half_to_float(std::uint16_t half) {
     const std::uint32_t h = half;
@@ -96,9 +107,22 @@ void quantize_q8_0(const float* x, BlockQ8_0* out, std::size_t count) {
         const float d = amax / 127.0f;
         const float inverse = d != 0.0f ? 1.0f / d : 0.0f;
         out[b].d = float_to_half(d);
+#if defined(__aarch64__)
+        const float32x4_t vinv = vdupq_n_f32(inverse);
+        for (std::size_t i = 0; i < kBlockSize; i += 16) {
+            const int32x4_t v0 = vcvtnq_s32_f32(vmulq_f32(vld1q_f32(block + i), vinv));
+            const int32x4_t v1 = vcvtnq_s32_f32(vmulq_f32(vld1q_f32(block + i + 4), vinv));
+            const int32x4_t v2 = vcvtnq_s32_f32(vmulq_f32(vld1q_f32(block + i + 8), vinv));
+            const int32x4_t v3 = vcvtnq_s32_f32(vmulq_f32(vld1q_f32(block + i + 12), vinv));
+            const int16x8_t lo = vcombine_s16(vmovn_s32(v0), vmovn_s32(v1));
+            const int16x8_t hi = vcombine_s16(vmovn_s32(v2), vmovn_s32(v3));
+            vst1q_s8(out[b].qs + i, vcombine_s8(vmovn_s16(lo), vmovn_s16(hi)));
+        }
+#else
         for (std::size_t i = 0; i < kBlockSize; ++i) {
             out[b].qs[i] = static_cast<std::int8_t>(std::nearbyint(block[i] * inverse));
         }
+#endif
     }
 }
 
@@ -124,6 +148,21 @@ void quantize_q8_k(const float* x, BlockQ8_K* out, std::size_t count) {
         }
         const float inverse = -127.0f / max;
         y.d = 1.0f / inverse;
+#if defined(__aarch64__)
+        const float32x4_t vinv = vdupq_n_f32(inverse);
+        const int32x4_t cap = vdupq_n_s32(127);
+        for (std::size_t g = 0; g < kSuperBlockSize / 16; ++g) {
+            const float* p = block + g * 16;
+            const int32x4_t v0 = vminq_s32(vcvtnq_s32_f32(vmulq_f32(vld1q_f32(p), vinv)), cap);
+            const int32x4_t v1 = vminq_s32(vcvtnq_s32_f32(vmulq_f32(vld1q_f32(p + 4), vinv)), cap);
+            const int32x4_t v2 = vminq_s32(vcvtnq_s32_f32(vmulq_f32(vld1q_f32(p + 8), vinv)), cap);
+            const int32x4_t v3 = vminq_s32(vcvtnq_s32_f32(vmulq_f32(vld1q_f32(p + 12), vinv)), cap);
+            const int16x8_t lo = vcombine_s16(vmovn_s32(v0), vmovn_s32(v1));
+            const int16x8_t hi = vcombine_s16(vmovn_s32(v2), vmovn_s32(v3));
+            vst1q_s8(y.qs + g * 16, vcombine_s8(vmovn_s16(lo), vmovn_s16(hi)));
+            y.bsums[g] = static_cast<std::int16_t>(vaddvq_s16(vaddq_s16(lo, hi)));
+        }
+#else
         for (std::size_t i = 0; i < kSuperBlockSize; ++i) {
             y.qs[i] = static_cast<std::int8_t>(std::min(127.0f, std::nearbyint(inverse * block[i])));
         }
@@ -132,6 +171,7 @@ void quantize_q8_k(const float* x, BlockQ8_K* out, std::size_t count) {
             for (std::size_t i = 0; i < 16; ++i) sum += y.qs[g * 16 + i];
             y.bsums[g] = static_cast<std::int16_t>(sum);
         }
+#endif
     }
 }
 
@@ -334,6 +374,105 @@ float dot_q6_k_q8_k(const BlockQ6_K* w, const BlockQ8_K* x, std::size_t blocks) 
         sum += x[b].d * half_to_float(w[b].d) * static_cast<float>(weighted);
     }
     return sum;
+}
+
+void dequantize_tq2_0(const BlockTQ2_0* blocks, float* out, std::size_t count) {
+    for (std::size_t b = 0; b < count / kSuperBlockSize; ++b) {
+        const float d = half_to_float(blocks[b].d);
+        float* y = out + b * kSuperBlockSize;
+        for (std::size_t j = 0; j < 64; j += 32) {
+            for (std::size_t l = 0; l < 4; ++l) {
+                for (std::size_t m = 0; m < 32; ++m) {
+                    const int q = (blocks[b].qs[j + m] >> (2 * l)) & 3;
+                    *y++ = static_cast<float>(q - 1) * d;
+                }
+            }
+        }
+    }
+}
+
+float dot_tq2_0_q8_k(const BlockTQ2_0* w, const BlockQ8_K* x, std::size_t blocks) {
+    float sum = 0.0f;
+    for (std::size_t b = 0; b < blocks; ++b) {
+        // sum((q - 1) x) = sum(q x) - sum(x), with sum(x) from the block sums.
+        std::int32_t acc = 0;
+        std::size_t i = 0;
+        for (std::size_t j = 0; j < 64; j += 32) {
+            for (std::size_t l = 0; l < 4; ++l) {
+                for (std::size_t m = 0; m < 32; ++m) acc += ((w[b].qs[j + m] >> (2 * l)) & 3) * x[b].qs[i++];
+            }
+        }
+        std::int32_t xsum = 0;
+        for (const std::int16_t s : x[b].bsums) xsum += s;
+        sum += x[b].d * half_to_float(w[b].d) * static_cast<float>(acc - xsum);
+    }
+    return sum;
+}
+
+namespace {
+
+// Value 0..2 of element e of a TQ2_0 block.
+inline int tq2_0_value(const BlockTQ2_0& block, std::size_t e) {
+    const std::size_t j = (e / 128) * 32, l = (e / 32) % 4, m = e % 32;
+    return (block.qs[j + m] >> (2 * l)) & 3;
+}
+
+// Byte and bit shift of element e (0..255) of row r (0..3) in a TQ2_0x4 block.
+inline void tq2_0x4_position(std::size_t r, std::size_t e, std::size_t& byte, unsigned& shift) {
+    const std::size_t chunk = e / 8;  // 0..31
+    const std::size_t v = chunk / 4, l = chunk % 4;
+    byte = 128 * (r / 2) + 16 * v + 8 * (r % 2) + (e % 8);
+    shift = static_cast<unsigned>(2 * l);
+}
+
+}  // namespace
+
+void repack_tq2_0x4(const BlockTQ2_0* in, std::size_t rows, std::size_t blocks, BlockTQ2_0x4* out) {
+    for (std::size_t g = 0; g < rows / 4; ++g) {
+        for (std::size_t b = 0; b < blocks; ++b) {
+            BlockTQ2_0x4& packed = out[g * blocks + b];
+            std::memset(packed.qs, 0, sizeof(packed.qs));
+            for (std::size_t r = 0; r < 4; ++r) {
+                const BlockTQ2_0& block = in[(g * 4 + r) * blocks + b];
+                packed.d[r] = block.d;
+                for (std::size_t e = 0; e < kSuperBlockSize; ++e) {
+                    std::size_t byte;
+                    unsigned shift;
+                    tq2_0x4_position(r, e, byte, shift);
+                    packed.qs[byte] |= static_cast<std::uint8_t>(tq2_0_value(block, e) << shift);
+                }
+            }
+        }
+    }
+}
+
+void dequantize_tq2_0x4_row(const BlockTQ2_0x4* group, std::size_t row_in_group, float* out, std::size_t count) {
+    for (std::size_t b = 0; b < count / kSuperBlockSize; ++b) {
+        const float d = half_to_float(group[b].d[row_in_group]);
+        for (std::size_t e = 0; e < kSuperBlockSize; ++e) {
+            std::size_t byte;
+            unsigned shift;
+            tq2_0x4_position(row_in_group, e, byte, shift);
+            out[b * kSuperBlockSize + e] = static_cast<float>(((group[b].qs[byte] >> shift) & 3) - 1) * d;
+        }
+    }
+}
+
+void dot_tq2_0x4_q8_k(const BlockTQ2_0x4* w, const BlockQ8_K* x, std::size_t blocks, float out[4]) {
+    for (std::size_t r = 0; r < 4; ++r) {
+        float sum = 0.0f;
+        for (std::size_t b = 0; b < blocks; ++b) {
+            std::int32_t acc = 0;
+            for (std::size_t e = 0; e < kSuperBlockSize; ++e) {
+                std::size_t byte;
+                unsigned shift;
+                tq2_0x4_position(r, e, byte, shift);
+                acc += (((w[b].qs[byte] >> shift) & 3) - 1) * x[b].qs[e];
+            }
+            sum += static_cast<float>(acc) * half_to_float(w[b].d[r]) * x[b].d;
+        }
+        out[r] = sum;
+    }
 }
 
 }  // namespace brisk

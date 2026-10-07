@@ -26,6 +26,11 @@ inline int32x4_t dot16(int8x16_t w, int8x16_t x) {
     return vpaddlq_s16(p);
 }
 
+inline int32x4_t dot16_acc(int32x4_t acc, int8x16_t w, int8x16_t x) {
+    const int16x8_t p = vmlal_s8(vmull_s8(vget_low_s8(w), vget_low_s8(x)), vget_high_s8(w), vget_high_s8(x));
+    return vpadalq_s16(acc, p);
+}
+
 }  // namespace
 
 void matvec_q4_0_neon(const void* w, std::size_t rows, std::size_t cols, const void* x, float* out) {
@@ -64,6 +69,20 @@ void matmul_q6_k_neon(const void* w, std::size_t rows, std::size_t cols, const v
     neon::matmul_k(static_cast<const BlockQ6_K*>(w), rows, cols, static_cast<const BlockQ8_K*>(x), n, out,
                    [](const BlockQ6_K* row, const BlockQ8_K* const* xs, std::size_t count, std::size_t blocks, float* o) {
                        neon::dot_rows_q6_k(row, xs, count, blocks, o, dot16);
+                   });
+}
+
+void matvec_tq2_0_neon(const void* w, std::size_t rows, std::size_t cols, const void* x, float* out) {
+    neon::matmul_k(static_cast<const BlockTQ2_0*>(w), rows, cols, static_cast<const BlockQ8_K*>(x), 1, out,
+                   [](const BlockTQ2_0* row, const BlockQ8_K* const* xs, std::size_t n, std::size_t blocks, float* o) {
+                       neon::dot_rows_tq2_0(row, xs, n, blocks, o, dot16_acc);
+                   });
+}
+
+void matmul_tq2_0_neon(const void* w, std::size_t rows, std::size_t cols, const void* x, std::size_t n, float* out) {
+    neon::matmul_k(static_cast<const BlockTQ2_0*>(w), rows, cols, static_cast<const BlockQ8_K*>(x), n, out,
+                   [](const BlockTQ2_0* row, const BlockQ8_K* const* xs, std::size_t count, std::size_t blocks, float* o) {
+                       neon::dot_rows_tq2_0(row, xs, count, blocks, o, dot16_acc);
                    });
 }
 

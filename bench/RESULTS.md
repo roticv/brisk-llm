@@ -58,6 +58,32 @@ Idle machine, pure Q4_0 files for both engines (llama.cpp numbers from `MacBook-
 
 Reading: on Q4_0, generation is 7-11% behind llama.cpp's CPU path at 4 threads and ahead at 10 threads (and ahead of Metal at 10); prompt processing is within 15-30% at 4 threads and within 2-16% at 10. The K-quants have NEON kernels but no batched tiles or interleaved layout yet, so they trail on both counts. Before the i8mm kernels (commit 45d473f) prompt processing was 2.3-3.4x behind.
 
+### BitNet b1.58 2B4T on the M4 (Phase 3)
+
+Ternary weights (TQ2_0, 537 MB) with the 128k-token embedding/output layer as Q6_K (269 MB, file `bitnet-2B4T-TQ2_0.gguf`) or Q4_0 (185 MB, `-e4`). llama.cpp is mainline with a one-line patch (squared ReLU) since its BitNet graph uses SiLU; bitnet.cpp's generic i2_s kernel has no NEON path (1.1 tokens/s). Medians of 5, tokens/s.
+
+| File | Threads | brisk prompt | llama.cpp prompt | brisk generation | llama.cpp generation |
+|---|---:|---:|---:|---:|---:|
+| TQ2_0 + Q6_K embedding | 4 | 110 | 139 | 35 | 30 |
+| TQ2_0 + Q6_K embedding | 10 | 183 | 81 | 28 | |
+| TQ2_0 + Q4_0 embedding | 4 | 110 | 130 | 40 | 36 ± 13 |
+| TQ2_0 + Q4_0 embedding | 10 | 182 | 125 | 31 | 10 ± 8 |
+
+Single short runs reach 52-75 tokens/s, but sustained runs do not: ternary generation is compute-bound on the M4 (the kernel does four times the work per byte of Q4_0), and the fanless Air throttles under sustained compute. Both engines show large run-to-run variance for the same reason. Per token, the file reads 0.72-0.81 GB, which is less than Qwen3-1.7B Q4_0 (0.97 GB) but not by the 3x the "0.4 GB" figure suggests, because the 128k-vocabulary output layer is a third of the bytes.
+
+Perplexity matches llama.cpp within 0.13%; the Llama 3 tokenizer matches on 2,117 test strings.
+
+### Speculative decoding on the M4 (Phase 3)
+
+Qwen3-1.7B pure Q4_0, 4 threads, greedy, output identical to plain decoding:
+
+| Text | plain | draft = Qwen3-0.6B | lookup drafting |
+|---|---:|---:|---:|
+| fresh answer (200 tokens) | 70.5 | 42.1 (55% of guesses accepted) | 44.0 (12%) |
+| "repeat the text above" (200 tokens) | 56.9 | | 107 (5 guesses), 135 (12 guesses), 99% accepted |
+
+A draft one third the target's cost loses more than it saves; lookup drafting is free and wins only where the output repeats the context.
+
 ## Raspberry Pi 4 Model B (4 GB, Cortex-A72 x4, Debian 13, 64-bit)
 
 Same llama.cpp commit `8216c84`, CPU only, 4 threads, 5 repetitions, 20 s cool-down. Speeds in tokens/s.

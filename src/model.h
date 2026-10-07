@@ -14,7 +14,15 @@
 
 namespace brisk {
 
+// The model families the engine can run. They share the Llama-style layer
+// structure and differ in a few extra norms and the feed-forward activation.
+enum class Architecture {
+    Qwen3,   // RMS norms on Q and K per head, SiLU-gated feed-forward
+    BitNet,  // ternary weights, extra norms before the output projections, squared-ReLU feed-forward
+};
+
 struct ModelConfig {
+    Architecture architecture = Architecture::Qwen3;
     std::uint32_t vocab_size = 0;
     std::uint32_t embedding_dim = 0;
     std::uint32_t layer_count = 0;
@@ -51,12 +59,14 @@ public:
         Matrix query;
         Matrix key;
         Matrix value;
-        std::span<const float> query_norm;
-        std::span<const float> key_norm;
+        std::span<const float> query_norm;         // Qwen3: per-head norm of Q (empty otherwise)
+        std::span<const float> key_norm;           // Qwen3: per-head norm of K
+        std::span<const float> attention_sub_norm;  // BitNet: norm of the attention result before the output projection
         Matrix attention_output;
         std::span<const float> feed_forward_norm;
         Matrix gate;
         Matrix up;
+        std::span<const float> feed_forward_sub_norm;  // BitNet: norm of gate*up before the down projection
         Matrix down;
     };
 
@@ -100,6 +110,15 @@ public:
     // length.
     std::span<const float> eval(std::span<const Token> tokens);
     std::span<const float> eval(Token token) { return eval(std::span<const Token>(&token, 1)); }
+
+    // Like eval(), but returns logits for every token: row i (vocab_size floats)
+    // predicts the token after tokens[i]. At most kMaxScoredTokens tokens.
+    std::span<const float> eval_all(std::span<const Token> tokens);
+
+    // Forgets everything from `position` on, so the next eval() continues there.
+    void rollback(std::size_t position);
+
+    static constexpr std::size_t kMaxScoredTokens = 64;
 
     // Appends tokens and returns the sum over i >= 1 of log p(tokens[i] | tokens[..i]),
     // the model's log-likelihood of the text. exp(-result / (n - 1)) is the perplexity.

@@ -8,6 +8,7 @@
 #include <fstream>
 #include <iterator>
 #include <map>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -20,6 +21,7 @@
 #include "mapped_file.h"
 #include "model.h"
 #include "sampler.h"
+#include "speculative.h"
 #include "tokenizer.h"
 
 namespace {
@@ -151,6 +153,8 @@ struct GenerateOptions {
     bool stop_at_end = true;   // stop when the model ends its turn
     std::string logits_path;   // if set, the logits after the prompt are written here
     std::size_t threads = std::thread::hardware_concurrency();
+    std::string draft;             // "lookup", or a path to a smaller model with the same tokenizer
+    std::size_t draft_tokens = 5;  // guesses per round
     brisk::SamplerConfig sampler;
 };
 
@@ -168,11 +172,16 @@ int cmd_generate(const GenerateOptions& options) {
 
     std::string text = options.prompt;
     if (options.chat) {
-        // Qwen's ChatML turn format. An empty think block tells Qwen3 to answer directly.
-        text = "<|im_start|>user\n" + text + "<|im_end|>\n<|im_start|>assistant\n";
-        if (!options.think) text += "<think>\n\n</think>\n\n";
+        if (model.config().architecture == brisk::Architecture::BitNet) {
+            text = "User: " + text + "<|eot_id|>Assistant: ";
+        } else {
+            // Qwen's ChatML turn format. An empty think block tells Qwen3 to answer directly.
+            text = "<|im_start|>user\n" + text + "<|im_end|>\n<|im_start|>assistant\n";
+            if (!options.think) text += "<think>\n\n</think>\n\n";
+        }
     }
-    const std::vector<brisk::Token> prompt = tokenizer.encode(text);
+    std::vector<brisk::Token> prompt = tokenizer.encode(text);
+    if (tokenizer.bos() >= 0) prompt.insert(prompt.begin(), tokenizer.bos());
     if (prompt.empty()) throw std::runtime_error("the prompt is empty");
     if (prompt.size() + options.max_tokens > model.config().context_length) {
         throw std::runtime_error("prompt plus generated tokens exceed the model's context length");
@@ -193,6 +202,61 @@ int cmd_generate(const GenerateOptions& options) {
     brisk::Sampler sampler(options.sampler);
     std::vector<brisk::Token> generated;
     const auto generate_start = std::chrono::steady_clock::now();
+
+    if (!options.draft.empty()) {
+        // Speculative decoding reproduces greedy output exactly, so it only applies there.
+        if (options.sampler.temperature > 0.0f) throw std::runtime_error("--draft requires greedy sampling (--temp 0)");
+        std::unique_ptr<brisk::MappedFile> draft_mapped;
+        std::unique_ptr<brisk::GgufFile> draft_file;
+        std::unique_ptr<brisk::Model> draft_model;
+        std::unique_ptr<brisk::Drafter> drafter;
+        if (options.draft == "lookup") {
+            drafter = std::make_unique<brisk::LookupDrafter>();
+        } else {
+            draft_mapped = std::make_unique<brisk::MappedFile>(options.draft);
+            draft_file = std::make_unique<brisk::GgufFile>(brisk::GgufFile::parse(draft_mapped->bytes()));
+            draft_model = std::make_unique<brisk::Model>(*draft_file);
+            if (draft_model->config().vocab_size != model.config().vocab_size) {
+                throw std::runtime_error("the draft model's vocabulary differs from the target's");
+            }
+            drafter = std::make_unique<brisk::ModelDrafter>(*draft_model, options.threads);
+        }
+        drafter->observe(prompt);
+        // The target has evaluated the whole prompt; step back one so the last
+        // token can be re-evaluated together with the guesses.
+        session.rollback(prompt.size() - 1);
+        brisk::Speculator speculator(session, *drafter, prompt.back(), options.draft_tokens);
+
+        bool done = false;
+        while (!done && generated.size() < options.max_tokens) {
+            for (const brisk::Token next : speculator.step()) {
+                if ((options.stop_at_end && tokenizer.is_end_of_generation(next)) || generated.size() >= options.max_tokens) {
+                    done = true;
+                    break;
+                }
+                generated.push_back(next);
+                if (!options.print_ids && !tokenizer.is_control(next)) {
+                    const std::string_view piece = tokenizer.piece(next);
+                    std::fwrite(piece.data(), 1, piece.size(), stdout);
+                    std::fflush(stdout);
+                }
+            }
+        }
+        const double generate_seconds = seconds_since(generate_start);
+        if (options.print_ids) print_ids(generated);
+        else std::printf("\n");
+        std::fflush(stdout);
+        const brisk::SpeculativeStats& st = speculator.stats();
+        std::fprintf(stderr,
+                     "load %.2f s | prompt %zu tokens, %.1f tokens/s | generation %zu tokens, %.1f tokens/s | "
+                     "%zu rounds, %zu of %zu guesses accepted | %zu threads, %.*s kernels\n",
+                     load_seconds, prompt.size(), static_cast<double>(prompt.size()) / prompt_seconds, generated.size(),
+                     static_cast<double>(generated.size()) / generate_seconds, st.rounds, st.accepted, st.drafted,
+                     options.threads, static_cast<int>(brisk::kernels::kernel_set_name().size()),
+                     brisk::kernels::kernel_set_name().data());
+        return 0;
+    }
+
     while (generated.size() < options.max_tokens) {
         const brisk::Token next = sampler.sample(logits);
         if (options.stop_at_end && tokenizer.is_end_of_generation(next)) break;
@@ -265,7 +329,10 @@ int usage() {
                  "  --seed <n>            random seed (default 0)\n"
                  "  --ids                 print token ids (prompt line, then generated line) instead of text\n"
                  "  --no-stop             keep generating past the end-of-turn token\n"
-                 "  --dump-logits <file>  write the float32 logits that follow the prompt\n");
+                 "  --dump-logits <file>  write the float32 logits that follow the prompt\n"
+                 "  --draft <model|lookup> speculative decoding: guess with a smaller model, or by\n"
+                 "                        looking up repeats in the text (greedy sampling only)\n"
+                 "  --draft-tokens <k>    guesses per round (default 5)\n");
     return 2;
 }
 
@@ -358,6 +425,8 @@ int run(const std::vector<std::string>& args) {
             else if (flag == "--top-p") options.sampler.top_p = parse_number<float>(flag, args[++i]);
             else if (flag == "--seed") options.sampler.seed = parse_number<std::uint64_t>(flag, args[++i]);
             else if (flag == "--dump-logits") options.logits_path = args[++i];
+            else if (flag == "--draft") options.draft = args[++i];
+            else if (flag == "--draft-tokens") options.draft_tokens = parse_number<std::size_t>(flag, args[++i]);
             else return usage();
         }
         if (!have_prompt) return usage();

@@ -30,6 +30,7 @@ add_library(brisk
     src/model.cpp
     src/quant.cpp
     src/sampler.cpp
+    src/speculative.cpp
     src/thread_pool.cpp
     src/tokenizer.cpp
     src/unicode.cpp
