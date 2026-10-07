@@ -1,4 +1,5 @@
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -9,10 +10,12 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <type_traits>
 #include <vector>
 
 #include "gguf.h"
+#include "kernels.h"
 #include "mapped_file.h"
 #include "model.h"
 #include "sampler.h"
@@ -146,6 +149,7 @@ struct GenerateOptions {
     bool print_ids = false;    // print token ids instead of text
     bool stop_at_end = true;   // stop when the model ends its turn
     std::string logits_path;   // if set, the logits after the prompt are written here
+    std::size_t threads = std::thread::hardware_concurrency();
     brisk::SamplerConfig sampler;
 };
 
@@ -174,10 +178,9 @@ int cmd_generate(const GenerateOptions& options) {
     }
     if (options.print_ids) print_ids(prompt);
 
-    brisk::Session session(model);
+    brisk::Session session(model, options.threads);
     const auto prompt_start = std::chrono::steady_clock::now();
-    std::span<const float> logits;
-    for (const brisk::Token token : prompt) logits = session.eval(token);
+    std::span<const float> logits = session.eval(prompt);
     const double prompt_seconds = seconds_since(prompt_start);
 
     if (!options.logits_path.empty()) {
@@ -209,9 +212,31 @@ int cmd_generate(const GenerateOptions& options) {
 
     // The last generated token is not evaluated, so one fewer pass was timed.
     const std::size_t timed = generated.empty() ? 0 : generated.size() - (generated.size() == options.max_tokens);
-    std::fprintf(stderr, "load %.2f s | prompt %zu tokens, %.1f tokens/s | generation %zu tokens, %.1f tokens/s\n",
+    std::fprintf(stderr,
+                 "load %.2f s | prompt %zu tokens, %.1f tokens/s | generation %zu tokens, %.1f tokens/s | %zu threads, %.*s kernels\n",
                  load_seconds, prompt.size(), static_cast<double>(prompt.size()) / prompt_seconds, generated.size(),
-                 timed > 0 ? static_cast<double>(timed) / generate_seconds : 0.0);
+                 timed > 0 ? static_cast<double>(timed) / generate_seconds : 0.0, options.threads,
+                 static_cast<int>(brisk::kernels::kernel_set_name().size()), brisk::kernels::kernel_set_name().data());
+    return 0;
+}
+
+// Scores a text: the model's perplexity over it, the standard check that an
+// implementation is right, since kernel errors raise it and rounding noise averages out.
+int cmd_perplexity(const std::string& model_path, const std::string& text, std::size_t threads) {
+    const brisk::MappedFile mapped(model_path);
+    const brisk::GgufFile file = brisk::GgufFile::parse(mapped.bytes());
+    const brisk::Tokenizer tokenizer(file);
+    const brisk::Model model(file);
+    const std::vector<brisk::Token> tokens = tokenizer.encode(text);
+    if (tokens.size() < 2) throw std::runtime_error("the text is too short to score");
+    if (tokens.size() > model.config().context_length) throw std::runtime_error("the text exceeds the context length");
+
+    brisk::Session session(model, threads);
+    const auto start = std::chrono::steady_clock::now();
+    const double log_likelihood = session.log_likelihood(tokens);
+    const double scored = static_cast<double>(tokens.size() - 1);
+    std::printf("tokens %zu | nll %.4f | perplexity %.4f | %.1f s\n", tokens.size(), -log_likelihood / scored,
+                std::exp(-log_likelihood / scored), seconds_since(start));
     return 0;
 }
 
@@ -220,9 +245,11 @@ int usage() {
                  "usage: brisk info [--tensors] <model.gguf>\n"
                  "       brisk tokenize <model.gguf> [--no-special] (--batch <strings.bin> | <text>)\n"
                  "       brisk generate <model.gguf> (-p <prompt> | -f <prompt-file>) [options]\n"
+                 "       brisk perplexity <model.gguf> -f <text-file> [-t <threads>]\n"
                  "\n"
                  "generate options:\n"
                  "  -n <count>            most tokens to generate (default 128)\n"
+                 "  -t <threads>          CPU threads to use (default: all cores)\n"
                  "  --chat                treat the prompt as a user message\n"
                  "  --no-think            with --chat, answer without a reasoning block\n"
                  "  --temp <t>            sampling temperature; 0 always picks the likeliest token (default 0)\n"
@@ -294,6 +321,14 @@ int run(const std::vector<std::string>& args) {
         return cmd_tokenize(args[1], parse_special, batch_path, text);
     }
 
+    if (command == "perplexity") {
+        if (args.size() < 4 || args[2] != "-f") return usage();
+        std::size_t threads = std::thread::hardware_concurrency();
+        if (args.size() == 6 && args[4] == "-t") threads = parse_number<std::size_t>("-t", args[5]);
+        else if (args.size() != 4) return usage();
+        return cmd_perplexity(args[1], read_text_file(args[3]), threads);
+    }
+
     if (command == "generate") {
         if (args.size() < 2) return usage();
         GenerateOptions options;
@@ -310,6 +345,7 @@ int run(const std::vector<std::string>& args) {
             else if (flag == "-p") { options.prompt = args[++i]; have_prompt = true; }
             else if (flag == "-f") { options.prompt = read_text_file(args[++i]); have_prompt = true; }
             else if (flag == "-n") options.max_tokens = parse_number<std::size_t>(flag, args[++i]);
+            else if (flag == "-t") options.threads = parse_number<std::size_t>(flag, args[++i]);
             else if (flag == "--temp") options.sampler.temperature = parse_number<float>(flag, args[++i]);
             else if (flag == "--top-k") options.sampler.top_k = parse_number<std::uint32_t>(flag, args[++i]);
             else if (flag == "--top-p") options.sampler.top_p = parse_number<float>(flag, args[++i]);

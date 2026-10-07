@@ -4,3 +4,4 @@ build*/
 bench/results/*.raw
 .DS_Store
 .cache/
+__pycache__/

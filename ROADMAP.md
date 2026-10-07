@@ -45,19 +45,17 @@ Rules: same model file, same prompt, same thread count as the baseline. On the A
 ## Phase 1: Correct scalar engine — done
 
 - CMake project, ASan/UBSan builds, bounds-checked GGUF loader over mmap, Qwen tokenizer, float32 Qwen3 forward pass, sampler, `brisk` CLI.
-- Tokenizer matches llama.cpp on 2,060 test strings; greedy output matches token for token on eight prompts with logits within 0.04.
+- Tokenizer matches llama.cpp on 2,060 test strings; greedy output matches token for token on eight prompts with logits within 0.04; float32 perplexity matches to four decimals.
 - Not done: cross-compilation to the Pi from the Mac. The Pi builds natively with its own GCC for now.
 
-## Phase 2: Reach llama.cpp on 4-bit models
+## Phase 2: Reach llama.cpp on 4-bit models — done on the Pi, open on the Mac
 
-- Q4_0 weights first, then Q4_K and Q6_K so the common GGUF files work (the downloaded "Q4_0" files also contain Q6_K and Q4_1 tensors; pure Q4_0 files are used until then).
-- 8-bit activation quantisation and integer dot products, as llama.cpp does, so outputs still match.
-- NEON kernels in separate translation units: baseline `armv8-a` for the A72, `dotprod`/`i8mm` variants for the M4, selected at startup.
-- Thread pool, with work split in proportion to each thread's measured speed so the M4's efficiency cores help instead of hurting.
-- Batched prompt processing (several tokens per pass over the weights).
-- Fuzz the GGUF parser.
+- Done: Q4_0, Q4_1, Q4_K and Q6_K weights with 8-bit activations; NEON kernels (baseline and `dotprod`) chosen at startup; thread pool with dynamic chunks; batched prompt processing; GGUF parser fuzzer (`tests/gguf_fuzz.cpp`); `brisk perplexity` and `tests/compare_perplexity.py` as the correctness check for quantised models (per-logit comparison is chaotic for 8-bit arithmetic, so perplexity is the yardstick: brisk matches llama.cpp within about 1%).
+- Pi results: generation at or slightly above llama.cpp on every file; prompt processing within 12% on the 0.6B and 5% on the 1.7B (`bench/RESULTS.md`).
+- Mac results (`bench/RESULTS.md`): generation 10-12% behind llama.cpp's CPU path at 4 threads, ahead of it at 10 threads (1.7B: 73 vs 66-71); prompt processing 2.3-3.4x behind, because llama.cpp uses `i8mm` matrix kernels and an interleaved weight layout that brisk lacks.
+- Not done: `i8mm` (smmla) batched kernels and a row-interleaved weight layout for the M4, needed to close the prompt gap and the last 10% of generation; attention over a long context is still scalar code and costs about 30% of generation speed after a 500-token prompt.
 
-**Done when:** Qwen3-1.7B generation is within 10% of llama.cpp on both machines and prompt processing is within 25%, with outputs still matching. On the Mac, generation with all 10 cores should beat llama.cpp's 4-core number.
+**Done when:** Qwen3-1.7B generation is within 10% of llama.cpp on both machines and prompt processing is within 25%, with perplexity matching. On the Mac, generation with all 10 cores should beat llama.cpp's 4-core number. Met on the Pi; on the Mac the 10-thread generation target is met but the 4-thread and prompt targets are not.
 
 ## Phase 3: Fewer bytes per token
 

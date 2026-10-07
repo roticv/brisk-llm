@@ -8,6 +8,8 @@
 #include <vector>
 
 #include "gguf.h"
+#include "quant.h"
+#include "thread_pool.h"
 #include "tokenizer.h"
 
 namespace brisk {
@@ -26,15 +28,20 @@ struct ModelConfig {
 };
 
 // A weight matrix stored row by row: `rows` outputs, each over `cols` inputs.
+// Quantised formats point at the file's bytes; F32 may too.
 struct Matrix {
-    std::span<const float> data;
+    WeightFormat format = WeightFormat::F32;
+    std::span<const float> f32;        // when format is F32
+    std::span<const std::byte> bytes;  // the blocks, otherwise
     std::size_t rows = 0;
     std::size_t cols = 0;
 
-    std::span<const float> row(std::size_t r) const { return data.subspan(r * cols, cols); }
+    std::size_t row_bytes() const { return cols / block_elements(format) * block_bytes(format); }
+    std::span<const float> f32_row(std::size_t r) const { return f32.subspan(r * cols, cols); }
+    const std::byte* row(std::size_t r) const { return bytes.data() + r * row_bytes(); }
 };
 
-// Weights of a Qwen3 model as float32. Float32 tensors are used directly from
+// Weights of a Qwen3 model. Float32 and Q4_0 tensors are used directly from
 // the file; 16-bit float tensors are widened into memory owned by the model.
 class Model {
 public:
@@ -81,23 +88,40 @@ private:
 // The model must outlive the session.
 class Session {
 public:
-    explicit Session(const Model& model);
+    // `threads` is the number of CPU threads to use, the caller included.
+    Session(const Model& model, std::size_t threads);
 
-    // Feeds the next token of the sequence and returns the logits for the
-    // token after it. The span is valid until the next call. Throws
-    // std::runtime_error past the model's context length.
-    std::span<const float> eval(Token token);
+    // Appends tokens to the sequence and returns the logits for the token
+    // after the last one. Several tokens at once (a prompt) are processed in
+    // batches, which is much faster than one at a time. The span is valid
+    // until the next call. Throws std::runtime_error past the model's context
+    // length.
+    std::span<const float> eval(std::span<const Token> tokens);
+    std::span<const float> eval(Token token) { return eval(std::span<const Token>(&token, 1)); }
+
+    // Appends tokens and returns the sum over i >= 1 of log p(tokens[i] | tokens[..i]),
+    // the model's log-likelihood of the text. exp(-result / (n - 1)) is the perplexity.
+    double log_likelihood(std::span<const Token> tokens);
 
     std::size_t position() const { return position_; }
 
 private:
+    // Processes up to kMaxBatch tokens starting at position_. With
+    // `all_logits` set, logits_ receives one row per token instead of only
+    // the last token's.
+    void eval_batch(std::span<const Token> tokens, bool all_logits);
+    // out = x * m^T for `n` rows of x (stride m.cols); out has stride m.rows.
+    void multiply(const Matrix& m, const float* x, std::size_t n, float* out);
+
     const Model& model_;
+    ThreadPool pool_;
     std::size_t position_ = 0;
 
     // Per layer, one entry per position: kv_head_count * head_dim floats.
     std::vector<std::vector<float>> key_cache_;
     std::vector<std::vector<float>> value_cache_;
 
+    // Scratch, with one row per token of the current batch.
     std::vector<float> hidden_;
     std::vector<float> normed_;
     std::vector<float> query_;
@@ -106,8 +130,10 @@ private:
     std::vector<float> gate_;
     std::vector<float> up_;
     std::vector<float> scores_;
-    std::vector<float> rope_;  // cos, sin pairs for the current position
+    std::vector<float> rope_;  // cos, sin pairs per position in the batch
     std::vector<float> logits_;
+    std::vector<BlockQ8_0> q8_0_;  // activations quantised for the 32-block formats
+    std::vector<BlockQ8_K> q8_k_;  // and for the K-quants
 };
 
 }  // namespace brisk

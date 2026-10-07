@@ -7,8 +7,15 @@
 //   llama_ref eval <model.gguf> <prompt.txt> <n_generate> <logits.bin>
 //       Prints the prompt's token ids, then n_generate greedily chosen ids.
 //       Writes the float32 logits that follow the prompt to logits.bin.
+//   llama_ref perplexity <model.gguf> <text.txt>
+//       Prints the mean negative log-likelihood and perplexity of the text,
+//       scored in one batch the way brisk's perplexity command does.
+//       With LLAMA_REF_ONE_BY_ONE=1 in the environment the prompt is fed one
+//       token at a time instead of as a batch, which exercises llama.cpp's
+//       other kernel path and shows how much its own results vary.
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -58,9 +65,10 @@ void quiet_log(ggml_log_level level, const char* text, void*) {
 
 int main(int argc, char** argv) {
     const std::string mode = argc > 1 ? argv[1] : "";
-    if (!((mode == "tokenize" && argc == 4) || (mode == "eval" && argc == 6))) {
+    if (!((mode == "tokenize" && argc == 4) || (mode == "eval" && argc == 6) || (mode == "perplexity" && argc == 4))) {
         std::fprintf(stderr, "usage: llama_ref tokenize <model> <strings.bin>\n"
-                             "       llama_ref eval <model> <prompt.txt> <n_generate> <logits.bin>\n");
+                             "       llama_ref eval <model> <prompt.txt> <n_generate> <logits.bin>\n"
+                             "       llama_ref perplexity <model> <text.txt>\n");
         return 2;
     }
 
@@ -110,6 +118,42 @@ int main(int argc, char** argv) {
     }
 
     std::vector<llama_token> prompt = tokenize(vocab, read_file(argv[3]));
+    const int n_vocab = llama_vocab_n_tokens(vocab);
+
+    if (mode == "perplexity") {
+        if (prompt.size() < 2 || prompt.size() > kContext) {
+            std::fprintf(stderr, "text is too short or does not fit the context\n");
+            return 1;
+        }
+        llama_batch batch = llama_batch_init(static_cast<int32_t>(prompt.size()), 0, 1);
+        for (std::size_t i = 0; i < prompt.size(); ++i) {
+            batch.token[i] = prompt[i];
+            batch.pos[i] = static_cast<llama_pos>(i);
+            batch.n_seq_id[i] = 1;
+            batch.seq_id[i][0] = 0;
+            batch.logits[i] = 1;
+        }
+        batch.n_tokens = static_cast<int32_t>(prompt.size());
+        if (llama_decode(ctx, batch) != 0) {
+            std::fprintf(stderr, "decode failed\n");
+            return 1;
+        }
+        double total = 0.0;
+        for (std::size_t i = 0; i + 1 < prompt.size(); ++i) {
+            const float* row = llama_get_logits_ith(ctx, static_cast<int32_t>(i));
+            const float max = *std::max_element(row, row + n_vocab);
+            double sum = 0.0;
+            for (int v = 0; v < n_vocab; ++v) sum += std::exp(static_cast<double>(row[v] - max));
+            total += static_cast<double>(row[prompt[i + 1]] - max) - std::log(sum);
+        }
+        const double scored = static_cast<double>(prompt.size() - 1);
+        std::printf("tokens %zu | nll %.4f | perplexity %.4f\n", prompt.size(), -total / scored, std::exp(-total / scored));
+        llama_batch_free(batch);
+        llama_free(ctx);
+        llama_model_free(model);
+        return 0;
+    }
+
     const int n_generate = std::atoi(argv[4]);
     if (prompt.empty() || prompt.size() + static_cast<std::size_t>(std::max(n_generate, 0)) > kContext) {
         std::fprintf(stderr, "prompt is empty or does not fit the context\n");
@@ -117,11 +161,14 @@ int main(int argc, char** argv) {
     }
     print_ids(prompt);
 
-    if (llama_decode(ctx, llama_batch_get_one(prompt.data(), static_cast<int32_t>(prompt.size()))) != 0) {
-        std::fprintf(stderr, "decode failed\n");
-        return 1;
+    const bool one_by_one = std::getenv("LLAMA_REF_ONE_BY_ONE") != nullptr;
+    const std::size_t step = one_by_one ? 1 : prompt.size();
+    for (std::size_t i = 0; i < prompt.size(); i += step) {
+        if (llama_decode(ctx, llama_batch_get_one(prompt.data() + i, static_cast<int32_t>(step))) != 0) {
+            std::fprintf(stderr, "decode failed\n");
+            return 1;
+        }
     }
-    const int n_vocab = llama_vocab_n_tokens(vocab);
     const float* logits = llama_get_logits_ith(ctx, -1);
     std::ofstream(argv[5], std::ios::binary)
         .write(reinterpret_cast<const char*>(logits), static_cast<std::streamsize>(n_vocab) * 4);
