@@ -120,6 +120,17 @@ Same files and settings, 4 threads. Prompt = ~500-token prompt; generation = 128
 
 The Pi reached 82 C and its soft temperature limit during this run, so the prompt numbers may be slightly pessimistic.
 
+### BitNet b1.58 2B4T on the Pi (Phase 3)
+
+Same files as on the Mac, 4 threads, short runs (the Pi reaches its soft temperature limit during longer ones).
+
+| File | brisk generation | llama.cpp generation |
+|---|---:|---:|
+| TQ2_0 + Q6_K embedding (0.81 GB/token) | 4.3 | |
+| TQ2_0 + Q4_0 embedding (0.72 GB/token) | 4.6 | 4.7 |
+
+For comparison Qwen3-1.7B Q4_0 (0.97 GB/token) generates at 3.6. The bandwidth ceiling for the 0.72 GB file is 6.0 tokens/s; the ternary kernel is also close to compute-bound on the A72 (about 3 multiply-adds per instruction), so cutting bytes further would need a lookup-table kernel to pay off.
+
 ### What this means
 
 - Generation is bandwidth-bound, as the user's earlier benchmarks also showed. Better kernels on the same file can gain at most about 20%.

@@ -57,7 +57,7 @@ Rules: same model file, same prompt, same thread count as the baseline. On the A
 
 **Done when:** Qwen3-1.7B generation is within 10% of llama.cpp on both machines and prompt processing is within 25%, with perplexity matching. On the Mac, generation with all 10 cores should beat llama.cpp's 4-core number. Met on the Pi and, for Q4_0, on the Mac except prompt processing at 4 threads (30% behind).
 
-## Phase 3: Fewer bytes per token — in progress
+## Phase 3: Fewer bytes per token — stopped after BitNet and speculative decoding
 
 Status so far (details in `bench/RESULTS.md`):
 
@@ -67,7 +67,11 @@ Status so far (details in `bench/RESULTS.md`):
 - **On the Pi it does, modestly:** 4.6 tokens/s against 3.6 for Qwen3-1.7B Q4_0, for a model with 40% more parameters.
 - **Speculative decoding is built and exact** (`--draft lookup` or `--draft <model>`), but with Qwen3-0.6B drafting the 1.7B it is slower than plain decoding (42 vs 70 tokens/s): the draft costs a third of a target token per guess. Lookup drafting is free and gives 2-2.4x on text that repeats its context, nothing on fresh text. Model drafting needs a draft under a tenth of the target's cost, which no Qwen3 pair offers.
 
-Remaining in this phase: vocabulary pruning, the output-layer shortcut, and sequential layout; these matter most for BitNet on the Pi.
+- **The remaining levers have small ceilings on the Pi.** BitNet reads 0.72 GB per token: 537 MB ternary layers, 185 MB output layer. Vocabulary pruning with an ASCII-only rule keeps 76% of the tokens (1.07-1.10x); pruning to ~32k tokens or an exact output-layer shortcut tops out at 1.35x; 1.6-bit ternary packing at 1.15x; all together about 1.6x, and the ternary kernel would need to become a lookup-table kernel for that to materialise, since the A72 is nearly compute-bound on it. On the Mac, ternary is a loss and the 4-bit Qwen3 path stays the best option.
+
+Decision (2026-10-07): stop here and consolidate rather than pursue those levers. The items below are not started.
+
+- Vocabulary pruning, the output-layer shortcut, 1.6-bit ternary packing, lookup-table ternary kernels (T-MAC style), sequential layout and prefetching.
 
 
 This is the phase that can move the ceiling, so it comes before any kernel polishing.
@@ -80,7 +84,7 @@ This is the phase that can move the ceiling, so it comes before any kernel polis
 
 **Done when:** BitNet outputs match bitnet.cpp and generation beats bitnet.cpp and llama.cpp on both machines; the output-layer shortcut, vocabulary pruning and speculative decoding each give a measured generation gain on Qwen3-1.7B on both machines with unchanged greedy output on the test prompts.
 
-## Phase 4: Prompt processing and remaining 4-bit headroom
+## Phase 4: Prompt processing and remaining 4-bit headroom — not started
 
 - Cache-blocked quantised matrix multiply for prompt processing.
 - Static memory planning, fused operations, no allocation during generation.
@@ -90,7 +94,7 @@ Dropped: A72-specific kernel tuning for generation. The Pi is bandwidth-bound, s
 
 **Done when:** on Qwen3-1.7B, generation is at least 15% faster and prompt processing at least 30% faster than llama.cpp on both machines.
 
-## Phase 5: Mac-only acceleration
+## Phase 5: Mac-only acceleration — not started
 
 Decide from measurements which of these is worth doing:
 
@@ -108,8 +112,22 @@ Decide from measurements which of these is worth doing:
 - Own weight file format, if GGUF layout becomes the bottleneck.
 - Cross-compilation to the Pi from the Mac.
 
+## Where it stands against the goal
+
+Like-for-like on the same files (details and conditions in `bench/RESULTS.md`):
+
+| | brisk | llama.cpp |
+|---|---|---|
+| M4, Qwen3-1.7B Q4_0, generation 4 / 10 threads | 66 / 80 | 71 / 66 (Metal 86 / 69) |
+| M4, Qwen3-1.7B Q4_0, prompt 4 / 10 threads | 244 / 359 | 347 / 426 |
+| M4, BitNet 2B4T, generation 4 threads | 40 | 36 |
+| Pi 4, Qwen3-1.7B Q4_0, prompt / generation | 6.5 / 3.6 | 5.8 / 3.3 |
+| Pi 4, Qwen3-0.6B Q4_0, prompt / generation | 19.4 / 9.8 | 19.0 / 9.7 |
+| Pi 4, BitNet 2B4T, generation | 4.6 | 4.7 |
+
+Faster than llama.cpp: generation on the Pi, generation on the M4 with all cores, BitNet on the M4, lookup-drafted generation on repetitive text (2x). Not faster: M4 generation on 4 threads (7% behind), M4 prompt processing (16-30% behind), K-quant files on the M4. Both engines sit at 80-90% of the memory-bandwidth ceiling for generation, which is why the margins either way are small.
+
 ## Open questions
 
-- Is the Mac GPU in scope, or is this a CPU engine? This decides whether Phase 5 includes Metal.
-- Has a newer natively low-bit model replaced BitNet 2B4T? Check before starting Phase 3.
-- The Pi throttles under sustained load (soft temperature limit reached during the baseline run). Is cooling available, or should prompt-processing targets allow for it?
+- Is the Mac GPU in scope? Metal is the only path to substantially faster prompt processing on the Mac.
+- The Pi throttles under sustained load (soft temperature limit reached during benchmark runs). Cooling would make its prompt numbers more reliable.
