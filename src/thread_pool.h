@@ -14,7 +14,8 @@ namespace brisk {
 // A fixed set of worker threads that split numbered tasks between them. The
 // calling thread works too, so a pool of size 1 runs everything inline.
 // Tasks are handed out one at a time, so faster cores take more of them,
-// which is what lets a mix of performance and efficiency cores all help.
+// which is what lets a mix of performance and efficiency cores all help, and
+// a run ends when its tasks are done, not when every worker has reported in.
 class ThreadPool {
 public:
     explicit ThreadPool(std::size_t threads);  // total threads, caller included
@@ -31,7 +32,7 @@ public:
 
 private:
     void worker_loop();
-    void work();
+    void work(std::uint64_t generation);
 
     std::vector<std::thread> workers_;
     std::mutex mutex_;
@@ -39,11 +40,12 @@ private:
     std::atomic<std::uint64_t> generation_{0};  // bumped once per run()
     std::atomic<bool> stop_{false};
 
-    // State of the current run().
+    // State of the current run(). `claims_` holds the generation in its high
+    // 32 bits and the next unclaimed task index in the low 32.
     const std::function<void(std::size_t)>* fn_ = nullptr;
     std::size_t tasks_ = 0;
-    std::atomic<std::size_t> next_task_{0};
-    std::atomic<std::size_t> finished_workers_{0};
+    std::atomic<std::uint64_t> claims_{0};
+    std::atomic<std::size_t> completed_{0};
 };
 
 }  // namespace brisk

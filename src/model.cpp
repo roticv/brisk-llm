@@ -260,65 +260,106 @@ private:
 };
 
 void Session::multiply(const Matrix& m, const float* x, std::size_t n, float* out) {
-    // Enough tasks that the threads stay balanced, but each large enough that
-    // handing it out costs nothing next to doing it.
-    // Chunks are multiples of 4 rows so the grouped Q4_0x4 layout never splits a group.
+    const Target target{&m, out};
+    multiply(std::span<const Target>(&target, 1), x, n);
+}
+
+void Session::multiply(std::span<const Target> targets, const float* x, std::size_t n) {
+    const Timed timed(profile_.matmul);
+    const std::size_t cols = targets[0].matrix->cols;
+
+    // Row chunks per target: enough tasks that the threads stay balanced, but
+    // each large enough that handing it out costs nothing next to doing it.
+    // Chunks are multiples of 4 rows so the grouped layouts never split a group.
     // Single-row passes stream the weights, so big chunks keep the streams long;
     // batched passes are compute-bound, so smaller chunks balance the threads.
-    const std::size_t chunk = (n == 1 ? std::clamp<std::size_t>(m.rows / (pool_.size() * 8), 16, 256)
-                                      : std::clamp<std::size_t>(m.rows / (pool_.size() * 4), 4, 64)) / 4 * 4;
-    const std::size_t tasks = (m.rows + chunk - 1) / chunk;
+    struct Plan {
+        std::size_t chunk;
+        std::size_t first_task;
+        const void* activations;
+        kernels::KernelSet kernels;
+    };
+    std::vector<Plan> plans(targets.size());
+    std::size_t total_tasks = 0;
+    for (std::size_t i = 0; i < targets.size(); ++i) {
+        const Matrix& m = *targets[i].matrix;
+        if (m.cols != cols) fail("fused multiply needs matrices with the same input size");
+        plans[i].chunk = (n == 1 ? std::clamp<std::size_t>(m.rows / (pool_.size() * 8), 16, 256)
+                                 : std::clamp<std::size_t>(m.rows / (pool_.size() * 4), 4, 64)) / 4 * 4;
+        plans[i].first_task = total_tasks;
+        total_tasks += (m.rows + plans[i].chunk - 1) / plans[i].chunk;
+    }
 
-    const Timed timed(profile_.matmul);
-    if (m.format == WeightFormat::F32) {
-        pool_.run(tasks, [&](std::size_t task) {
-            const std::size_t end = std::min(m.rows, (task + 1) * chunk);
-            for (std::size_t r = task * chunk; r < end; ++r) {
+    // Quantise the activations once per format the targets take.
+    const auto quantize_start = std::chrono::steady_clock::now();
+    bool have_q8_0 = false, have_q8_k = false;
+    for (const Target& t : targets) {
+        if (t.matrix->format == WeightFormat::F32) continue;
+        const std::size_t blocks = cols / block_elements(t.matrix->format);
+        if (takes_q8_k(t.matrix->format) && !have_q8_k) {
+            q8_k_.resize(n * blocks);
+            pool_.run(n, [&](std::size_t r) { quantize_q8_k(x + r * cols, q8_k_.data() + r * blocks, cols); });
+            have_q8_k = true;
+        } else if (!takes_q8_k(t.matrix->format) && !have_q8_0) {
+            q8_0_.resize(n * blocks);
+            pool_.run(n, [&](std::size_t r) { quantize_q8_0(x + r * cols, q8_0_.data() + r * blocks, cols); });
+            have_q8_0 = true;
+        }
+    }
+    profile_.quantize += std::chrono::duration<double>(std::chrono::steady_clock::now() - quantize_start).count();
+
+    // Kernels and, for batched passes, their rearranged activations (shared
+    // between targets with the same kernel set; at most two distinct sets).
+    std::size_t prepared_used = 0;
+    for (std::size_t i = 0; i < targets.size(); ++i) {
+        const Matrix& m = *targets[i].matrix;
+        if (m.format == WeightFormat::F32) continue;
+        plans[i].kernels = kernels::kernels_for(m.format);
+        plans[i].activations = takes_q8_k(m.format) ? static_cast<const void*>(q8_k_.data())
+                                                    : static_cast<const void*>(q8_0_.data());
+        if (n > 1 && plans[i].kernels.prepare != nullptr) {
+            bool shared = false;
+            for (std::size_t j = 0; j < i && !shared; ++j) {
+                if (plans[j].kernels.prepare == plans[i].kernels.prepare && targets[j].matrix->format == m.format) {
+                    plans[i].activations = plans[j].activations;
+                    shared = true;
+                }
+            }
+            if (!shared) {
+                if (prepared_used == 2) fail("fused multiply supports at most two kernel sets");
+                const std::size_t blocks = cols / block_elements(m.format);
+                std::vector<std::byte>& buffer = prepared_[prepared_used++];
+                buffer.resize(plans[i].kernels.prepared_bytes(n, blocks));
+                plans[i].kernels.prepare(plans[i].activations, n, blocks, buffer.data());
+                plans[i].activations = buffer.data();
+            }
+        }
+    }
+
+    pool_.run(total_tasks, [&](std::size_t task) {
+        std::size_t i = targets.size() - 1;
+        while (plans[i].first_task > task) --i;
+        const Matrix& m = *targets[i].matrix;
+        float* out = targets[i].out;
+        const Plan& plan = plans[i];
+        const std::size_t begin = (task - plan.first_task) * plan.chunk;
+        const std::size_t end = std::min(m.rows, begin + plan.chunk);
+
+        if (m.format == WeightFormat::F32) {
+            for (std::size_t r = begin; r < end; ++r) {
                 for (std::size_t t = 0; t < n; ++t) {
                     out[t * m.rows + r] = kernels::dot_f32(m.f32.data() + r * m.cols, x + t * m.cols, m.cols);
                 }
             }
-        });
-        return;
-    }
-
-    // Quantise the activations to the format the weights' kernels take.
-    const std::size_t blocks = m.cols / block_elements(m.format);
-    const void* activations = nullptr;
-    const auto quantize_start = std::chrono::steady_clock::now();
-    if (takes_q8_k(m.format)) {
-        q8_k_.resize(n * blocks);
-        pool_.run(n, [&](std::size_t t) { quantize_q8_k(x + t * m.cols, q8_k_.data() + t * blocks, m.cols); });
-        activations = q8_k_.data();
-    } else {
-        q8_0_.resize(n * blocks);
-        pool_.run(n, [&](std::size_t t) { quantize_q8_0(x + t * m.cols, q8_0_.data() + t * blocks, m.cols); });
-        activations = q8_0_.data();
-    }
-
-    profile_.quantize += std::chrono::duration<double>(std::chrono::steady_clock::now() - quantize_start).count();
-    const kernels::KernelSet k = kernels::kernels_for(m.format);
-    if (n > 1 && k.prepare != nullptr) {
-        prepared_.resize(k.prepared_bytes(n, blocks));
-        k.prepare(activations, n, blocks, prepared_.data());
-        activations = prepared_.data();
-    }
-    if (n == 1) {
-        pool_.run(tasks, [&](std::size_t task) {
-            const std::size_t begin = task * chunk;
-            const std::size_t end = std::min(m.rows, begin + chunk);
-            k.matvec(m.row(begin), end - begin, m.cols, activations, out + begin);
-        });
-        return;
-    }
-    pool_.run(tasks, [&](std::size_t task) {
-        const std::size_t begin = task * chunk;
-        const std::size_t end = std::min(m.rows, begin + chunk);
-        // The kernel writes a dense (n x rows-in-chunk) block; scatter it into out's stride.
-        float local[kMaxBatch * 64];
-        k.matmul(m.row(begin), end - begin, m.cols, activations, n, local);
-        for (std::size_t t = 0; t < n; ++t) {
-            std::copy_n(local + t * (end - begin), end - begin, out + t * m.rows + begin);
+        } else if (n == 1) {
+            plan.kernels.matvec(m.row(begin), end - begin, m.cols, plan.activations, out + begin);
+        } else {
+            // The kernel writes a dense (n x rows-in-chunk) block; scatter it into out's stride.
+            float local[kMaxBatch * 64];
+            plan.kernels.matmul(m.row(begin), end - begin, m.cols, plan.activations, n, local);
+            for (std::size_t t = 0; t < n; ++t) {
+                std::copy_n(local + t * (end - begin), end - begin, out + t * m.rows + begin);
+            }
         }
     });
 }
@@ -444,9 +485,10 @@ void Session::eval_batch(std::span<const Token> tokens, bool all_logits) {
                 rms_norm(rows(hidden_, t, embd), layer.attention_norm, c.rms_epsilon, rows(normed_, t, embd));
             });
         }
-        multiply(layer.query, normed_.data(), n, query_.data());
-        multiply(layer.key, normed_.data(), n, new_keys);
-        multiply(layer.value, normed_.data(), n, new_values);
+        {
+            const Target qkv[3] = {{&layer.query, query_.data()}, {&layer.key, new_keys}, {&layer.value, new_values}};
+            multiply(qkv, normed_.data(), n);
+        }
 
         Timed* phase = new Timed(profile_.norm_rope);
         pool_.run(n, [&](std::size_t t) {
@@ -521,8 +563,10 @@ void Session::eval_batch(std::span<const Token> tokens, bool all_logits) {
                 rms_norm(rows(hidden_, t, embd), layer.feed_forward_norm, c.rms_epsilon, rows(normed_, t, embd));
             });
         }
-        multiply(layer.gate, normed_.data(), n, gate_.data());
-        multiply(layer.up, normed_.data(), n, up_.data());
+        {
+            const Target gate_up[2] = {{&layer.gate, gate_.data()}, {&layer.up, up_.data()}};
+            multiply(gate_up, normed_.data(), n);
+        }
         {
             const Timed timed(profile_.activation);
             pool_.run(n, [&](std::size_t t) {

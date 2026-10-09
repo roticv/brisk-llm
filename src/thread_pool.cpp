@@ -22,6 +22,8 @@ void raise_thread_priority() {
 // spinning keeps the wake-up latency out of the per-token time.
 constexpr int kSpinIterations = 100000;
 
+constexpr std::uint64_t kIndexMask = 0xFFFFFFFFull;
+
 }  // namespace
 
 ThreadPool::ThreadPool(std::size_t threads) {
@@ -46,26 +48,52 @@ void ThreadPool::run(std::size_t tasks, const std::function<void(std::size_t)>& 
         return;
     }
 
+    // Publish this run, then bump the generation. Task claims carry the
+    // generation in their high bits, so a worker that is late to notice a
+    // new run can never take one of its tasks for the previous function.
     fn_ = &fn;
     tasks_ = tasks;
-    next_task_.store(0, std::memory_order_relaxed);
-    finished_workers_.store(0, std::memory_order_relaxed);
+    completed_.store(0, std::memory_order_relaxed);
+    const std::uint64_t generation = generation_.load(std::memory_order_relaxed) + 1;
+    claims_.store(generation << 32, std::memory_order_release);  // publishes fn_ and tasks_ to late claimers
     {
         const std::lock_guard<std::mutex> lock(mutex_);
-        generation_.fetch_add(1, std::memory_order_release);
+        generation_.store(generation, std::memory_order_release);
     }
     wake_.notify_all();
 
-    work();
-    while (finished_workers_.load(std::memory_order_acquire) < workers_.size()) {}
+    work(generation);
+    // Wait for the tasks, not for every worker: a slow core that never got
+    // a task does not hold up the run.
+    while (completed_.load(std::memory_order_acquire) < tasks) {}
     fn_ = nullptr;
 }
 
-void ThreadPool::work() {
-    for (std::size_t i = next_task_.fetch_add(1, std::memory_order_relaxed); i < tasks_;
-         i = next_task_.fetch_add(1, std::memory_order_relaxed)) {
-        (*fn_)(i);
+void ThreadPool::work(std::uint64_t generation) {
+    // Each claim takes one task index with a single atomic increment. If the
+    // claim turns out to carry a newer generation, a new run has started
+    // since this thread looked: its function and task count were published
+    // before that generation's claims, so the index is simply executed for
+    // the new run.
+    const std::function<void(std::size_t)>* fn = fn_;
+    std::size_t tasks = tasks_;
+    std::size_t done = 0;
+    while (true) {
+        const std::uint64_t claim = claims_.fetch_add(1, std::memory_order_acq_rel);
+        const std::uint64_t claimed_generation = claim >> 32;
+        if (claimed_generation != generation) {
+            if (done > 0) completed_.fetch_add(done, std::memory_order_release);
+            done = 0;
+            generation = claimed_generation;
+            fn = fn_;
+            tasks = tasks_;
+        }
+        const std::size_t index = static_cast<std::size_t>(claim & kIndexMask);
+        if (index >= tasks) break;
+        (*fn)(index);
+        ++done;
     }
+    if (done > 0) completed_.fetch_add(done, std::memory_order_release);
 }
 
 void ThreadPool::worker_loop() {
@@ -73,19 +101,18 @@ void ThreadPool::worker_loop() {
     std::uint64_t seen = 0;
     while (true) {
         // Wait for the next generation: spin first, then sleep.
-        bool ready = false;
-        for (int i = 0; i < kSpinIterations && !ready; ++i) {
-            ready = generation_.load(std::memory_order_acquire) != seen;
+        std::uint64_t generation = seen;
+        for (int i = 0; i < kSpinIterations && generation == seen; ++i) {
+            generation = generation_.load(std::memory_order_acquire);
         }
-        if (!ready) {
+        if (generation == seen) {
             std::unique_lock<std::mutex> lock(mutex_);
             wake_.wait(lock, [&] { return generation_.load(std::memory_order_acquire) != seen; });
+            generation = generation_.load(std::memory_order_acquire);
         }
-        seen = generation_.load(std::memory_order_acquire);
+        seen = generation;
         if (stop_.load()) return;
-
-        work();
-        finished_workers_.fetch_add(1, std::memory_order_release);
+        work(generation);
     }
 }
 

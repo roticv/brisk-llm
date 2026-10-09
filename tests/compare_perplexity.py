@@ -16,7 +16,7 @@ import subprocess
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-TEXTS = [ROOT / "bench" / "prompt512.txt", ROOT / "ROADMAP.md"]
+TEXTS = [ROOT / "bench" / "prompt512.txt", ROOT / "README.md"]  # both fit llama_ref's 2048-token context
 TOLERANCE = 0.02  # relative
 
 

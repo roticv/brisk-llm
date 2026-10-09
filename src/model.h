@@ -139,6 +139,13 @@ private:
     void eval_batch(std::span<const Token> tokens, bool all_logits);
     // out = x * m^T for `n` rows of x (stride m.cols); out has stride m.rows.
     void multiply(const Matrix& m, const float* x, std::size_t n, float* out);
+    // Several matrices applied to the same x in one pass (one activation
+    // quantisation, one pool dispatch). All must have the same cols.
+    struct Target {
+        const Matrix* matrix;
+        float* out;
+    };
+    void multiply(std::span<const Target> targets, const float* x, std::size_t n);
 
     const Model& model_;
     ThreadPool pool_;
@@ -162,7 +169,7 @@ private:
     std::vector<float> logits_;
     std::vector<BlockQ8_0> q8_0_;  // activations quantised for the 32-block formats
     std::vector<BlockQ8_K> q8_k_;  // and for the K-quants
-    std::vector<std::byte> prepared_;  // activations rearranged for a batched kernel
+    std::vector<std::byte> prepared_[2];  // activations rearranged for a batched kernel, per kernel set
 };
 
 }  // namespace brisk

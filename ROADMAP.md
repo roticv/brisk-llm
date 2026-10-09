@@ -53,7 +53,8 @@ Rules: same model file, same prompt, same thread count as the baseline. On the A
 - Done: Q4_0, Q4_1, Q4_K and Q6_K weights with 8-bit activations; NEON kernels (baseline and `dotprod`) chosen at startup; thread pool with dynamic chunks; batched prompt processing; GGUF parser fuzzer (`tests/gguf_fuzz.cpp`); `brisk perplexity` and `tests/compare_perplexity.py` as the correctness check for quantised models (per-logit comparison is chaotic for 8-bit arithmetic, so perplexity is the yardstick: brisk matches llama.cpp within about 1%).
 - Pi results: generation at or slightly above llama.cpp on every file; prompt processing within 12% on the 0.6B and 5% on the 1.7B (`bench/RESULTS.md`).
 - Mac results (`bench/RESULTS.md`): with `i8mm` (smmla) batched kernels, a four-row interleaved Q4_0 layout repacked at load, and NEON attention, Qwen3-1.7B generation is 7% behind llama.cpp's CPU path at 4 threads and 21% ahead at 10 (80 vs 66, also ahead of Metal's 69); prompt processing is 30% behind at 4 threads and 16% behind at 10.
-- Not done: the K-quants (Q4_K, Q6_K) have no batched tiles or interleaved layout, so Q4_K_M files trail llama.cpp on the Mac; per-token thread-pool synchronisation (about 360 dispatches per token) is the next generation overhead.
+- Done later (2026-10-09): the thread pool ends a dispatch when its tasks are done rather than when every worker reports in (the efficiency cores respond slowly, which made each dispatch cost 18-33 us at 10 threads), and Q/K/V and gate/up are single dispatches; 10-thread generation gained 5-10%.
+- Not done: the K-quants (Q4_K, Q6_K) have no batched tiles or interleaved layout, so Q4_K_M files trail llama.cpp on the Mac.
 
 **Done when:** Qwen3-1.7B generation is within 10% of llama.cpp on both machines and prompt processing is within 25%, with perplexity matching. On the Mac, generation with all 10 cores should beat llama.cpp's 4-core number. Met on the Pi and, for Q4_0, on the Mac except prompt processing at 4 threads (30% behind).
 
@@ -118,11 +119,12 @@ Like-for-like on the same files (details and conditions in `bench/RESULTS.md`):
 
 | | brisk | llama.cpp |
 |---|---|---|
-| M4, Qwen3-1.7B Q4_0, generation 4 / 10 threads | 66 / 80 | 71 / 66 (Metal 86 / 69) |
-| M4, Qwen3-1.7B Q4_0, prompt 4 / 10 threads | 244 / 359 | 347 / 426 |
+| M4, Qwen3-1.7B Q4_0, generation 4 / 10 threads | 67 / 83 | 71 / 66 (Metal 86 / 69) |
+| M4, Qwen3-1.7B Q4_0, prompt 4 / 10 threads | 247 / 373 | 347 / 426 |
+| M4, Qwen3-1.7B Q4_K_M, generation 4 / 10 threads | 50 / 51 | 59 / 54 |
 | M4, BitNet 2B4T, generation 4 threads | 40 | 36 |
-| Pi 4, Qwen3-1.7B Q4_0, prompt / generation | 6.5 / 3.6 | 5.8 / 3.3 |
-| Pi 4, Qwen3-0.6B Q4_0, prompt / generation | 19.4 / 9.8 | 19.0 / 9.7 |
+| Pi 4, Qwen3-1.7B Q4_0, prompt / generation | 6.6 / 3.7 | 5.8 / 3.3 |
+| Pi 4, Qwen3-0.6B Q4_0, prompt / generation | 19.4 / 9.9 | 19.0 / 9.7 |
 | Pi 4, BitNet 2B4T, generation | 4.6 | 4.7 |
 
 Faster than llama.cpp: generation on the Pi, generation on the M4 with all cores, BitNet on the M4, lookup-drafted generation on repetitive text (2x). Not faster: M4 generation on 4 threads (7% behind), M4 prompt processing (16-30% behind), K-quant files on the M4. Both engines sit at 80-90% of the memory-bandwidth ceiling for generation, which is why the margins either way are small.
