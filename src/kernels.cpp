@@ -51,6 +51,24 @@ void matmul_tq2_0x4_generic(const void* w, std::size_t rows, std::size_t cols, c
     }
 }
 
+template <typename Block, void (*Dot4)(const Block*, const BlockQ8_K*, std::size_t, float[4])>
+void matvec_grouped_k_generic(const void* w, std::size_t rows, std::size_t cols, const void* x, float* out) {
+    const auto* weights = static_cast<const Block*>(w);
+    const auto* activations = static_cast<const BlockQ8_K*>(x);
+    const std::size_t blocks = cols / kSuperBlockSize;
+    for (std::size_t g = 0; g < rows / 4; ++g) Dot4(weights + g * blocks, activations, blocks, out + 4 * g);
+}
+
+template <typename Block, void (*Dot4)(const Block*, const BlockQ8_K*, std::size_t, float[4])>
+void matmul_grouped_k_generic(const void* w, std::size_t rows, std::size_t cols, const void* x, std::size_t n, float* out) {
+    const auto* weights = static_cast<const Block*>(w);
+    const auto* activations = static_cast<const BlockQ8_K*>(x);
+    const std::size_t blocks = cols / kSuperBlockSize;
+    for (std::size_t g = 0; g < rows / 4; ++g) {
+        for (std::size_t t = 0; t < n; ++t) Dot4(weights + g * blocks, activations + t * blocks, blocks, out + t * rows + 4 * g);
+    }
+}
+
 void matmul_q4_0x4_generic(const void* w, std::size_t rows, std::size_t cols, const void* x, std::size_t n, float* out) {
     const auto* weights = static_cast<const BlockQ4_0x4*>(w);
     const auto* activations = static_cast<const BlockQ8_0*>(x);
@@ -70,6 +88,10 @@ KernelSet generic_kernels(WeightFormat format) {
             return {matvec_q4_0x4_generic, matmul_q4_0x4_generic};
         case WeightFormat::TQ2_0x4:
             return {matvec_tq2_0x4_generic, matmul_tq2_0x4_generic};
+        case WeightFormat::Q4_Kx4:
+            return {matvec_grouped_k_generic<BlockQ4_Kx4, dot_q4_kx4_q8_k>, matmul_grouped_k_generic<BlockQ4_Kx4, dot_q4_kx4_q8_k>};
+        case WeightFormat::Q6_Kx4:
+            return {matvec_grouped_k_generic<BlockQ6_Kx4, dot_q6_kx4_q8_k>, matmul_grouped_k_generic<BlockQ6_Kx4, dot_q6_kx4_q8_k>};
         case WeightFormat::Q4_0:
             return {matvec_generic<BlockQ4_0, BlockQ8_0, dot_q4_0_q8_0>, matmul_generic<BlockQ4_0, BlockQ8_0, dot_q4_0_q8_0>};
         case WeightFormat::Q4_1:
@@ -116,11 +138,23 @@ std::vector<NamedKernels> neon_kernels(WeightFormat format) {
             break;
         case WeightFormat::TQ2_0x4:
             if (dotprod && cpu_features().i8mm) {
-                out.push_back({"i8mm", {matvec_tq2_0x4_dotprod, matmul_tq2_0x4_i8mm, prepare_tq2_0x4_i8mm,
-                                        prepared_bytes_tq2_0x4_i8mm}});
+                out.push_back({"i8mm", {matvec_tq2_0x4_dotprod, matmul_tq2_0x4_i8mm, prepare_k_i8mm, prepared_bytes_k_i8mm}});
+            }
+            break;
+        case WeightFormat::Q4_Kx4:
+            if (dotprod && cpu_features().i8mm) {
+                out.push_back({"i8mm", {matvec_q4_kx4_dotprod, matmul_q4_kx4_i8mm, prepare_k_i8mm, prepared_bytes_k_i8mm}});
+            }
+            break;
+        case WeightFormat::Q6_Kx4:
+            if (dotprod && cpu_features().i8mm) {
+                out.push_back({"i8mm", {matvec_q6_kx4_dotprod, matmul_q6_kx4_i8mm, prepare_k_i8mm, prepared_bytes_k_i8mm}});
             }
             break;
         case WeightFormat::Q4_1:
+            out.push_back({"neon", {matvec_q4_1_neon, matmul_q4_1_neon}});
+            if (dotprod) out.push_back({"dotprod", {matvec_q4_1_dotprod, matmul_q4_1_dotprod}});
+            break;
         case WeightFormat::F32:
             break;
     }

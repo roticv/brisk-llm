@@ -54,7 +54,7 @@ Rules: same model file, same prompt, same thread count as the baseline. On the A
 - Pi results: generation at or slightly above llama.cpp on every file; prompt processing within 12% on the 0.6B and 5% on the 1.7B (`bench/RESULTS.md`).
 - Mac results (`bench/RESULTS.md`): with `i8mm` (smmla) batched kernels, a four-row interleaved Q4_0 layout repacked at load, and NEON attention, Qwen3-1.7B generation is 7% behind llama.cpp's CPU path at 4 threads and 21% ahead at 10 (80 vs 66, also ahead of Metal's 69); prompt processing is 30% behind at 4 threads and 16% behind at 10.
 - Done later (2026-10-09): the thread pool ends a dispatch when its tasks are done rather than when every worker reports in (the efficiency cores respond slowly, which made each dispatch cost 18-33 us at 10 threads), and Q/K/V and gate/up are single dispatches; 10-thread generation gained 5-10%.
-- Not done: the K-quants (Q4_K, Q6_K) have no batched tiles or interleaved layout, so Q4_K_M files trail llama.cpp on the Mac.
+- Done later (2026-10-10): Q4_K and Q6_K got the four-row interleaved layout, sdot generation kernels and smmla tiles, and Q4_1 NEON kernels; Q4_K_M generation went from 50 to 59 (4 threads) and 76 (10 threads) against llama.cpp's 59 / 54, and prompts from 65 to 247. The same Q6_K kernels doubled BitNet's prompt rate (its output layer is Q6_K).
 
 **Done when:** Qwen3-1.7B generation is within 10% of llama.cpp on both machines and prompt processing is within 25%, with perplexity matching. On the Mac, generation with all 10 cores should beat llama.cpp's 4-core number. Met on the Pi and, for Q4_0, on the Mac except prompt processing at 4 threads (30% behind).
 
@@ -64,7 +64,7 @@ Status so far (details in `bench/RESULTS.md`):
 
 - **BitNet b1.58 2B4T runs in brisk** (Llama 3 tokenizer, squared-ReLU feed-forward, sub-norms, TQ2_0 ternary kernels with a four-row interleaved layout and an smmla prompt tile). Perplexity matches llama.cpp within 0.13%. The baseline is mainline llama.cpp with a one-line local patch (its BitNet graph uses SiLU; this model uses squared ReLU); bitnet.cpp's generic ternary kernel has no NEON path and its ARM path needs a different conversion and generated kernels.
 - **The "0.4 GB" model reads 0.72-0.81 GB per token**, because its 128k-token embedding/output layer is 185-269 MB on its own. That is 25% fewer bytes than Qwen3-1.7B Q4_0, not 3x. Vocabulary pruning and the output-layer shortcut are therefore part of the BitNet work, not separate from it.
-- **On the M4 ternary does not pay:** generation is compute-bound (four times the work per byte of Q4_0) and the fanless Air throttles, so sustained generation is 35-40 tokens/s against 66 for Qwen3-1.7B Q4_0. brisk is still ahead of llama.cpp on the same file (30-36, with large variance).
+- **On the M4 ternary pays only with cooling pauses:** generation is compute-bound (four times the work per byte of Q4_0), so back-to-back runs on the fanless Air throttle to 35-40 tokens/s; with 20 s pauses between runs it reaches 79-108, above Qwen3-1.7B Q4_0's 69-79, and 2-3x llama.cpp on the same file.
 - **On the Pi it does, modestly:** 4.6 tokens/s against 3.6 for Qwen3-1.7B Q4_0, for a model with 40% more parameters.
 - **Speculative decoding is built and exact** (`--draft lookup` or `--draft <model>`), but with Qwen3-0.6B drafting the 1.7B it is slower than plain decoding (42 vs 70 tokens/s): the draft costs a third of a target token per guess. Lookup drafting is free and gives 2-2.4x on text that repeats its context, nothing on fresh text. Model drafting needs a draft under a tenth of the target's cost, which no Qwen3 pair offers.
 
@@ -119,15 +119,17 @@ Like-for-like on the same files (details and conditions in `bench/RESULTS.md`):
 
 | | brisk | llama.cpp |
 |---|---|---|
-| M4, Qwen3-1.7B Q4_0, generation 4 / 10 threads | 67 / 83 | 71 / 66 (Metal 86 / 69) |
-| M4, Qwen3-1.7B Q4_0, prompt 4 / 10 threads | 247 / 373 | 347 / 426 |
-| M4, Qwen3-1.7B Q4_K_M, generation 4 / 10 threads | 50 / 51 | 59 / 54 |
-| M4, BitNet 2B4T, generation 4 threads | 40 | 36 |
+| M4, Qwen3-1.7B Q4_0, generation 4 / 10 threads | 69 / 79 | 71 / 66 (Metal 86 / 69) |
+| M4, Qwen3-1.7B Q4_0, prompt 4 / 10 threads | 269 / 376 | 347 / 426 |
+| M4, Qwen3-1.7B Q4_K_M, generation 4 / 10 threads | 59 / 76 | 59 / 54 (Metal 75 / 65) |
+| M4, Qwen3-1.7B Q4_K_M, prompt 4 / 10 threads | 247 / 376 | 224 / 301 |
+| M4, Qwen3-0.6B Q4_0, generation 4 / 10 threads | 178 / 219 | 189 / 162 (Metal 198 / 165) |
+| M4, BitNet 2B4T, generation 4 / 10 threads | 79 / 108 | 36 / 10 |
 | Pi 4, Qwen3-1.7B Q4_0, prompt / generation | 6.6 / 3.7 | 5.8 / 3.3 |
 | Pi 4, Qwen3-0.6B Q4_0, prompt / generation | 19.4 / 9.9 | 19.0 / 9.7 |
 | Pi 4, BitNet 2B4T, generation | 4.6 | 4.7 |
 
-Faster than llama.cpp: generation on the Pi, generation on the M4 with all cores, BitNet on the M4, lookup-drafted generation on repetitive text (2x). Not faster: M4 generation on 4 threads (7% behind), M4 prompt processing (16-30% behind), K-quant files on the M4. Both engines sit at 80-90% of the memory-bandwidth ceiling for generation, which is why the margins either way are small.
+Faster than llama.cpp: generation on the Pi, generation on the M4 with all cores (18-45%, also past Metal), BitNet on the M4 (2-3x), Q4_K_M files on the M4, lookup-drafted generation on repetitive text (2x). Level: M4 generation on 4 threads (within 3-6%). Not faster: M4 prompt processing on Q4_0 at 4 threads (7-23% behind). Both engines sit at 80-90% of the memory-bandwidth ceiling for generation, which is why the 4-thread margins are small.
 
 ## Open questions
 

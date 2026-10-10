@@ -41,37 +41,30 @@ Ceiling = bandwidth / model file size. This is approximate: `membw` is a simple 
 - Prompt processing is compute-bound: Metal is 2.5-4x faster than CPU, and KleidiAI adds only about 10%. There is room for a better CPU path.
 - Beyond that, fewer bits per weight is the remaining lever, as the roadmap assumes.
 
-### brisk on the M4 (Phase 2, with i8mm kernels and the interleaved layout)
+### brisk on the M4 (current)
 
-Idle machine, pure Q4_0 files for both engines (llama.cpp numbers from `MacBook-Air-llama.cpp-8216c84-pure.md`), prompt = ~500 tokens, generation = 128 tokens from an almost empty context, medians of 5. Tokens/s.
+Idle machine, 20 s pause between runs (as llama-bench's --delay; the fanless Air throttles otherwise, and brisk's compute-heavier kernels suffer more from that than llama.cpp's), prompt = ~500 tokens, generation = 128 tokens from an almost empty context, medians of 5. llama.cpp CPU and Metal numbers are from the baseline runs on the same files. Tokens/s.
 
-| Model | Threads | brisk prompt | llama.cpp CPU prompt | llama.cpp Metal prompt | brisk generation | llama.cpp CPU generation | llama.cpp Metal generation |
+| File | Threads | brisk prompt | llama.cpp CPU | llama.cpp Metal | brisk generation | llama.cpp CPU | llama.cpp Metal |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| Qwen3-0.6B pure Q4_0 | 4 | 575 | 697 | 2845 | 168 | 189 | 198 |
-| Qwen3-0.6B pure Q4_0 | 10 | 898 | 882 | 2759 | 191 | 162 | 165 |
-| Qwen3-1.7B pure Q4_0 | 4 | 247 | 347 | 1003 | 67 | 71 | 86 |
-| Qwen3-1.7B pure Q4_0 | 10 | 373 | 426 | 1015 | 83 | 66 | 69 |
-| Qwen3-1.7B Q4_K_M | 4 | 65 | 224 | 893 | 50 | 59 | 75 |
-| Qwen3-1.7B Q4_K_M | 10 | 106 | 301 | 897 | 51 | 54 | 65 |
+| Qwen3-0.6B pure Q4_0 | 4 | 687 | 697 | 2845 | 178 | 189 | 198 |
+| Qwen3-0.6B pure Q4_0 | 10 | 1043 | 882 | 2759 | 219 | 162 | 165 |
+| Qwen3-1.7B pure Q4_0 | 4 | 269 | 347 | 1003 | 69 | 71 | 86 |
+| Qwen3-1.7B pure Q4_0 | 10 | 376 | 426 | 1015 | 79 | 66 | 69 |
+| Qwen3-1.7B Q4_K_M | 4 | 247 | 224 | 893 | 59 | 59 | 75 |
+| Qwen3-1.7B Q4_K_M | 10 | 376 | 301 | 897 | 76 | 54 | 65 |
+| Qwen3-1.7B Q4_0 (Q6_K embedding, Q4_1) | 4 | 269 | 353 | 946 | 63 | 65 | 78 |
+| Qwen3-1.7B Q4_0 (Q6_K embedding, Q4_1) | 10 | 358 | 401 | 958 | 81 | 56 | 74 |
+| Qwen3-0.6B Q4_0 (Q6_K embedding) | 4 | 644 | 934 | 2728 | 162 | 167 | 175 |
+| Qwen3-0.6B Q4_0 (Q6_K embedding) | 10 | 844 | 311 | 2692 | 181 | 129 | 159 |
+| BitNet 2B4T TQ2_0 (Q6_K embedding) | 4 | 209 | 139 | | 71 | 30 | |
+| BitNet 2B4T TQ2_0 (Q6_K embedding) | 10 | 368 | 81 | | 99 | | |
+| BitNet 2B4T TQ2_0 (Q4_0 embedding) | 4 | 240 | 130 | | 79 | 36 | |
+| BitNet 2B4T TQ2_0 (Q4_0 embedding) | 10 | 365 | 125 | | 108 | 10 | |
 
-(Q4_K_M llama.cpp numbers are from the first baseline run on the same file.)
+Reading: generation is level with llama.cpp's CPU path at 4 threads (within 3-6%) and 18-45% ahead at 10, where it also passes Metal; prompt processing is 7-23% behind on Q4_0 at 4 threads, ahead on Q4_K_M, and ahead at 10 threads on the small model. All formats now use the four-row interleaved layouts with smmla tiles (Q4_0, Q4_K, Q6_K, TQ2_0) on CPUs with i8mm. Earlier tables in this file's history were measured without pauses and understated brisk, most of all on BitNet (35-40 then, 71-108 now).
 
-Reading: on Q4_0, generation is 6-11% behind llama.cpp's CPU path at 4 threads and 18-26% ahead at 10 threads (and ahead of Metal at 10); prompt processing is within 15-30% at 4 threads and within 2-12% at 10. The K-quants have NEON kernels but no batched tiles or interleaved layout yet, so they trail on both counts. Before the i8mm kernels (commit 45d473f) prompt processing was 2.3-3.4x behind. The 10-thread generation numbers improved 5-10% when the thread pool stopped waiting for every worker to report in at the end of each dispatch (the efficiency cores respond slowly) and Q/K/V and gate/up became single dispatches.
-
-### BitNet b1.58 2B4T on the M4 (Phase 3)
-
-Ternary weights (TQ2_0, 537 MB) with the 128k-token embedding/output layer as Q6_K (269 MB, file `bitnet-2B4T-TQ2_0.gguf`) or Q4_0 (185 MB, `-e4`). llama.cpp is mainline with a one-line patch (squared ReLU) since its BitNet graph uses SiLU; bitnet.cpp's generic i2_s kernel has no NEON path (1.1 tokens/s). Medians of 5, tokens/s.
-
-| File | Threads | brisk prompt | llama.cpp prompt | brisk generation | llama.cpp generation |
-|---|---:|---:|---:|---:|---:|
-| TQ2_0 + Q6_K embedding | 4 | 110 | 139 | 35 | 30 |
-| TQ2_0 + Q6_K embedding | 10 | 183 | 81 | 28 | |
-| TQ2_0 + Q4_0 embedding | 4 | 110 | 130 | 40 | 36 ± 13 |
-| TQ2_0 + Q4_0 embedding | 10 | 182 | 125 | 31 | 10 ± 8 |
-
-Single short runs reach 52-75 tokens/s, but sustained runs do not: ternary generation is compute-bound on the M4 (the kernel does four times the work per byte of Q4_0), and the fanless Air throttles under sustained compute. Both engines show large run-to-run variance for the same reason. Per token, the file reads 0.72-0.81 GB, which is less than Qwen3-1.7B Q4_0 (0.97 GB) but not by the 3x the "0.4 GB" figure suggests, because the 128k-vocabulary output layer is a third of the bytes.
-
-Perplexity matches llama.cpp within 0.13%; the Llama 3 tokenizer matches on 2,117 test strings.
+Per token, the BitNet files read 0.72-0.81 GB, less than Qwen3-1.7B Q4_0 (0.97 GB) but not by the 3x the "0.4 GB" figure suggests, because the 128k-vocabulary output layer is a third of the bytes. Perplexity matches llama.cpp within 0.13%; the Llama 3 tokenizer matches on 2,117 test strings.
 
 ### Speculative decoding on the M4 (Phase 3)
 

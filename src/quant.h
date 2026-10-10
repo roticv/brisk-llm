@@ -12,7 +12,7 @@ constexpr std::size_t kBlockSize = 32;  // weights per block for Q4_0 and Q8_0
 
 // Storage formats of weight matrices that the engine can multiply by.
 // Q4_0x4 is Q4_0 repacked at load time (see BlockQ4_0x4); it never appears in files.
-enum class WeightFormat { F32, Q4_0, Q4_1, Q4_K, Q6_K, Q4_0x4, TQ2_0, TQ2_0x4 };
+enum class WeightFormat { F32, Q4_0, Q4_1, Q4_K, Q6_K, Q4_0x4, TQ2_0, TQ2_0x4, Q4_Kx4, Q6_Kx4 };
 
 // Weights per block and bytes per block of a quantised format.
 std::size_t block_elements(WeightFormat format);
@@ -105,6 +105,41 @@ static_assert(sizeof(BlockTQ2_0x4) == 264);
 void repack_tq2_0x4(const BlockTQ2_0* in, std::size_t rows, std::size_t blocks, BlockTQ2_0x4* out);
 void dequantize_tq2_0x4_row(const BlockTQ2_0x4* group, std::size_t row_in_group, float* out, std::size_t count);
 
+// One Q4_K block from each of four consecutive rows, interleaved for the
+// NEON kernels. A chunk is 8 consecutive elements of a row. For row pair rp
+// (rows 2rp, 2rp+1) and sub-block sb (32 elements = chunks 0..3), the 32 bytes
+// at qs[256 rp + 32 sb] are two 16-byte vectors v = 0, 1; byte k of vector v
+// holds element k % 8 of chunk v (low nibble) and of chunk v + 2 (high
+// nibble), of row 2rp for k < 8 and row 2rp+1 for k >= 8. So one load, one
+// AND and one shift give two [row a chunk | row b chunk] vectors. Scales and
+// minimums are copied per row unchanged.
+struct BlockQ4_Kx4 {
+    std::uint8_t qs[512];
+    std::uint8_t scales[4][12];
+    std::uint16_t d[4];
+    std::uint16_t dmin[4];
+};
+static_assert(sizeof(BlockQ4_Kx4) == 576);
+
+// One Q6_K block from each of four consecutive rows. Per row pair rp and
+// 64-element group g (chunks 0..7): `low[rp][g]` holds the low four bits of
+// each value as four vectors, vector v's low nibbles being chunk v and its
+// high nibbles chunk v + 4, rows split by halves as above; `high[rp][g]`
+// holds the top two bits as two vectors, bit pair l (0..3) of vector v
+// being chunk 4v + l. Values are 0..63 with the offset of 32 still included.
+struct BlockQ6_Kx4 {
+    std::uint8_t low[2][4][64];
+    std::uint8_t high[2][4][32];
+    std::int8_t scales[4][16];
+    std::uint16_t d[4];
+};
+static_assert(sizeof(BlockQ6_Kx4) == 512 + 256 + 64 + 8);
+
+void repack_q4_kx4(const BlockQ4_K* in, std::size_t rows, std::size_t blocks, BlockQ4_Kx4* out);
+void dequantize_q4_kx4_row(const BlockQ4_Kx4* group, std::size_t row_in_group, float* out, std::size_t count);
+void repack_q6_kx4(const BlockQ6_K* in, std::size_t rows, std::size_t blocks, BlockQ6_Kx4* out);
+void dequantize_q6_kx4_row(const BlockQ6_Kx4* group, std::size_t row_in_group, float* out, std::size_t count);
+
 // Activations for the K-quants: 256 signed 8-bit values with a float scale,
 // plus the sum of each group of 16, which the kernels need for the offsets.
 struct BlockQ8_K {
@@ -130,7 +165,7 @@ template <typename Block>
 constexpr std::size_t block_elements_of() {
     return sizeof(Block) == sizeof(BlockQ4_0) || sizeof(Block) == sizeof(BlockQ4_1) || sizeof(Block) == sizeof(BlockQ4_0x4)
                ? kBlockSize
-               : kSuperBlockSize;  // Q4_K, Q6_K, TQ2_0, TQ2_0x4
+               : kSuperBlockSize;  // Q4_K, Q6_K, TQ2_0 and the grouped K-quant layouts
 }
 
 // Decodes the 256 6-bit values of a Q6_K block, offset removed, in weight order.
@@ -146,6 +181,8 @@ float dot_q6_k_q8_k(const BlockQ6_K* w, const BlockQ8_K* x, std::size_t blocks);
 float dot_tq2_0_q8_k(const BlockTQ2_0* w, const BlockQ8_K* x, std::size_t blocks);
 // All four rows of a packed ternary group at once: out[0..3].
 void dot_tq2_0x4_q8_k(const BlockTQ2_0x4* w, const BlockQ8_K* x, std::size_t blocks, float out[4]);
+void dot_q4_kx4_q8_k(const BlockQ4_Kx4* w, const BlockQ8_K* x, std::size_t blocks, float out[4]);
+void dot_q6_kx4_q8_k(const BlockQ6_Kx4* w, const BlockQ8_K* x, std::size_t blocks, float out[4]);
 
 // Unpacks the 6-bit scale and minimum of sub-block j (0-7) of a Q4_K block.
 inline void q4_k_scale_min(const std::uint8_t* scales, int j, std::uint8_t& scale, std::uint8_t& min) {

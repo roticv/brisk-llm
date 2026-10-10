@@ -139,6 +139,31 @@ inline float32x4_t half4_to_float(std::uint16_t h) {
     return vcvt_f32_f16(vreinterpret_f16_u16(vdup_n_u16(h)));
 }
 
+// ---- Q4_1 -----------------------------------------------------------------
+//
+// weight = q * d + m, so dot = d_w d_x sum(q x) + m_w (d_x sum(x)). The
+// nibbles stay unsigned; DotBlockU(w_low, w_high, x) must treat them so.
+
+inline void unpack_q4_1(const BlockQ4_1& block, int8x16_t& low, int8x16_t& high) {
+    const uint8x16_t packed = vld1q_u8(block.qs);
+    low = vreinterpretq_s8_u8(vandq_u8(packed, vdupq_n_u8(0x0F)));
+    high = vreinterpretq_s8_u8(vshrq_n_u8(packed, 4));
+}
+
+template <typename DotBlock>
+inline float dot_row_q4_1(const BlockQ4_1* w, const BlockQ8_0* x, std::size_t blocks, DotBlock dot_block) {
+    float total = 0.0f;
+    for (std::size_t b = 0; b < blocks; ++b) {
+        int8x16_t l, h;
+        unpack_q4_1(w[b], l, h);
+        const float dx = vgetq_lane_f32(half4_to_float(x[b].d), 0);
+        const std::int32_t xsum = vaddlvq_s8(vld1q_s8(x[b].qs)) + vaddlvq_s8(vld1q_s8(x[b].qs + 16));
+        total += static_cast<float>(vaddvq_s32(dot_block(l, h, x[b]))) * vgetq_lane_f32(half4_to_float(w[b].d), 0) * dx +
+                 vgetq_lane_f32(half4_to_float(w[b].m), 0) * (dx * static_cast<float>(xsum));
+    }
+    return total;
+}
+
 // Decodes a Q6_K block into 16 vectors of 16 signed values, offset removed,
 // in weight order (so vector g holds the elements scaled by scales[g]).
 inline void unpack_q6_k(const BlockQ6_K& block, int8x16_t q[16]) {

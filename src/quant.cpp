@@ -19,7 +19,9 @@ std::size_t block_elements(WeightFormat format) {
         case WeightFormat::Q4_K:
         case WeightFormat::Q6_K:
         case WeightFormat::TQ2_0:
-        case WeightFormat::TQ2_0x4: return kSuperBlockSize;
+        case WeightFormat::TQ2_0x4:
+        case WeightFormat::Q4_Kx4:
+        case WeightFormat::Q6_Kx4: return kSuperBlockSize;
     }
     return 1;
 }
@@ -34,13 +36,15 @@ std::size_t block_bytes(WeightFormat format) {
         case WeightFormat::Q6_K: return sizeof(BlockQ6_K);
         case WeightFormat::TQ2_0: return sizeof(BlockTQ2_0);
         case WeightFormat::TQ2_0x4: return sizeof(BlockTQ2_0x4) / 4;  // per row
+        case WeightFormat::Q4_Kx4: return sizeof(BlockQ4_Kx4) / 4;
+        case WeightFormat::Q6_Kx4: return sizeof(BlockQ6_Kx4) / 4;
     }
     return 0;
 }
 
 bool takes_q8_k(WeightFormat format) {
     return format == WeightFormat::Q4_K || format == WeightFormat::Q6_K || format == WeightFormat::TQ2_0 ||
-           format == WeightFormat::TQ2_0x4;
+           format == WeightFormat::TQ2_0x4 || format == WeightFormat::Q4_Kx4 || format == WeightFormat::Q6_Kx4;
 }
 
 float half_to_float(std::uint16_t half) {
@@ -470,6 +474,169 @@ void dot_tq2_0x4_q8_k(const BlockTQ2_0x4* w, const BlockQ8_K* x, std::size_t blo
                 acc += (((w[b].qs[byte] >> shift) & 3) - 1) * x[b].qs[e];
             }
             sum += static_cast<float>(acc) * half_to_float(w[b].d[r]) * x[b].d;
+        }
+        out[r] = sum;
+    }
+}
+
+namespace {
+
+// Value 0..15 of element e of a Q4_K block, and its sub-block.
+inline int q4_k_value(const BlockQ4_K& block, std::size_t e) {
+    const std::size_t chunk64 = e / 64, within = e % 64;
+    const std::uint8_t byte = block.qs[chunk64 * 32 + within % 32];
+    return within < 32 ? (byte & 0x0F) : (byte >> 4);
+}
+
+// Where element e of row r lives in a Q4_Kx4 block.
+inline void q4_kx4_position(std::size_t r, std::size_t e, std::size_t& byte, bool& high) {
+    const std::size_t sb = e / 32, c = (e % 32) / 8, k = e % 8;
+    byte = 256 * (r / 2) + 32 * sb + 16 * (c % 2) + 8 * (r % 2) + k;
+    high = c >= 2;
+}
+
+// Where element e of row r lives in a Q6_Kx4 block: the nibble and the bit pair.
+inline void q6_kx4_position(std::size_t r, std::size_t e, std::size_t& low_byte, bool& low_high, std::size_t& high_byte,
+                            unsigned& high_shift) {
+    const std::size_t g = e / 64, c = (e % 64) / 8, k = e % 8;
+    const std::size_t rp = r / 2, half = 8 * (r % 2);
+    low_byte = (rp * 4 + g) * 64 + 16 * (c % 4) + half + k;
+    low_high = c >= 4;
+    high_byte = (rp * 4 + g) * 32 + 16 * (c / 4) + half + k;
+    high_shift = static_cast<unsigned>(2 * (c % 4));
+}
+
+}  // namespace
+
+void repack_q4_kx4(const BlockQ4_K* in, std::size_t rows, std::size_t blocks, BlockQ4_Kx4* out) {
+    for (std::size_t g = 0; g < rows / 4; ++g) {
+        for (std::size_t b = 0; b < blocks; ++b) {
+            BlockQ4_Kx4& packed = out[g * blocks + b];
+            std::memset(packed.qs, 0, sizeof(packed.qs));
+            for (std::size_t r = 0; r < 4; ++r) {
+                const BlockQ4_K& block = in[(g * 4 + r) * blocks + b];
+                packed.d[r] = block.d;
+                packed.dmin[r] = block.dmin;
+                std::memcpy(packed.scales[r], block.scales, 12);
+                for (std::size_t e = 0; e < kSuperBlockSize; ++e) {
+                    std::size_t byte;
+                    bool high;
+                    q4_kx4_position(r, e, byte, high);
+                    const int q = q4_k_value(block, e);
+                    packed.qs[byte] |= static_cast<std::uint8_t>(high ? q << 4 : q);
+                }
+            }
+        }
+    }
+}
+
+void dequantize_q4_kx4_row(const BlockQ4_Kx4* group, std::size_t row_in_group, float* out, std::size_t count) {
+    for (std::size_t b = 0; b < count / kSuperBlockSize; ++b) {
+        const BlockQ4_Kx4& packed = group[b];
+        const float d = half_to_float(packed.d[row_in_group]);
+        const float dmin = half_to_float(packed.dmin[row_in_group]);
+        for (std::size_t e = 0; e < kSuperBlockSize; ++e) {
+            std::uint8_t scale, min;
+            q4_k_scale_min(packed.scales[row_in_group], static_cast<int>(e / 32), scale, min);
+            std::size_t byte;
+            bool high;
+            q4_kx4_position(row_in_group, e, byte, high);
+            const int q = high ? (packed.qs[byte] >> 4) : (packed.qs[byte] & 0x0F);
+            out[b * kSuperBlockSize + e] = d * scale * static_cast<float>(q) - dmin * min;
+        }
+    }
+}
+
+void dot_q4_kx4_q8_k(const BlockQ4_Kx4* w, const BlockQ8_K* x, std::size_t blocks, float out[4]) {
+    for (std::size_t r = 0; r < 4; ++r) {
+        float sum = 0.0f;
+        for (std::size_t b = 0; b < blocks; ++b) {
+            std::int32_t weighted = 0, offsets = 0;
+            for (int sb = 0; sb < 8; ++sb) {
+                std::uint8_t scale, min;
+                q4_k_scale_min(w[b].scales[r], sb, scale, min);
+                std::int32_t dot = 0;
+                for (std::size_t i = 0; i < 32; ++i) {
+                    const std::size_t e = static_cast<std::size_t>(sb) * 32 + i;
+                    std::size_t byte;
+                    bool high;
+                    q4_kx4_position(r, e, byte, high);
+                    dot += (high ? (w[b].qs[byte] >> 4) : (w[b].qs[byte] & 0x0F)) * x[b].qs[e];
+                }
+                weighted += scale * dot;
+                offsets += min * (x[b].bsums[2 * sb] + x[b].bsums[2 * sb + 1]);
+            }
+            sum += x[b].d * (half_to_float(w[b].d[r]) * static_cast<float>(weighted) -
+                             half_to_float(w[b].dmin[r]) * static_cast<float>(offsets));
+        }
+        out[r] = sum;
+    }
+}
+
+void repack_q6_kx4(const BlockQ6_K* in, std::size_t rows, std::size_t blocks, BlockQ6_Kx4* out) {
+    std::int8_t q[kSuperBlockSize];
+    for (std::size_t g = 0; g < rows / 4; ++g) {
+        for (std::size_t b = 0; b < blocks; ++b) {
+            BlockQ6_Kx4& packed = out[g * blocks + b];
+            std::memset(packed.low, 0, sizeof(packed.low));
+            std::memset(packed.high, 0, sizeof(packed.high));
+            for (std::size_t r = 0; r < 4; ++r) {
+                const BlockQ6_K& block = in[(g * 4 + r) * blocks + b];
+                packed.d[r] = block.d;
+                std::memcpy(packed.scales[r], block.scales, 16);
+                unpack_q6_k(block, q);  // values -32..31
+                for (std::size_t e = 0; e < kSuperBlockSize; ++e) {
+                    const unsigned v = static_cast<unsigned>(q[e] + 32);  // 0..63
+                    std::size_t low_byte, high_byte;
+                    bool low_high;
+                    unsigned high_shift;
+                    q6_kx4_position(r, e, low_byte, low_high, high_byte, high_shift);
+                    (&packed.low[0][0][0])[low_byte] |= static_cast<std::uint8_t>(low_high ? (v & 0xF) << 4 : (v & 0xF));
+                    (&packed.high[0][0][0])[high_byte] |= static_cast<std::uint8_t>((v >> 4) << high_shift);
+                }
+            }
+        }
+    }
+}
+
+namespace {
+
+inline int q6_kx4_value(const BlockQ6_Kx4& packed, std::size_t r, std::size_t e) {
+    std::size_t low_byte, high_byte;
+    bool low_high;
+    unsigned high_shift;
+    q6_kx4_position(r, e, low_byte, low_high, high_byte, high_shift);
+    const std::uint8_t lo = (&packed.low[0][0][0])[low_byte];
+    const std::uint8_t hi = (&packed.high[0][0][0])[high_byte];
+    return static_cast<int>((low_high ? (lo >> 4) : (lo & 0xF)) | (((hi >> high_shift) & 3) << 4)) - 32;
+}
+
+}  // namespace
+
+void dequantize_q6_kx4_row(const BlockQ6_Kx4* group, std::size_t row_in_group, float* out, std::size_t count) {
+    for (std::size_t b = 0; b < count / kSuperBlockSize; ++b) {
+        const float d = half_to_float(group[b].d[row_in_group]);
+        for (std::size_t e = 0; e < kSuperBlockSize; ++e) {
+            out[b * kSuperBlockSize + e] =
+                d * group[b].scales[row_in_group][e / 16] * static_cast<float>(q6_kx4_value(group[b], row_in_group, e));
+        }
+    }
+}
+
+void dot_q6_kx4_q8_k(const BlockQ6_Kx4* w, const BlockQ8_K* x, std::size_t blocks, float out[4]) {
+    for (std::size_t r = 0; r < 4; ++r) {
+        float sum = 0.0f;
+        for (std::size_t b = 0; b < blocks; ++b) {
+            std::int32_t weighted = 0;
+            for (int sb = 0; sb < 16; ++sb) {
+                std::int32_t dot = 0;
+                for (std::size_t i = 0; i < 16; ++i) {
+                    const std::size_t e = static_cast<std::size_t>(sb) * 16 + i;
+                    dot += q6_kx4_value(w[b], r, e) * x[b].qs[e];
+                }
+                weighted += w[b].scales[r][sb] * dot;
+            }
+            sum += x[b].d * half_to_float(w[b].d[r]) * static_cast<float>(weighted);
         }
         out[r] = sum;
     }

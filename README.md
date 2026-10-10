@@ -55,4 +55,4 @@ Benchmarks on the Air are only meaningful with nothing else running; the fanless
 
 ## Status
 
-Phases 0-2 of the roadmap are done; Phase 3 stopped after BitNet and speculative decoding, with the findings recorded in the roadmap. In short: generation on both machines sits within a few percent of llama.cpp either way, because both are at 80-90% of the memory-bandwidth ceiling; brisk is ahead on the Pi, on the M4 with all cores, and on BitNet, and behind on M4 prompt processing and on K-quant files.
+Phases 0-2 of the roadmap are done; Phase 3 stopped after BitNet and speculative decoding, with the findings recorded in the roadmap. In short: generation at 4 threads sits within a few percent of llama.cpp either way, because both engines are at 80-90% of the memory-bandwidth ceiling; brisk is ahead on the Pi, on the M4 with all cores (where it also passes llama.cpp's Metal path), on Q4_K_M files, and on BitNet (2-3x), and behind on M4 prompt processing of Q4_0 files at 4 threads.

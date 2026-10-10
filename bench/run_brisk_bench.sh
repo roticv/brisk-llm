@@ -9,11 +9,13 @@
 #   MODELS     space-separated GGUFs        (default: the pure Q4_0 files in models/)
 #   THREADS    space-separated thread counts (default: perf cores and all cores on macOS, all cores on Linux)
 #   REPS       repetitions per test         (default: 5)
+#   DELAY      seconds between runs          (default: 20, lets a fanless machine cool down)
 set -euo pipefail
 
 BRISK=${BRISK:-build-release/brisk}
 MODELS=${MODELS:-"models/Qwen3-0.6B-pure-Q4_0.gguf models/Qwen3-1.7B-pure-Q4_0.gguf"}
 REPS=${REPS:-5}
+DELAY=${DELAY:-20}
 if [[ $(uname) == Darwin ]]; then
     THREADS=${THREADS:-"$(sysctl -n hw.perflevel0.physicalcpu) $(sysctl -n hw.physicalcpu)"}
 else
@@ -27,14 +29,19 @@ mkdir -p bench/results
     echo "|---|---:|---:|---:|"
 } > "$out"
 
+# perl rather than sleep: sleep is intercepted in some automation environments.
+pause() { perl -e "select(undef, undef, undef, $DELAY)"; }
+
 median() { sort -n | awk '{ v[NR] = $1 } END { print (NR % 2) ? v[(NR + 1) / 2] : (v[NR / 2] + v[NR / 2 + 1]) / 2 }'; }
 
 for model in $MODELS; do
     for t in $THREADS; do
         prompt_rates=(); gen_rates=()
         for ((r = 0; r < REPS; r++)); do
+            pause
             line=$("$BRISK" generate "$model" -f bench/prompt512.txt -n 1 -t "$t" --no-stop 2>&1 >/dev/null | tail -1)
             prompt_rates+=("$(sed -E 's/.*prompt [0-9]+ tokens, ([0-9.]+) tokens.*/\1/' <<< "$line")")
+            pause
             line=$("$BRISK" generate "$model" -p "Once" -n 128 -t "$t" --no-stop 2>&1 >/dev/null | tail -1)
             gen_rates+=("$(sed -E 's/.*generation [0-9]+ tokens, ([0-9.]+) tokens.*/\1/' <<< "$line")")
         done

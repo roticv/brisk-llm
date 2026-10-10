@@ -63,6 +63,14 @@ void dequantize_row(brisk::WeightFormat format, const std::uint8_t* w, std::size
             brisk::dequantize_tq2_0x4_row(reinterpret_cast<const brisk::BlockTQ2_0x4*>(w + (r / 4) * blocks * sizeof(brisk::BlockTQ2_0x4)),
                                           r % 4, out.data(), kCols);
             break;
+        case brisk::WeightFormat::Q4_Kx4:
+            brisk::dequantize_q4_kx4_row(reinterpret_cast<const brisk::BlockQ4_Kx4*>(w + (r / 4) * blocks * sizeof(brisk::BlockQ4_Kx4)),
+                                         r % 4, out.data(), kCols);
+            break;
+        case brisk::WeightFormat::Q6_Kx4:
+            brisk::dequantize_q6_kx4_row(reinterpret_cast<const brisk::BlockQ6_Kx4*>(w + (r / 4) * blocks * sizeof(brisk::BlockQ6_Kx4)),
+                                         r % 4, out.data(), kCols);
+            break;
         case brisk::WeightFormat::Q4_0x4:
             brisk::dequantize_q4_0x4_row(reinterpret_cast<const brisk::BlockQ4_0x4*>(w + (r / 4) * blocks * sizeof(brisk::BlockQ4_0x4)),
                                          r % 4, out.data(), kCols);
@@ -181,12 +189,49 @@ void test_kernels_match_dequantised_reference() {
                 case brisk::WeightFormat::Q4_K: std::memcpy(block, &d, 2); std::memcpy(block + 2, &d, 2); break;
                 case brisk::WeightFormat::Q6_K: std::memcpy(block + 208, &d, 2); break;
                 case brisk::WeightFormat::TQ2_0: std::memcpy(block + 64, &d, 2); break;
-                case brisk::WeightFormat::TQ2_0x4: break;
+                case brisk::WeightFormat::TQ2_0x4:
+                case brisk::WeightFormat::Q4_Kx4:
+                case brisk::WeightFormat::Q6_Kx4: break;
                 case brisk::WeightFormat::Q4_0x4:
                 case brisk::WeightFormat::F32: break;
             }
         }
         check_format(format, rows, w.data(), x);
+    }
+
+    // Q4_Kx4 and Q6_Kx4 from repacked random rows; the repacked rows must dequantise identically.
+    {
+        constexpr std::size_t rows_k = 36;
+        const std::size_t blocks_k = kCols / brisk::kSuperBlockSize;
+        std::vector<brisk::BlockQ4_K> q4(rows_k * blocks_k);
+        for (brisk::BlockQ4_K& b : q4) {
+            b.d = brisk::float_to_half(0.001f + 0.001f * std::fabs(normal(rng)));
+            b.dmin = b.d;
+            for (std::uint8_t& v : b.scales) v = byte();
+            for (std::uint8_t& v : b.qs) v = byte();
+        }
+        std::vector<brisk::BlockQ4_Kx4> packed4(rows_k / 4 * blocks_k);
+        brisk::repack_q4_kx4(q4.data(), rows_k, blocks_k, packed4.data());
+        std::vector<brisk::BlockQ6_K> q6(rows_k * blocks_k);
+        for (brisk::BlockQ6_K& b : q6) {
+            b.d = brisk::float_to_half(0.001f + 0.001f * std::fabs(normal(rng)));
+            for (std::int8_t& v : b.scales) v = static_cast<std::int8_t>(byte());
+            for (std::uint8_t& v : b.ql) v = byte();
+            for (std::uint8_t& v : b.qh) v = byte();
+        }
+        std::vector<brisk::BlockQ6_Kx4> packed6(rows_k / 4 * blocks_k);
+        brisk::repack_q6_kx4(q6.data(), rows_k, blocks_k, packed6.data());
+        for (std::size_t r = 0; r < rows_k; ++r) {
+            std::vector<float> a(kCols), b(kCols);
+            brisk::dequantize_q4_k(q4.data() + r * blocks_k, a.data(), kCols);
+            brisk::dequantize_q4_kx4_row(packed4.data() + (r / 4) * blocks_k, r % 4, b.data(), kCols);
+            CHECK(a == b);
+            brisk::dequantize_q6_k(q6.data() + r * blocks_k, a.data(), kCols);
+            brisk::dequantize_q6_kx4_row(packed6.data() + (r / 4) * blocks_k, r % 4, b.data(), kCols);
+            CHECK(a == b);
+        }
+        check_format(brisk::WeightFormat::Q4_Kx4, rows_k, reinterpret_cast<const std::uint8_t*>(packed4.data()), x);
+        check_format(brisk::WeightFormat::Q6_Kx4, rows_k, reinterpret_cast<const std::uint8_t*>(packed6.data()), x);
     }
 
     // TQ2_0x4 from repacked random ternary rows (values 0..2 only, as the format defines).
