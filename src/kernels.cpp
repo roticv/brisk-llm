@@ -17,12 +17,13 @@ void matvec_generic(const void* w, std::size_t rows, std::size_t cols, const voi
 }
 
 template <typename Block, typename Activation, float (*Dot)(const Block*, const Activation*, std::size_t)>
-void matmul_generic(const void* w, std::size_t rows, std::size_t cols, const void* x, std::size_t n, float* out) {
+void matmul_generic(const void* w, std::size_t rows, std::size_t cols, const void* x, std::size_t n, float* out,
+                      std::size_t out_stride) {
     const auto* weights = static_cast<const Block*>(w);
     const auto* activations = static_cast<const Activation*>(x);
     const std::size_t blocks = cols / block_elements_of<Block>();
     for (std::size_t r = 0; r < rows; ++r) {
-        for (std::size_t t = 0; t < n; ++t) out[t * rows + r] = Dot(weights + r * blocks, activations + t * blocks, blocks);
+        for (std::size_t t = 0; t < n; ++t) out[t * out_stride + r] = Dot(weights + r * blocks, activations + t * blocks, blocks);
     }
 }
 
@@ -40,13 +41,14 @@ void matvec_tq2_0x4_generic(const void* w, std::size_t rows, std::size_t cols, c
     for (std::size_t g = 0; g < rows / 4; ++g) dot_tq2_0x4_q8_k(weights + g * blocks, activations, blocks, out + 4 * g);
 }
 
-void matmul_tq2_0x4_generic(const void* w, std::size_t rows, std::size_t cols, const void* x, std::size_t n, float* out) {
+void matmul_tq2_0x4_generic(const void* w, std::size_t rows, std::size_t cols, const void* x, std::size_t n, float* out,
+                      std::size_t out_stride) {
     const auto* weights = static_cast<const BlockTQ2_0x4*>(w);
     const auto* activations = static_cast<const BlockQ8_K*>(x);
     const std::size_t blocks = cols / kSuperBlockSize;
     for (std::size_t g = 0; g < rows / 4; ++g) {
         for (std::size_t t = 0; t < n; ++t) {
-            dot_tq2_0x4_q8_k(weights + g * blocks, activations + t * blocks, blocks, out + t * rows + 4 * g);
+            dot_tq2_0x4_q8_k(weights + g * blocks, activations + t * blocks, blocks, out + t * out_stride + 4 * g);
         }
     }
 }
@@ -60,22 +62,24 @@ void matvec_grouped_k_generic(const void* w, std::size_t rows, std::size_t cols,
 }
 
 template <typename Block, void (*Dot4)(const Block*, const BlockQ8_K*, std::size_t, float[4])>
-void matmul_grouped_k_generic(const void* w, std::size_t rows, std::size_t cols, const void* x, std::size_t n, float* out) {
+void matmul_grouped_k_generic(const void* w, std::size_t rows, std::size_t cols, const void* x, std::size_t n, float* out,
+                      std::size_t out_stride) {
     const auto* weights = static_cast<const Block*>(w);
     const auto* activations = static_cast<const BlockQ8_K*>(x);
     const std::size_t blocks = cols / kSuperBlockSize;
     for (std::size_t g = 0; g < rows / 4; ++g) {
-        for (std::size_t t = 0; t < n; ++t) Dot4(weights + g * blocks, activations + t * blocks, blocks, out + t * rows + 4 * g);
+        for (std::size_t t = 0; t < n; ++t) Dot4(weights + g * blocks, activations + t * blocks, blocks, out + t * out_stride + 4 * g);
     }
 }
 
-void matmul_q4_0x4_generic(const void* w, std::size_t rows, std::size_t cols, const void* x, std::size_t n, float* out) {
+void matmul_q4_0x4_generic(const void* w, std::size_t rows, std::size_t cols, const void* x, std::size_t n, float* out,
+                      std::size_t out_stride) {
     const auto* weights = static_cast<const BlockQ4_0x4*>(w);
     const auto* activations = static_cast<const BlockQ8_0*>(x);
     const std::size_t blocks = cols / kBlockSize;
     for (std::size_t g = 0; g < rows / 4; ++g) {
         for (std::size_t t = 0; t < n; ++t) {
-            dot_q4_0x4_q8_0(weights + g * blocks, activations + t * blocks, blocks, out + t * rows + 4 * g);
+            dot_q4_0x4_q8_0(weights + g * blocks, activations + t * blocks, blocks, out + t * out_stride + 4 * g);
         }
     }
 }

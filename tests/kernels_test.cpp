@@ -138,7 +138,7 @@ void check_format(brisk::WeightFormat format, std::size_t rows, const std::uint8
             v.kernels.prepare(activations, kTokens, blocks, prepared.data());
             batched_input = prepared.data();
         }
-        v.kernels.matmul(w, rows, kCols, batched_input, kTokens, batched.data());
+        v.kernels.matmul(w, rows, kCols, batched_input, kTokens, batched.data(), rows);
         for (std::size_t t = 0; t < kTokens; ++t) {
             std::vector<float> single(rows, 12345.0f);
             const auto* xt = static_cast<const std::uint8_t*>(activations) + t * activation_bytes;

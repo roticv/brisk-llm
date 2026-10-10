@@ -88,6 +88,51 @@ void softmax_f32(std::span<float> x) {
     for (; i < n; ++i) p[i] *= scale;
 }
 
+namespace {
+
+// 4 queries x 4 keys: 16 vector accumulators, each reduced once at the end.
+inline void score_block_4x4(const float* const q[4], const float* const k[4], std::size_t dim, float scale, float* out[4],
+                            std::size_t nq, std::size_t np) {
+    float32x4_t acc[4][4];
+    for (int i = 0; i < 4; ++i) {
+        for (int j = 0; j < 4; ++j) acc[i][j] = vdupq_n_f32(0.0f);
+    }
+    for (std::size_t d = 0; d < dim; d += 4) {
+        const float32x4_t kv[4] = {vld1q_f32(k[0] + d), vld1q_f32(k[1] + d), vld1q_f32(k[2] + d), vld1q_f32(k[3] + d)};
+        for (int i = 0; i < 4; ++i) {
+            const float32x4_t qv = vld1q_f32(q[i] + d);
+            for (int j = 0; j < 4; ++j) acc[i][j] = vmlaq_f32(acc[i][j], qv, kv[j]);
+        }
+    }
+    for (std::size_t i = 0; i < nq; ++i) {
+        for (std::size_t j = 0; j < np; ++j) out[i][j] = vaddvq_f32(acc[i][j]) * scale;
+    }
+}
+
+}  // namespace
+
+void scores_f32(const float* const* queries, std::size_t nq, const float* keys, std::size_t key_stride, std::size_t np,
+                std::size_t dim, float scale, float* const* scores) {
+    for (std::size_t q0 = 0; q0 < nq; q0 += 4) {
+        const std::size_t qn = std::min<std::size_t>(4, nq - q0);
+        // Missing queries/keys in a partial block repeat the block's last one; their results are discarded.
+        const float* q[4];
+        float* out[4];
+        for (std::size_t i = 0; i < 4; ++i) {
+            q[i] = queries[q0 + std::min(i, qn - 1)];
+            out[i] = scores[q0 + std::min(i, qn - 1)];
+        }
+        for (std::size_t p0 = 0; p0 < np; p0 += 4) {
+            const std::size_t pn = std::min<std::size_t>(4, np - p0);
+            const float* k[4];
+            for (std::size_t j = 0; j < 4; ++j) k[j] = keys + (p0 + std::min(j, pn - 1)) * key_stride;
+            float* o[4];
+            for (std::size_t i = 0; i < 4; ++i) o[i] = out[i] + p0;
+            score_block_4x4(q, k, dim, scale, o, qn, pn);
+        }
+    }
+}
+
 // Accumulates 32 dims per pass in registers: 8 vectors per head, so up to
 // 2 heads at once; more heads take more passes.
 void weighted_sum_f32(const float* values, std::size_t value_stride, std::size_t count, const float* weights,
@@ -134,6 +179,13 @@ float dot_f32(const float* a, const float* b, std::size_t n) {
 
 void axpy_f32(float scale, const float* x, float* out, std::size_t n) {
     for (std::size_t i = 0; i < n; ++i) out[i] += scale * x[i];
+}
+
+void scores_f32(const float* const* queries, std::size_t nq, const float* keys, std::size_t key_stride, std::size_t np,
+                std::size_t dim, float scale, float* const* scores) {
+    for (std::size_t i = 0; i < nq; ++i) {
+        for (std::size_t p = 0; p < np; ++p) scores[i][p] = dot_f32(queries[i], keys + p * key_stride, dim) * scale;
+    }
 }
 
 void weighted_sum_f32(const float* values, std::size_t value_stride, std::size_t count, const float* weights,

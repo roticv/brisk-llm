@@ -130,6 +130,7 @@ Model::Model(const GgufFile& file) {
         fail("a model dimension is zero");
     }
     if (config_.head_count % config_.kv_head_count != 0) fail("head_count is not a multiple of head_count_kv");
+    if (config_.head_count / config_.kv_head_count > 8) fail("more than 8 query heads per key/value head is not supported");
 
     // Qwen3 sets the head size explicitly; it is not always embedding_dim / head_count.
     config_.head_dim = file.get<std::uint32_t>(prefix + "attention.key_length")
@@ -377,12 +378,7 @@ void Session::multiply(std::span<const Target> targets, const float* x, std::siz
         } else if (n == 1) {
             plan.kernels.matvec(m.row(begin), end - begin, m.cols, plan.activations, out + begin);
         } else {
-            // The kernel writes a dense (n x rows-in-chunk) block; scatter it into out's stride.
-            float local[kMaxBatch * 64];
-            plan.kernels.matmul(m.row(begin), end - begin, m.cols, plan.activations, n, local);
-            for (std::size_t t = 0; t < n; ++t) {
-                std::copy_n(local + t * (end - begin), end - begin, out + t * m.rows + begin);
-            }
+            plan.kernels.matmul(m.row(begin), end - begin, m.cols, plan.activations, n, out + begin, m.rows);
         }
     });
 }
@@ -548,16 +544,21 @@ void Session::eval_batch(std::span<const Token> tokens, bool all_logits) {
                 return scores + ((t - t0) * c.head_count + g) * length;
             };
 
-            for (std::size_t p = 0; p < visible_last; ++p) {
-                const float* k = keys.data() + p * kv_dim + kv_offset;
-                for (std::size_t t = t0; t < t1; ++t) {
-                    if (p > position_ + t) continue;  // later tokens of the tile see further than this one
-                    const float* q = query_.data() + t * query_dim + kv * heads_per_kv * head_dim;
-                    for (std::size_t g = 0; g < heads_per_kv; ++g) {
-                        score_row(t, g)[p] = kernels::dot_f32(q + g * head_dim, k, head_dim) * attention_scale;
-                    }
+            // All the tile's queries (each token's heads for this key/value
+            // head) against every position the last token sees; positions a
+            // token cannot see are computed too but ignored by its softmax.
+            const float* queries[kTokenTile * 8];
+            float* rows_out[kTokenTile * 8];
+            std::size_t nq = 0;
+            for (std::size_t t = t0; t < t1; ++t) {
+                for (std::size_t g = 0; g < heads_per_kv; ++g) {
+                    queries[nq] = query_.data() + t * query_dim + (kv * heads_per_kv + g) * head_dim;
+                    rows_out[nq] = score_row(t, g);
+                    ++nq;
                 }
             }
+            kernels::scores_f32(queries, nq, keys.data() + kv_offset, kv_dim, visible_last, head_dim, attention_scale,
+                                rows_out);
             for (std::size_t t = t0; t < t1; ++t) {
                 const std::size_t visible = position_ + t + 1;
                 for (std::size_t g = 0; g < heads_per_kv; ++g) {

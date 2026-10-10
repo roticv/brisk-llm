@@ -18,10 +18,11 @@ namespace brisk::kernels {
 // out[r] = dot(row r of w, x).
 using Matvec = void (*)(const void* w, std::size_t rows, std::size_t cols, const void* x, float* out);
 
-// The same for `n` activation rows at once: out[t * rows + r] = dot(row r of w, x row t).
+// The same for `n` activation rows at once: out[t * out_stride + r] = dot(row r of w, x row t).
 // Each weight block is unpacked once and reused for every activation row, so
 // this is compute-bound where the single-row version is memory-bound.
-using Matmul = void (*)(const void* w, std::size_t rows, std::size_t cols, const void* x, std::size_t n, float* out);
+using Matmul = void (*)(const void* w, std::size_t rows, std::size_t cols, const void* x, std::size_t n, float* out,
+                        std::size_t out_stride);
 
 // Some batched kernels want the activations rearranged first. `prepare`
 // writes `prepared_bytes(n, blocks)` bytes that `matmul` then takes as `x`
@@ -48,39 +49,54 @@ bool prefers_q4_0x4();
 KernelSet generic_kernels(WeightFormat format);
 #if defined(__aarch64__)
 void matvec_q4_0_neon(const void* w, std::size_t rows, std::size_t cols, const void* x, float* out);
-void matmul_q4_0_neon(const void* w, std::size_t rows, std::size_t cols, const void* x, std::size_t n, float* out);
+void matmul_q4_0_neon(const void* w, std::size_t rows, std::size_t cols, const void* x, std::size_t n, float* out,
+                      std::size_t out_stride);
 void matvec_q4_0_dotprod(const void* w, std::size_t rows, std::size_t cols, const void* x, float* out);
-void matmul_q4_0_dotprod(const void* w, std::size_t rows, std::size_t cols, const void* x, std::size_t n, float* out);
-void matmul_q4_0_i8mm(const void* w, std::size_t rows, std::size_t cols, const void* x, std::size_t n, float* out);
+void matmul_q4_0_dotprod(const void* w, std::size_t rows, std::size_t cols, const void* x, std::size_t n, float* out,
+                      std::size_t out_stride);
+void matmul_q4_0_i8mm(const void* w, std::size_t rows, std::size_t cols, const void* x, std::size_t n, float* out,
+                      std::size_t out_stride);
 void matvec_q4_kx4_dotprod(const void* w, std::size_t rows, std::size_t cols, const void* x, float* out);
-void matmul_q4_kx4_i8mm(const void* w, std::size_t rows, std::size_t cols, const void* x, std::size_t n, float* out);
+void matmul_q4_kx4_i8mm(const void* w, std::size_t rows, std::size_t cols, const void* x, std::size_t n, float* out,
+                      std::size_t out_stride);
 void matvec_q6_kx4_dotprod(const void* w, std::size_t rows, std::size_t cols, const void* x, float* out);
-void matmul_q6_kx4_i8mm(const void* w, std::size_t rows, std::size_t cols, const void* x, std::size_t n, float* out);
+void matmul_q6_kx4_i8mm(const void* w, std::size_t rows, std::size_t cols, const void* x, std::size_t n, float* out,
+                      std::size_t out_stride);
 // Activation preparation shared by the smmla tiles of all 256-element formats.
 void prepare_k_i8mm(const void* x, std::size_t n, std::size_t blocks, void* out);
 std::size_t prepared_bytes_k_i8mm(std::size_t n, std::size_t blocks);
 void matvec_tq2_0x4_dotprod(const void* w, std::size_t rows, std::size_t cols, const void* x, float* out);
-void matmul_tq2_0x4_i8mm(const void* w, std::size_t rows, std::size_t cols, const void* x, std::size_t n, float* out);
+void matmul_tq2_0x4_i8mm(const void* w, std::size_t rows, std::size_t cols, const void* x, std::size_t n, float* out,
+                      std::size_t out_stride);
 void matvec_q4_0x4_dotprod(const void* w, std::size_t rows, std::size_t cols, const void* x, float* out);
-void matmul_q4_0x4_i8mm(const void* w, std::size_t rows, std::size_t cols, const void* x, std::size_t n, float* out);
+void matmul_q4_0x4_i8mm(const void* w, std::size_t rows, std::size_t cols, const void* x, std::size_t n, float* out,
+                      std::size_t out_stride);
 void prepare_q4_0x4_i8mm(const void* x, std::size_t n, std::size_t blocks, void* out);
 std::size_t prepared_bytes_q4_0x4_i8mm(std::size_t n, std::size_t blocks);
 void matvec_q4_1_neon(const void* w, std::size_t rows, std::size_t cols, const void* x, float* out);
-void matmul_q4_1_neon(const void* w, std::size_t rows, std::size_t cols, const void* x, std::size_t n, float* out);
+void matmul_q4_1_neon(const void* w, std::size_t rows, std::size_t cols, const void* x, std::size_t n, float* out,
+                      std::size_t out_stride);
 void matvec_q4_1_dotprod(const void* w, std::size_t rows, std::size_t cols, const void* x, float* out);
-void matmul_q4_1_dotprod(const void* w, std::size_t rows, std::size_t cols, const void* x, std::size_t n, float* out);
+void matmul_q4_1_dotprod(const void* w, std::size_t rows, std::size_t cols, const void* x, std::size_t n, float* out,
+                      std::size_t out_stride);
 void matvec_q4_k_neon(const void* w, std::size_t rows, std::size_t cols, const void* x, float* out);
-void matmul_q4_k_neon(const void* w, std::size_t rows, std::size_t cols, const void* x, std::size_t n, float* out);
+void matmul_q4_k_neon(const void* w, std::size_t rows, std::size_t cols, const void* x, std::size_t n, float* out,
+                      std::size_t out_stride);
 void matvec_q4_k_dotprod(const void* w, std::size_t rows, std::size_t cols, const void* x, float* out);
-void matmul_q4_k_dotprod(const void* w, std::size_t rows, std::size_t cols, const void* x, std::size_t n, float* out);
+void matmul_q4_k_dotprod(const void* w, std::size_t rows, std::size_t cols, const void* x, std::size_t n, float* out,
+                      std::size_t out_stride);
 void matvec_tq2_0_neon(const void* w, std::size_t rows, std::size_t cols, const void* x, float* out);
-void matmul_tq2_0_neon(const void* w, std::size_t rows, std::size_t cols, const void* x, std::size_t n, float* out);
+void matmul_tq2_0_neon(const void* w, std::size_t rows, std::size_t cols, const void* x, std::size_t n, float* out,
+                      std::size_t out_stride);
 void matvec_tq2_0_dotprod(const void* w, std::size_t rows, std::size_t cols, const void* x, float* out);
-void matmul_tq2_0_dotprod(const void* w, std::size_t rows, std::size_t cols, const void* x, std::size_t n, float* out);
+void matmul_tq2_0_dotprod(const void* w, std::size_t rows, std::size_t cols, const void* x, std::size_t n, float* out,
+                      std::size_t out_stride);
 void matvec_q6_k_neon(const void* w, std::size_t rows, std::size_t cols, const void* x, float* out);
-void matmul_q6_k_neon(const void* w, std::size_t rows, std::size_t cols, const void* x, std::size_t n, float* out);
+void matmul_q6_k_neon(const void* w, std::size_t rows, std::size_t cols, const void* x, std::size_t n, float* out,
+                      std::size_t out_stride);
 void matvec_q6_k_dotprod(const void* w, std::size_t rows, std::size_t cols, const void* x, float* out);
-void matmul_q6_k_dotprod(const void* w, std::size_t rows, std::size_t cols, const void* x, std::size_t n, float* out);
+void matmul_q6_k_dotprod(const void* w, std::size_t rows, std::size_t cols, const void* x, std::size_t n, float* out,
+                      std::size_t out_stride);
 // Every NEON kernel set for `format`, best last; empty where only the generic exists.
 struct NamedKernels {
     std::string_view name;

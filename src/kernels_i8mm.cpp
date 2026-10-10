@@ -6,6 +6,7 @@
 // does 32 multiply-adds against sdot's 16. The tile here is 4 rows x 4 tokens,
 // which keeps 4 accumulators, 8 weight and 8 activation vectors live.
 
+#include <algorithm>
 #include <cstring>
 
 #include "kernels.h"
@@ -14,6 +15,11 @@
 namespace brisk::kernels {
 
 namespace {
+
+// Row groups (of 4 rows) handled together per token tile in the batched
+// kernels: 8 groups of a 2048-wide Q4_0 matrix are 37 KB, which with one
+// 8-token tile stays within L1.
+constexpr std::size_t kGroupBand = 8;
 
 inline int32x4_t dot_block(int8x16_t w_low, int8x16_t w_high, const BlockQ8_0& x) {
     const int32x4_t acc = vdotq_s32(vdupq_n_s32(0), w_low, vld1q_s8(x.qs));
@@ -90,7 +96,8 @@ void tile_4x4(const BlockQ4_0* w, std::size_t blocks, const BlockQ8_0* x, std::s
 
 }  // namespace
 
-void matmul_q4_0_i8mm(const void* w, std::size_t rows, std::size_t cols, const void* x, std::size_t n, float* out) {
+void matmul_q4_0_i8mm(const void* w, std::size_t rows, std::size_t cols, const void* x, std::size_t n, float* out,
+                      std::size_t out_stride) {
     const auto* weights = static_cast<const BlockQ4_0*>(w);
     const auto* activations = static_cast<const BlockQ8_0*>(x);
     const std::size_t blocks = cols / kBlockSize;
@@ -99,19 +106,19 @@ void matmul_q4_0_i8mm(const void* w, std::size_t rows, std::size_t cols, const v
     for (; r + 4 <= rows; r += 4) {
         std::size_t t = 0;
         for (; t + 4 <= n; t += 4) {
-            tile_4x4(weights + r * blocks, blocks, activations + t * blocks, blocks, out + t * rows + r, rows);
+            tile_4x4(weights + r * blocks, blocks, activations + t * blocks, blocks, out + t * out_stride + r, out_stride);
         }
         // Leftover tokens: one row at a time with the dot-product kernel.
         for (; t < n; ++t) {
             for (std::size_t i = 0; i < 4; ++i) {
-                out[t * rows + r + i] = neon::dot_row(weights + (r + i) * blocks, activations + t * blocks, blocks, dot_block);
+                out[t * out_stride + r + i] = neon::dot_row(weights + (r + i) * blocks, activations + t * blocks, blocks, dot_block);
             }
         }
     }
     // Leftover rows.
     for (; r < rows; ++r) {
         for (std::size_t t = 0; t < n; ++t) {
-            out[t * rows + r] = neon::dot_row(weights + r * blocks, activations + t * blocks, blocks, dot_block);
+            out[t * out_stride + r] = neon::dot_row(weights + r * blocks, activations + t * blocks, blocks, dot_block);
         }
     }
 }
@@ -221,22 +228,33 @@ void tile_x4(const BlockQ4_0x4* group, std::size_t blocks, const TokenPairBlock*
 
 }  // namespace
 
-void matmul_q4_0x4_i8mm(const void* w, std::size_t rows, std::size_t cols, const void* x, std::size_t n, float* out) {
+void matmul_q4_0x4_i8mm(const void* w, std::size_t rows, std::size_t cols, const void* x, std::size_t n, float* out,
+                      std::size_t out_stride) {
     const auto* weights = static_cast<const BlockQ4_0x4*>(w);
     const std::size_t blocks = cols / kBlockSize;
     const Prepared prepared = view_prepared(x, n, blocks);
     const TokenPairBlock* pairs = prepared.pairs;
     const BlockQ8_0* activations = prepared.rows;
-    for (std::size_t g = 0; g < rows / 4; ++g) {
+    // Blocked so that a band of row groups and one token tile both stay in L1:
+    // for each band, every token tile is run against every group in the band.
+    const std::size_t groups = rows / 4;
+    for (std::size_t g0 = 0; g0 < groups; g0 += kGroupBand) {
+        const std::size_t g1 = std::min(groups, g0 + kGroupBand);
         std::size_t t = 0;
         for (; t + 8 <= n; t += 8) {
-            tile_x4<4>(weights + g * blocks, blocks, pairs + (t / 2) * blocks, out + t * rows + 4 * g, rows);
+            for (std::size_t g = g0; g < g1; ++g) {
+                tile_x4<4>(weights + g * blocks, blocks, pairs + (t / 2) * blocks, out + t * out_stride + 4 * g, out_stride);
+            }
         }
         for (; t + 4 <= n; t += 4) {
-            tile_x4<2>(weights + g * blocks, blocks, pairs + (t / 2) * blocks, out + t * rows + 4 * g, rows);
+            for (std::size_t g = g0; g < g1; ++g) {
+                tile_x4<2>(weights + g * blocks, blocks, pairs + (t / 2) * blocks, out + t * out_stride + 4 * g, out_stride);
+            }
         }
         for (; t < n; ++t) {
-            matvec_q4_0x4_dotprod(weights + g * blocks, 4, cols, activations + t * blocks, out + t * rows + 4 * g);
+            for (std::size_t g = g0; g < g1; ++g) {
+                matvec_q4_0x4_dotprod(weights + g * blocks, 4, cols, activations + t * blocks, out + t * out_stride + 4 * g);
+            }
         }
     }
 }
@@ -486,14 +504,22 @@ void q6_k_tile(const BlockQ6_Kx4* group, std::size_t blocks, const KTokenPairBlo
 
 template <typename Block, typename Tile8, typename Tile4, typename Matvec>
 void grouped_k_matmul(const Block* weights, std::size_t rows, std::size_t cols, const void* x, std::size_t n, float* out,
-                      Tile8 tile8, Tile4 tile4, Matvec matvec) {
+                      std::size_t out_stride, Tile8 tile8, Tile4 tile4, Matvec matvec) {
     const std::size_t blocks = cols / kSuperBlockSize;
     const KPrepared prepared = view_k_prepared(x, n, blocks);
-    for (std::size_t g = 0; g < rows / 4; ++g) {
+    const std::size_t groups = rows / 4;
+    for (std::size_t g0 = 0; g0 < groups; g0 += kGroupBand) {
+        const std::size_t g1 = std::min(groups, g0 + kGroupBand);
         std::size_t t = 0;
-        for (; t + 8 <= n; t += 8) tile8(weights + g * blocks, blocks, prepared.pairs + (t / 2) * blocks, out + t * rows + 4 * g, rows);
-        for (; t + 4 <= n; t += 4) tile4(weights + g * blocks, blocks, prepared.pairs + (t / 2) * blocks, out + t * rows + 4 * g, rows);
-        for (; t < n; ++t) matvec(weights + g * blocks, 4, cols, prepared.rows + t * blocks, out + t * rows + 4 * g);
+        for (; t + 8 <= n; t += 8) {
+            for (std::size_t g = g0; g < g1; ++g) tile8(weights + g * blocks, blocks, prepared.pairs + (t / 2) * blocks, out + t * out_stride + 4 * g, out_stride);
+        }
+        for (; t + 4 <= n; t += 4) {
+            for (std::size_t g = g0; g < g1; ++g) tile4(weights + g * blocks, blocks, prepared.pairs + (t / 2) * blocks, out + t * out_stride + 4 * g, out_stride);
+        }
+        for (; t < n; ++t) {
+            for (std::size_t g = g0; g < g1; ++g) matvec(weights + g * blocks, 4, cols, prepared.rows + t * blocks, out + t * out_stride + 4 * g);
+        }
     }
 }
 
@@ -524,18 +550,21 @@ void prepare_k_i8mm(const void* x_raw, std::size_t n, std::size_t blocks, void* 
     }
 }
 
-void matmul_tq2_0x4_i8mm(const void* w, std::size_t rows, std::size_t cols, const void* x, std::size_t n, float* out) {
-    grouped_k_matmul(static_cast<const BlockTQ2_0x4*>(w), rows, cols, x, n, out, ternary_tile<4>, ternary_tile<2>,
+void matmul_tq2_0x4_i8mm(const void* w, std::size_t rows, std::size_t cols, const void* x, std::size_t n, float* out,
+                      std::size_t out_stride) {
+    grouped_k_matmul(static_cast<const BlockTQ2_0x4*>(w), rows, cols, x, n, out, out_stride, ternary_tile<4>, ternary_tile<2>,
                      matvec_tq2_0x4_dotprod);
 }
 
-void matmul_q4_kx4_i8mm(const void* w, std::size_t rows, std::size_t cols, const void* x, std::size_t n, float* out) {
-    grouped_k_matmul(static_cast<const BlockQ4_Kx4*>(w), rows, cols, x, n, out, q4_k_tile<4>, q4_k_tile<2>,
+void matmul_q4_kx4_i8mm(const void* w, std::size_t rows, std::size_t cols, const void* x, std::size_t n, float* out,
+                      std::size_t out_stride) {
+    grouped_k_matmul(static_cast<const BlockQ4_Kx4*>(w), rows, cols, x, n, out, out_stride, q4_k_tile<4>, q4_k_tile<2>,
                      matvec_q4_kx4_dotprod);
 }
 
-void matmul_q6_kx4_i8mm(const void* w, std::size_t rows, std::size_t cols, const void* x, std::size_t n, float* out) {
-    grouped_k_matmul(static_cast<const BlockQ6_Kx4*>(w), rows, cols, x, n, out, q6_k_tile<4>, q6_k_tile<2>,
+void matmul_q6_kx4_i8mm(const void* w, std::size_t rows, std::size_t cols, const void* x, std::size_t n, float* out,
+                      std::size_t out_stride) {
+    grouped_k_matmul(static_cast<const BlockQ6_Kx4*>(w), rows, cols, x, n, out, out_stride, q6_k_tile<4>, q6_k_tile<2>,
                      matvec_q6_kx4_dotprod);
 }
 

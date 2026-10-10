@@ -114,7 +114,7 @@ inline void dot_row_x4(const BlockQ4_0* w, const BlockQ8_0* const x[4], std::siz
 
 template <typename DotBlock>
 inline void matmul(const BlockQ4_0* w, std::size_t rows, std::size_t cols, const BlockQ8_0* x, std::size_t n, float* out,
-                   DotBlock dot_block) {
+                   std::size_t out_stride, DotBlock dot_block) {
     const std::size_t blocks = cols / kBlockSize;
     for (std::size_t r = 0; r < rows; ++r) {
         const BlockQ4_0* row = w + r * blocks;
@@ -124,9 +124,9 @@ inline void matmul(const BlockQ4_0* w, std::size_t rows, std::size_t cols, const
                                             x + (t + 3) * blocks};
             float result[4];
             dot_row_x4(row, xs, blocks, result, dot_block);
-            for (int i = 0; i < 4; ++i) out[(t + static_cast<std::size_t>(i)) * rows + r] = result[i];
+            for (int i = 0; i < 4; ++i) out[(t + static_cast<std::size_t>(i)) * out_stride + r] = result[i];
         }
-        for (; t < n; ++t) out[t * rows + r] = dot_row(row, x + t * blocks, blocks, dot_block);
+        for (; t < n; ++t) out[t * out_stride + r] = dot_row(row, x + t * blocks, blocks, dot_block);
     }
 }
 
@@ -313,7 +313,7 @@ inline void dot_rows_tq2_0(const BlockTQ2_0* w, const BlockQ8_K* const* xs, std:
 // Generic driver for the K-quant kernels: `dot_rows(w_row, xs, n, blocks, out)`.
 template <typename Block, typename DotRows>
 inline void matmul_k(const Block* w, std::size_t rows, std::size_t cols, const BlockQ8_K* x, std::size_t n, float* out,
-                     DotRows dot_rows) {
+                     std::size_t out_stride, DotRows dot_rows) {
     const std::size_t blocks = cols / kSuperBlockSize;
     for (std::size_t r = 0; r < rows; ++r) {
         for (std::size_t t = 0; t < n; t += 4) {
@@ -321,7 +321,7 @@ inline void matmul_k(const Block* w, std::size_t rows, std::size_t cols, const B
             const BlockQ8_K* xs[4] = {x + t * blocks, x + (t + 1) * blocks, x + (t + 2) * blocks, x + (t + 3) * blocks};
             float result[4];
             dot_rows(w + r * blocks, xs, count, blocks, result);
-            for (std::size_t i = 0; i < count; ++i) out[(t + i) * rows + r] = result[i];
+            for (std::size_t i = 0; i < count; ++i) out[(t + i) * out_stride + r] = result[i];
         }
     }
 }

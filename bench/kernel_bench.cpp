@@ -81,7 +81,7 @@ int main(int argc, char** argv) {
                 v.kernels.prepare(xq.data(), kTokens, blocks, prepared.data());
                 input = prepared.data();
             }
-            v.kernels.matmul(weights, rows, cols, input, kTokens, out.data());
+            v.kernels.matmul(weights, rows, cols, input, kTokens, out.data(), rows);
             ++reps;
         }
         const double gmacs = static_cast<double>(rows * cols * kTokens) * reps / seconds(start) / 1e9;
