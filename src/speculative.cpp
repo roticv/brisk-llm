@@ -55,8 +55,7 @@ std::vector<Token> LookupDrafter::draft(std::size_t count) {
         for (std::size_t start = n - ngram; start-- > 0;) {
             if (std::equal(suffix, suffix + ngram, history_.data() + start)) {
                 const std::size_t from = start + ngram;
-                const std::size_t available = std::min(count, n - ngram - from);
-                if (available == 0) break;
+                const std::size_t available = std::min(count, n - from);  // may run into the suffix itself
                 return {history_.begin() + static_cast<std::ptrdiff_t>(from),
                         history_.begin() + static_cast<std::ptrdiff_t>(from + available)};
             }

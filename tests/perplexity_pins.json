@@ -1,0 +1,32 @@
+[
+  {
+    "model": "Qwen3-0.6B-Q4_0.gguf",
+    "text": "bench/prompt512.txt",
+    "perplexity": 2.2779
+  },
+  {
+    "model": "Qwen3-0.6B-Q4_0.gguf",
+    "text": "README.md",
+    "perplexity": 33.1012
+  },
+  {
+    "model": "Qwen3-0.6B-pure-Q4_0.gguf",
+    "text": "README.md",
+    "perplexity": 35.6474
+  },
+  {
+    "model": "Qwen3-1.7B-pure-Q4_0.gguf",
+    "text": "README.md",
+    "perplexity": 23.7286
+  },
+  {
+    "model": "Qwen3-1.7B-Q4_K_M.gguf",
+    "text": "README.md",
+    "perplexity": 23.1215
+  },
+  {
+    "model": "bitnet-2B4T-TQ2_0-e4.gguf",
+    "text": "README.md",
+    "perplexity": 33.4719
+  }
+]

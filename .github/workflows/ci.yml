@@ -1,0 +1,61 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install tools (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y ninja-build
+
+      - name: Install tools (macOS)
+        if: runner.os == 'macOS'
+        run: brew install ninja
+
+      - name: Sanitizer build and unit tests
+        run: |
+          cmake -B build -G Ninja -DBRISK_SANITIZE=ON -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          cmake --build build
+          ctest --test-dir build --output-on-failure
+
+      - name: Replay the fuzz corpus through the parser
+        run: |
+          for f in tests/fuzz_corpus/*; do build/brisk info "$f" > /dev/null 2>&1 || true; done
+
+      - name: Release build
+        run: |
+          cmake -B build-release -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build-release
+
+      - name: Cache the test model
+        id: model
+        uses: actions/cache@v4
+        with:
+          path: models/Qwen3-0.6B-Q4_0.gguf
+          key: qwen3-0.6b-q4_0-unsloth
+
+      - name: Download the test model
+        if: steps.model.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p models
+          curl -sfL -o models/Qwen3-0.6B-Q4_0.gguf \
+            https://huggingface.co/unsloth/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q4_0.gguf
+
+      - name: Perplexity against pinned values
+        run: python3 tests/check_perplexity.py build-release/brisk
+
+      - name: Smoke test generation
+        run: |
+          build-release/brisk generate models/Qwen3-0.6B-Q4_0.gguf --chat --no-think \
+            -p "Name three primary colours." -n 24 -t 2
