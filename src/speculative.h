@@ -29,7 +29,7 @@ public:
 // Guesses with a smaller model of the same tokenizer, decoding greedily.
 class ModelDrafter : public Drafter {
 public:
-    ModelDrafter(const Model& model, std::size_t threads);
+    ModelDrafter(const Model& model, std::size_t threads, std::size_t max_context);
     void observe(std::span<const Token> tokens) override;
     std::vector<Token> draft(std::size_t count) override;
 

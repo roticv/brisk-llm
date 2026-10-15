@@ -40,10 +40,12 @@ private:
     std::atomic<std::uint64_t> generation_{0};  // bumped once per run()
     std::atomic<bool> stop_{false};
 
-    // State of the current run(). `claims_` holds the generation in its high
-    // 32 bits and the next unclaimed task index in the low 32.
+    // State of the current run(). `claims_` packs the run's generation (24
+    // bits), its task count (20) and the next unclaimed index (20), so one
+    // atomic increment yields a claim that is valid for exactly one run.
+    // fn_ is only read under a valid claim, i.e. while that run is in
+    // progress and fn_ is its function.
     const std::function<void(std::size_t)>* fn_ = nullptr;
-    std::size_t tasks_ = 0;
     std::atomic<std::uint64_t> claims_{0};
     std::atomic<std::size_t> completed_{0};
 };

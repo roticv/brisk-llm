@@ -14,7 +14,8 @@ Token argmax(std::span<const float> logits) {
 
 // ---- ModelDrafter -----------------------------------------------------------
 
-ModelDrafter::ModelDrafter(const Model& model, std::size_t threads) : session_(model, threads) {}
+ModelDrafter::ModelDrafter(const Model& model, std::size_t threads, std::size_t max_context)
+    : session_(model, threads, max_context) {}
 
 void ModelDrafter::observe(std::span<const Token> tokens) {
     // The draft model is kept exactly one token behind what was observed, so

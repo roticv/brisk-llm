@@ -112,21 +112,29 @@ inline void dot_row_x4(const BlockQ4_0* w, const BlockQ8_0* const x[4], std::siz
     }
 }
 
+// Rows handled together per token tile in the batched kernels, so that the
+// band's weights and one tile's activations both stay in L1 (the A72 has 32 KB).
+constexpr std::size_t kRowBand = 8;
+
 template <typename DotBlock>
 inline void matmul(const BlockQ4_0* w, std::size_t rows, std::size_t cols, const BlockQ8_0* x, std::size_t n, float* out,
                    std::size_t out_stride, DotBlock dot_block) {
     const std::size_t blocks = cols / kBlockSize;
-    for (std::size_t r = 0; r < rows; ++r) {
-        const BlockQ4_0* row = w + r * blocks;
+    for (std::size_t r0 = 0; r0 < rows; r0 += kRowBand) {
+        const std::size_t r1 = std::min(rows, r0 + kRowBand);
         std::size_t t = 0;
         for (; t + 4 <= n; t += 4) {
             const BlockQ8_0* const xs[4] = {x + t * blocks, x + (t + 1) * blocks, x + (t + 2) * blocks,
                                             x + (t + 3) * blocks};
-            float result[4];
-            dot_row_x4(row, xs, blocks, result, dot_block);
-            for (int i = 0; i < 4; ++i) out[(t + static_cast<std::size_t>(i)) * out_stride + r] = result[i];
+            for (std::size_t r = r0; r < r1; ++r) {
+                float result[4];
+                dot_row_x4(w + r * blocks, xs, blocks, result, dot_block);
+                for (int i = 0; i < 4; ++i) out[(t + static_cast<std::size_t>(i)) * out_stride + r] = result[i];
+            }
         }
-        for (; t < n; ++t) out[t * out_stride + r] = dot_row(row, x + t * blocks, blocks, dot_block);
+        for (; t < n; ++t) {
+            for (std::size_t r = r0; r < r1; ++r) out[t * out_stride + r] = dot_row(w + r * blocks, x + t * blocks, blocks, dot_block);
+        }
     }
 }
 
@@ -315,13 +323,16 @@ template <typename Block, typename DotRows>
 inline void matmul_k(const Block* w, std::size_t rows, std::size_t cols, const BlockQ8_K* x, std::size_t n, float* out,
                      std::size_t out_stride, DotRows dot_rows) {
     const std::size_t blocks = cols / kSuperBlockSize;
-    for (std::size_t r = 0; r < rows; ++r) {
+    for (std::size_t r0 = 0; r0 < rows; r0 += kRowBand) {
+        const std::size_t r1 = std::min(rows, r0 + kRowBand);
         for (std::size_t t = 0; t < n; t += 4) {
             const std::size_t count = std::min<std::size_t>(4, n - t);
             const BlockQ8_K* xs[4] = {x + t * blocks, x + (t + 1) * blocks, x + (t + 2) * blocks, x + (t + 3) * blocks};
-            float result[4];
-            dot_rows(w + r * blocks, xs, count, blocks, result);
-            for (std::size_t i = 0; i < count; ++i) out[(t + i) * out_stride + r] = result[i];
+            for (std::size_t r = r0; r < r1; ++r) {
+                float result[4];
+                dot_rows(w + r * blocks, xs, count, blocks, result);
+                for (std::size_t i = 0; i < count; ++i) out[(t + i) * out_stride + r] = result[i];
+            }
         }
     }
 }

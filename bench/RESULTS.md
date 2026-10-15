@@ -106,7 +106,10 @@ Same files and settings, 4 threads. Prompt = ~500-token prompt; generation = 128
 | Model | brisk prompt | llama.cpp prompt | brisk generation | llama.cpp generation |
 |---|---:|---:|---:|---:|
 | Qwen3-0.6B pure Q4_0 | 19.4 | 19.0 | 9.9 | 9.7 |
-| Qwen3-1.7B pure Q4_0 | 6.6 | 5.8 | 3.7 | 3.3 |
+| Qwen3-1.7B pure Q4_0 | 11.0 | 5.8 | 3.7 | 3.3 |
+| BitNet 2B4T TQ2_0 (Q4_0 embedding) | 6.0 | 8.3 | 4.6 | 4.7 |
+
+The 1.7B and BitNet prompt rates are single runs after the batched kernels were blocked by row bands and the K/V cache made head-major (2026-10-14); the 0.6B row predates that. Before those changes the 1.7B prompt rate was 6.6.
 | Qwen3-0.6B Q4_0 (Q6_K embedding) | | 19.5 | 8.8 | 9.2 |
 | Qwen3-1.7B Q4_0 (Q6_K embedding) | | 6.6 | 3.4 | 3.4 |
 | Qwen3-1.7B Q4_K_M | | 6.0 | 3.4 | 3.3 |

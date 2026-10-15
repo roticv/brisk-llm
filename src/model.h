@@ -101,7 +101,9 @@ private:
 class Session {
 public:
     // `threads` is the number of CPU threads to use, the caller included.
-    Session(const Model& model, std::size_t threads);
+    // `max_context` bounds the sequence length (and the cache memory); 0 means
+    // the model's trained context length.
+    Session(const Model& model, std::size_t threads, std::size_t max_context = 0);
 
     // Appends tokens to the sequence and returns the logits for the token
     // after the last one. Several tokens at once (a prompt) are processed in
@@ -152,9 +154,13 @@ private:
     std::size_t position_ = 0;
     Profile profile_;
 
-    // Per layer, one entry per position: kv_head_count * head_dim floats.
+    // Per layer, head-major: [kv head][position][head_dim], so a head's rows
+    // are contiguous and stream well. Allocated for max_context_ positions on
+    // a layer's first use.
+    std::size_t max_context_ = 0;
     std::vector<std::vector<float>> key_cache_;
     std::vector<std::vector<float>> value_cache_;
+    std::vector<float> kv_staging_;  // this batch's new keys or values, [token][kv_dim], before copying in
 
     // Scratch, with one row per token of the current batch.
     std::vector<float> hidden_;

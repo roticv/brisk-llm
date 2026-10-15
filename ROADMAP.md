@@ -119,17 +119,17 @@ Like-for-like on the same files (details and conditions in `bench/RESULTS.md`):
 
 | | brisk | llama.cpp |
 |---|---|---|
-| M4, Qwen3-1.7B Q4_0, generation 4 / 10 threads | 69 / 79 | 71 / 66 (Metal 86 / 69) |
-| M4, Qwen3-1.7B Q4_0, prompt 4 / 10 threads | 269 / 376 | 347 / 426 |
+| M4, Qwen3-1.7B Q4_0, generation 4 / 10 threads | 77 / 93 | 71 / 66 (Metal 86 / 69) |
+| M4, Qwen3-1.7B Q4_0, prompt 4 / 10 threads | 325 / 479 | 347 / 426 |
 | M4, Qwen3-1.7B Q4_K_M, generation 4 / 10 threads | 59 / 76 | 59 / 54 (Metal 75 / 65) |
 | M4, Qwen3-1.7B Q4_K_M, prompt 4 / 10 threads | 247 / 376 | 224 / 301 |
 | M4, Qwen3-0.6B Q4_0, generation 4 / 10 threads | 178 / 219 | 189 / 162 (Metal 198 / 165) |
 | M4, BitNet 2B4T, generation 4 / 10 threads | 79 / 108 | 36 / 10 |
-| Pi 4, Qwen3-1.7B Q4_0, prompt / generation | 6.6 / 3.7 | 5.8 / 3.3 |
+| Pi 4, Qwen3-1.7B Q4_0, prompt / generation | 11.0 / 3.7 | 5.8 / 3.3 |
 | Pi 4, Qwen3-0.6B Q4_0, prompt / generation | 19.4 / 9.9 | 19.0 / 9.7 |
 | Pi 4, BitNet 2B4T, generation | 4.6 | 4.7 |
 
-Faster than llama.cpp: generation on the Pi, generation on the M4 with all cores (18-45%, also past Metal), BitNet on the M4 (2-3x), Q4_K_M files on the M4, lookup-drafted generation on repetitive text (2x). Level: M4 generation on 4 threads (within 3-6%). Not faster: M4 prompt processing on Q4_0 at 4 threads (7-23% behind). Both engines sit at 80-90% of the memory-bandwidth ceiling for generation, which is why the 4-thread margins are small.
+Faster than llama.cpp: generation on the Pi, prompt processing on the Pi (1.9x on the 1.7B), generation on the M4 (8% ahead at 4 threads, 40% at 10, also past Metal), BitNet on the M4 (2-3x), Q4_K_M files on the M4, M4 prompt processing at 10 threads, lookup-drafted generation on repetitive text (2x). Not faster: M4 prompt processing on Q4_0 at 4 threads (6% behind). Both engines sit at 80-90% of the memory-bandwidth ceiling for generation, which is why the 4-thread generation margins are small.
 
 ## Open questions
 

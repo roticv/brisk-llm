@@ -133,30 +133,43 @@ void scores_f32(const float* const* queries, std::size_t nq, const float* keys, 
     }
 }
 
-// Accumulates 32 dims per pass in registers: 8 vectors per head, so up to
-// 2 heads at once; more heads take more passes.
+// Positions are taken in chunks small enough that a chunk's value rows stay
+// in L1 across the four 32-dim passes (on the A72, with 32 KB of L1, a pass
+// over 500 positions would otherwise re-fetch every row from L2). Within a
+// pass, 8 accumulator vectors per head, two heads at a time, live in
+// registers; they are saved to `out` between chunks.
 void weighted_sum_f32(const float* values, std::size_t value_stride, std::size_t count, const float* weights,
                       std::size_t stride, std::size_t heads, std::size_t dim, float* out) {
-    for (std::size_t h0 = 0; h0 < heads; h0 += 2) {
-        const std::size_t nh = std::min<std::size_t>(2, heads - h0);
-        const float* w0 = weights + h0 * stride;
-        const float* w1 = weights + (h0 + nh - 1) * stride;  // same as w0 when nh == 1
-        for (std::size_t d = 0; d < dim; d += 32) {
-            float32x4_t a[8], b[8];
-            for (int i = 0; i < 8; ++i) a[i] = b[i] = vdupq_n_f32(0.0f);
-            for (std::size_t p = 0; p < count; ++p) {
-                const float* v = values + p * value_stride + d;
-                const float32x4_t s0 = vdupq_n_f32(w0[p]);
-                const float32x4_t s1 = vdupq_n_f32(w1[p]);
+    constexpr std::size_t kPositionChunk = 32;
+    std::fill_n(out, heads * dim, 0.0f);
+    for (std::size_t p0 = 0; p0 < count; p0 += kPositionChunk) {
+        const std::size_t p1 = std::min(count, p0 + kPositionChunk);
+        for (std::size_t h0 = 0; h0 < heads; h0 += 2) {
+            const std::size_t nh = std::min<std::size_t>(2, heads - h0);
+            const float* w0 = weights + h0 * stride;
+            const float* w1 = weights + (h0 + nh - 1) * stride;  // same as w0 when nh == 1
+            float* o0 = out + h0 * dim;
+            float* o1 = out + (h0 + nh - 1) * dim;
+            for (std::size_t d = 0; d < dim; d += 32) {
+                float32x4_t a[8], b[8];
                 for (int i = 0; i < 8; ++i) {
-                    const float32x4_t vv = vld1q_f32(v + 4 * i);
-                    a[i] = vmlaq_f32(a[i], s0, vv);
-                    b[i] = vmlaq_f32(b[i], s1, vv);
+                    a[i] = vld1q_f32(o0 + d + 4 * static_cast<std::size_t>(i));
+                    b[i] = nh == 2 ? vld1q_f32(o1 + d + 4 * static_cast<std::size_t>(i)) : vdupq_n_f32(0.0f);
                 }
-            }
-            for (int i = 0; i < 8; ++i) vst1q_f32(out + h0 * dim + d + 4 * static_cast<std::size_t>(i), a[i]);
-            if (nh == 2) {
-                for (int i = 0; i < 8; ++i) vst1q_f32(out + (h0 + 1) * dim + d + 4 * static_cast<std::size_t>(i), b[i]);
+                for (std::size_t p = p0; p < p1; ++p) {
+                    const float* v = values + p * value_stride + d;
+                    const float32x4_t s0 = vdupq_n_f32(w0[p]);
+                    const float32x4_t s1 = vdupq_n_f32(w1[p]);
+                    for (int i = 0; i < 8; ++i) {
+                        const float32x4_t vv = vld1q_f32(v + 4 * i);
+                        a[i] = vmlaq_f32(a[i], s0, vv);
+                        b[i] = vmlaq_f32(b[i], s1, vv);
+                    }
+                }
+                for (int i = 0; i < 8; ++i) vst1q_f32(o0 + d + 4 * static_cast<std::size_t>(i), a[i]);
+                if (nh == 2) {
+                    for (int i = 0; i < 8; ++i) vst1q_f32(o1 + d + 4 * static_cast<std::size_t>(i), b[i]);
+                }
             }
         }
     }

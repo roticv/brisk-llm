@@ -188,7 +188,9 @@ int cmd_generate(const GenerateOptions& options) {
     }
     if (options.print_ids) print_ids(prompt);
 
-    brisk::Session session(model, options.threads);
+    // Room for the prompt, the answer, and a round of speculative guesses.
+    const std::size_t max_context = prompt.size() + options.max_tokens + options.draft_tokens + 1;
+    brisk::Session session(model, options.threads, max_context);
     const auto prompt_start = std::chrono::steady_clock::now();
     std::span<const float> logits = session.eval(prompt);
     const double prompt_seconds = seconds_since(prompt_start);
@@ -219,7 +221,7 @@ int cmd_generate(const GenerateOptions& options) {
             if (draft_model->config().vocab_size != model.config().vocab_size) {
                 throw std::runtime_error("the draft model's vocabulary differs from the target's");
             }
-            drafter = std::make_unique<brisk::ModelDrafter>(*draft_model, options.threads);
+            drafter = std::make_unique<brisk::ModelDrafter>(*draft_model, options.threads, max_context);
         }
         drafter->observe(prompt);
         // The target has evaluated the whole prompt; step back one so the last
@@ -302,7 +304,7 @@ int cmd_perplexity(const std::string& model_path, const std::string& text, std::
     if (tokens.size() < 2) throw std::runtime_error("the text is too short to score");
     if (tokens.size() > model.config().context_length) throw std::runtime_error("the text exceeds the context length");
 
-    brisk::Session session(model, threads);
+    brisk::Session session(model, threads, tokens.size());
     const auto start = std::chrono::steady_clock::now();
     const double log_likelihood = session.log_likelihood(tokens);
     const double scored = static_cast<double>(tokens.size() - 1);

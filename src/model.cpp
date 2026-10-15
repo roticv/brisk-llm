@@ -383,11 +383,14 @@ void Session::multiply(std::span<const Target> targets, const float* x, std::siz
     });
 }
 
-Session::Session(const Model& model, std::size_t threads) : model_(model), pool_(std::max<std::size_t>(threads, 1)) {
+Session::Session(const Model& model, std::size_t threads, std::size_t max_context)
+    : model_(model), pool_(std::max<std::size_t>(threads, 1)) {
     const ModelConfig& c = model.config();
     const std::size_t query_dim = static_cast<std::size_t>(c.head_count) * c.head_dim;
+    max_context_ = max_context == 0 ? c.context_length : std::min<std::size_t>(max_context, c.context_length);
     key_cache_.resize(c.layer_count);
     value_cache_.resize(c.layer_count);
+    kv_staging_.resize(kMaxBatch * static_cast<std::size_t>(c.kv_head_count) * c.head_dim);
     hidden_.resize(kMaxBatch * c.embedding_dim);
     normed_.resize(kMaxBatch * c.embedding_dim);
     query_.resize(kMaxBatch * query_dim);
@@ -405,7 +408,7 @@ std::span<const float> Session::eval(std::span<const Token> tokens) {
     for (const Token token : tokens) {
         if (token < 0 || static_cast<std::uint32_t>(token) >= c.vocab_size) fail("token id out of range");
     }
-    if (tokens.size() > c.context_length - position_) fail("context length exceeded");
+    if (tokens.size() > max_context_ - position_) fail("context length exceeded");
 
     for (std::size_t begin = 0; begin < tokens.size(); begin += kMaxBatch) {
         eval_batch(tokens.subspan(begin, std::min(kMaxBatch, tokens.size() - begin)), false);
@@ -419,7 +422,7 @@ std::span<const float> Session::eval_all(std::span<const Token> tokens) {
     for (const Token token : tokens) {
         if (token < 0 || static_cast<std::uint32_t>(token) >= c.vocab_size) fail("token id out of range");
     }
-    if (tokens.size() > c.context_length - position_) fail("context length exceeded");
+    if (tokens.size() > max_context_ - position_) fail("context length exceeded");
     eval_batch(tokens, true);
     return std::span<const float>(logits_.data(), tokens.size() * c.vocab_size);
 }
@@ -435,7 +438,7 @@ double Session::log_likelihood(std::span<const Token> tokens) {
     for (const Token token : tokens) {
         if (token < 0 || static_cast<std::uint32_t>(token) >= c.vocab_size) fail("token id out of range");
     }
-    if (tokens.size() > c.context_length - position_) fail("context length exceeded");
+    if (tokens.size() > max_context_ - position_) fail("context length exceeded");
 
     // Smaller batches than eval(): every token's logits are kept, vocab_size floats each.
     constexpr std::size_t kScoreBatch = kMaxScoredTokens;
@@ -493,10 +496,17 @@ void Session::eval_batch(std::span<const Token> tokens, bool all_logits) {
         const Model::Layer& layer = model_.layers()[l];
         std::vector<float>& keys = key_cache_[l];
         std::vector<float>& values = value_cache_[l];
-        keys.resize(length * kv_dim);
-        values.resize(length * kv_dim);
-        float* new_keys = keys.data() + position_ * kv_dim;  // this batch's rows, contiguous
-        float* new_values = values.data() + position_ * kv_dim;
+        if (keys.empty()) {
+            keys.resize(static_cast<std::size_t>(c.kv_head_count) * max_context_ * head_dim);
+            values.resize(keys.size());
+        }
+        // Row p of key/value head kv in this layer's cache.
+        auto cache_row = [&](std::vector<float>& cache, std::size_t kv, std::size_t p) {
+            return cache.data() + (kv * max_context_ + p) * head_dim;
+        };
+        // New keys and values are produced as [token][kv_dim] rows, then copied into the head-major cache.
+        float* new_keys = kv_staging_.data();
+        float* new_values = projected_.data();  // free until the attention output projection
 
         {
             const Timed timed(profile_.norm_rope);
@@ -521,6 +531,8 @@ void Session::eval_batch(std::span<const Token> tokens, bool all_logits) {
                 const std::span<float> k(new_keys + t * kv_dim + h * head_dim, head_dim);
                 if (!layer.key_norm.empty()) rms_norm(k, layer.key_norm, c.rms_epsilon, k);
                 apply_rope(k, rope);
+                std::copy_n(k.data(), head_dim, cache_row(keys, h, position_ + t));
+                std::copy_n(new_values + t * kv_dim + h * head_dim, head_dim, cache_row(values, h, position_ + t));
             }
         });
 
@@ -529,14 +541,13 @@ void Session::eval_batch(std::span<const Token> tokens, bool all_logits) {
         // Causal attention: token t of the batch sees positions 0 to position_ + t.
         // One task covers a key/value head and up to kTokenTile consecutive
         // tokens, so each cached row is read once for all their query heads.
-        constexpr std::size_t kTokenTile = 4;
+        constexpr std::size_t kTokenTile = 16;  // wide, so the cache is streamed once per 16 tokens, not per 4
         const std::size_t token_tiles = (n + kTokenTile - 1) / kTokenTile;
         pool_.run(token_tiles * c.kv_head_count, [&](std::size_t task) {
             const std::size_t tile = task / c.kv_head_count;
             const std::size_t kv = task % c.kv_head_count;
             const std::size_t t0 = tile * kTokenTile;
             const std::size_t t1 = std::min(n, t0 + kTokenTile);
-            const std::size_t kv_offset = kv * head_dim;
             const std::size_t visible_last = position_ + t1;  // positions seen by the tile's last token
             // Scores: one row per (token, query head) of the tile.
             float* scores = scores_.data() + (t0 * c.head_count + kv * heads_per_kv) * length;
@@ -557,14 +568,14 @@ void Session::eval_batch(std::span<const Token> tokens, bool all_logits) {
                     ++nq;
                 }
             }
-            kernels::scores_f32(queries, nq, keys.data() + kv_offset, kv_dim, visible_last, head_dim, attention_scale,
+            kernels::scores_f32(queries, nq, cache_row(keys, kv, 0), head_dim, visible_last, head_dim, attention_scale,
                                 rows_out);
             for (std::size_t t = t0; t < t1; ++t) {
                 const std::size_t visible = position_ + t + 1;
                 for (std::size_t g = 0; g < heads_per_kv; ++g) {
                     kernels::softmax_f32(std::span<float>(score_row(t, g), visible));
                 }
-                kernels::weighted_sum_f32(values.data() + kv_offset, kv_dim, visible, score_row(t, 0), length,
+                kernels::weighted_sum_f32(cache_row(values, kv, 0), head_dim, visible, score_row(t, 0), length,
                                           heads_per_kv, head_dim,
                                           attended_.data() + t * query_dim + kv * heads_per_kv * head_dim);
             }

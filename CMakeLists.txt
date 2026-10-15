@@ -52,6 +52,9 @@ target_link_libraries(brisk-cli PRIVATE brisk)
 add_executable(kernel_bench bench/kernel_bench.cpp)
 target_link_libraries(kernel_bench PRIVATE brisk)
 
+add_executable(attention_bench bench/attention_bench.cpp)
+target_link_libraries(attention_bench PRIVATE brisk)
+
 add_executable(membw bench/membw.cpp)
 target_link_libraries(membw PRIVATE Threads::Threads)
 
