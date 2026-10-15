@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Checks brisk's perplexity against values pinned in tests/perplexity_pins.json.
 
-Usage: python3 tests/check_perplexity.py [--update] [brisk-binary]
+Usage: python3 tests/check_perplexity.py [--update] [--gpu] [brisk-binary]
 
 Each pin names a model file (under models/) and a text (repo-relative) with
 the perplexity brisk produced when the pin was recorded. A kernel or model
@@ -21,16 +21,21 @@ PINS = ROOT / "tests" / "perplexity_pins.json"
 TOLERANCE = 0.01  # relative
 
 
-def perplexity(brisk, model, text):
-    result = subprocess.run([brisk, "perplexity", str(model), "-f", str(text)], capture_output=True, text=True)
+def perplexity(brisk, model, text, gpu):
+    """The perplexity, or None when the GPU backend does not take this file."""
+    command = [brisk, "perplexity", str(model), "-f", str(text)] + (["--gpu"] if gpu else [])
+    result = subprocess.run(command, capture_output=True, text=True)
     if result.returncode != 0:
+        if gpu and "Metal backend needs" in result.stderr:
+            return None
         sys.exit(f"brisk perplexity failed on {model.name}:\n{result.stderr}")
     return float(re.search(r"perplexity ([0-9.]+)", result.stdout).group(1))
 
 
 def main():
-    args = [a for a in sys.argv[1:] if a != "--update"]
+    args = [a for a in sys.argv[1:] if a not in ("--update", "--gpu")]
     update = "--update" in sys.argv
+    gpu = "--gpu" in sys.argv  # check the Metal backend against the same pins (Q4_0 files only)
     brisk = args[0] if args else str(ROOT / "build-release" / "brisk")
     pins = json.loads(PINS.read_text())
 
@@ -41,7 +46,10 @@ def main():
         if not model.exists():
             print(f"{pin['model']}: not present, skipped")
             continue
-        value = perplexity(brisk, model, ROOT / pin["text"])
+        value = perplexity(brisk, model, ROOT / pin["text"], gpu)
+        if value is None:
+            print(f"{pin['model']}: not a pure Q4_0 file, skipped on the GPU")
+            continue
         checked += 1
         if update:
             pin["perplexity"] = round(value, 4)

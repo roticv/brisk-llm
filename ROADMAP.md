@@ -95,14 +95,13 @@ Dropped: A72-specific kernel tuning for generation. The Pi is bandwidth-bound, s
 
 **Done when:** on Qwen3-1.7B, generation is at least 15% faster and prompt processing at least 30% faster than llama.cpp on both machines.
 
-## Phase 5: Mac-only acceleration — not started
+## Phase 5: Mac-only acceleration — Metal backend done, at parity
 
-Decide from measurements which of these is worth doing:
+- Metal backend behind `--gpu` (`src/metal/`): an `Engine` interface shared with the CPU `Session`; weights used in place from the memory-mapped file (no-copy buffer), K/V cache on the GPU, one command buffer per batch; shaders embedded as source and compiled at start. Kernels: Q4_0 gemv (two rows per simdgroup, fused q/k/v and gate/up dispatches, epilogues for the residual add and gating), a 64x64 simdgroup-matrix tile for batches (block-major operands, half activations written by the producing kernels, fused epilogues), per-head norm + RoPE + cache write, attention on the matrix unit by blocks of 8 tokens, and a split-position attention for single tokens with a combine pass. `metal_test` checks both matmuls against a float reference; `metal_bench` gives GFLOPS per shape; the perplexity pins hold on the GPU (`check_perplexity.py --gpu`).
+- Result on Qwen3-1.7B Q4_0: 940 tokens/s prompt and 89.6 generation (80 after a 500-token prompt) against llama.cpp Metal's 1034 and 88.4; on the 0.6B, 2615 / 183 against 2825 / 198. Prompt processing is 2.9x the CPU path. The tiled matmul runs at 85-90% of the GPU's measured matrix peak and faster than llama.cpp's own kernel in isolation; the remaining 7-9% on prompts is in the smaller passes and launch gaps, and generation is at the bandwidth ceiling for the large matrices. Details in `bench/RESULTS.md`.
+- Not done: Q6_K/Q8_0 output matrices (the common "Q4_0" downloads have one), K-quant and BitNet (TQ2_0) GPU kernels, a half-precision K/V cache, speculative decoding on the GPU, and SME2 CPU kernels.
 
-- SME2 kernels for prompt processing (llama.cpp's KleidiAI path gains only about 10%, so there may be more available).
-- A Metal backend with fused kernels.
-
-**Done when:** the Mac numbers beat llama.cpp's best configuration (CPU or Metal, whichever is faster), or the measurements show the CPU path already does.
+**Done when (original):** the Mac numbers beat llama.cpp's best configuration. Reached for generation on the 1.7B (level), not for prompt processing (7-9% behind) or the 0.6B.
 
 ## Later, if wanted
 
@@ -121,6 +120,8 @@ Like-for-like on the same files (details and conditions in `bench/RESULTS.md`):
 |---|---|---|
 | M4, Qwen3-1.7B Q4_0, generation 4 / 10 threads | 77 / 93 | 71 / 66 (Metal 86 / 69) |
 | M4, Qwen3-1.7B Q4_0, prompt 4 / 10 threads | 325 / 479 | 347 / 426 |
+| M4 GPU, Qwen3-1.7B Q4_0, prompt / generation | 940 / 89.6 | Metal 1034 / 88.4 |
+| M4 GPU, Qwen3-0.6B Q4_0, prompt / generation | 2615 / 183 | Metal 2825 / 198 |
 | M4, Qwen3-1.7B Q4_K_M, generation 4 / 10 threads | 59 / 76 | 59 / 54 (Metal 75 / 65) |
 | M4, Qwen3-1.7B Q4_K_M, prompt 4 / 10 threads | 247 / 376 | 224 / 301 |
 | M4, Qwen3-0.6B Q4_0, generation 4 / 10 threads | 178 / 219 | 189 / 162 (Metal 198 / 165) |
@@ -129,9 +130,9 @@ Like-for-like on the same files (details and conditions in `bench/RESULTS.md`):
 | Pi 4, Qwen3-0.6B Q4_0, prompt / generation | 19.4 / 9.9 | 19.0 / 9.7 |
 | Pi 4, BitNet 2B4T, generation | 4.6 | 4.7 |
 
-Faster than llama.cpp: generation on the Pi, prompt processing on the Pi (1.9x on the 1.7B), generation on the M4 (8% ahead at 4 threads, 40% at 10, also past Metal), BitNet on the M4 (2-3x), Q4_K_M files on the M4, M4 prompt processing at 10 threads, lookup-drafted generation on repetitive text (2x). Not faster: M4 prompt processing on Q4_0 at 4 threads (6% behind). Both engines sit at 80-90% of the memory-bandwidth ceiling for generation, which is why the 4-thread generation margins are small.
+Faster than llama.cpp: generation on the Pi, prompt processing on the Pi (1.9x on the 1.7B), generation on the M4 (8% ahead at 4 threads, 40% at 10, also past Metal), BitNet on the M4 (2-3x), Q4_K_M files on the M4, M4 prompt processing at 10 threads, lookup-drafted generation on repetitive text (2x). Not faster: M4 prompt processing on Q4_0 at 4 threads (6% behind), and on the GPU, where brisk's Metal backend is level with llama.cpp's on 1.7B generation and 7-9% behind on prompts. Both engines sit at 80-90% of the memory-bandwidth ceiling for generation, which is why the generation margins are small.
 
 ## Open questions
 
-- Is the Mac GPU in scope? Metal is the only path to substantially faster prompt processing on the Mac.
+- The GPU is now in scope and the Metal backend is at parity with llama.cpp's. Beating it there by a clear margin would have to come from elsewhere than the matmul (already at 85-90% of the GPU's peak): speculative decoding on the GPU, or ternary (BitNet) GPU kernels where the weights are 3x smaller.
 - The Pi throttles under sustained load (soft temperature limit reached during benchmark runs). Cooling would make its prompt numbers more reliable.

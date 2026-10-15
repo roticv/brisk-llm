@@ -77,6 +77,21 @@ Qwen3-1.7B pure Q4_0, 4 threads, greedy, output identical to plain decoding:
 
 A draft one third the target's cost loses more than it saves; lookup drafting is free and wins only where the output repeats the context.
 
+### Metal backend on the M4 (Phase 5)
+
+`--gpu --warmup` against `llama-bench` (which also warms up), run alternately on the same files with 15-20 s pauses, medians of 3. Prompt = 497 tokens (llama-bench: 512); generation = 64 tokens from an almost empty context. Tokens/s.
+
+| File | brisk GPU prompt | llama.cpp Metal | brisk GPU generation | llama.cpp Metal |
+|---|---|---|---|---|
+| Qwen3-0.6B Q4_0 | 2615 | 2825 | 183 | 198 |
+| Qwen3-1.7B Q4_0 | 940 | 1034 | 89.6 | 88.4 |
+
+Generation after a 497-token prompt (context the `tg64` numbers do not have): 80 tokens/s on the 1.7B.
+
+Where the time goes on the 1.7B prompt (GPU time of the batch, 0.53 s): the tiled matmul takes about 0.47 s at 2.8-3.0 TFLOPS, which is 85-90% of the 3.25 TFLOPS that a register-only `simdgroup_multiply_accumulate` loop reaches on this GPU (`bench/metal_bench`; llama.cpp's own matmul measures 2.6 TFLOPS in its `test-backend-ops perf`); attention is 0.03 s; the rest is small. So the 9% gap to llama.cpp on prompt processing is not in the matmul kernel but spread over the remaining passes and launch gaps. In generation the layer gemvs read the weights at ~90 GB/s and the large output matrix at 117 GB/s (of 120 measured by `membw`), so the per-layer dispatches are what costs; the 0.6B, with its smaller matrices, loses more to that. First-run numbers are 10-15% lower than warmed ones: the GPU clock ramps and the mapped weights are touched for the first time.
+
+Measured along the way: a 128x64 tile with 8 simdgroups ran 3x slower (register pressure), as did unrolling the gemv's block loop; halving threadgroup memory per tile changed nothing; block-major 8x8 operand layouts with contiguous `simdgroup_load`s gave +8%; fusing the residual adds and SiLU gate into the matmul epilogues and writing half activations from the producers gave +5%; splitting a single token's attention over position chunks took long-context generation from 68 to 80 tokens/s. A `uint` load at a 2-byte-aligned address inside an 18-byte Q4_0 block is silently rounded down to 4 bytes on this GPU; `metal_test` exists because of it.
+
 ## Raspberry Pi 4 Model B (4 GB, Cortex-A72 x4, Debian 13, 64-bit)
 
 Same llama.cpp commit `8216c84`, CPU only, 4 threads, 5 repetitions, 20 s cool-down. Speeds in tokens/s.

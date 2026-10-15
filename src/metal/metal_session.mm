@@ -2,6 +2,7 @@
 #import <Metal/Metal.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -32,7 +33,7 @@ struct MatmulParams {
 };
 struct GemvParams {
     uint32_t rows[3];
-    uint32_t cols, n, mode;
+    uint32_t cols, n, mode, paired;
 };
 struct NormParams {
     uint32_t dim;
@@ -47,8 +48,9 @@ struct RopeParams {
 struct AttentionParams {
     uint32_t n, position0, head_count, kv_head_count, head_dim, max_context;
     float scale;
-    uint32_t write_half;
+    uint32_t write_half, splits, chunk;
 };
+constexpr uint32_t kMaxSplits = 16;  // position ranges a small batch's attention is spread over
 
 // A tensor on the GPU: a buffer and a byte offset into it.
 struct Buf {
@@ -56,7 +58,7 @@ struct Buf {
     NSUInteger offset = 0;
 };
 
-constexpr std::size_t kMaxBatch = 256;
+constexpr std::size_t kMaxBatch = 512;
 
 }  // namespace
 
@@ -68,7 +70,8 @@ struct MetalSession::Impl {
 
     id<MTLDevice> device = nil;
     id<MTLCommandQueue> queue = nil;
-    id<MTLComputePipelineState> embed = nil, rms_norm = nil, matmul = nil, matmul_mm = nil, rope = nil, attention = nil;
+    id<MTLComputePipelineState> embed = nil, rms_norm = nil, matmul = nil, matmul_mm = nil, rope = nil, attention = nil,
+                                attention_small = nil, attention_combine = nil;
     bool tiles_fit = false;  // every matrix has rows and columns in multiples of 64, as the tiled kernel needs
 
     id<MTLBuffer> weights = nil;  // the whole mapped file, no copy
@@ -84,7 +87,7 @@ struct MetalSession::Impl {
     // Half copies of the activations the tiled matmul reads, written by their producers.
     id<MTLBuffer> normed_h = nil, attended_h = nil, gate_h = nil;
     id<MTLBuffer> tokens = nil, x = nil, normed = nil, q = nil, k_stage = nil, v_stage = nil, attended = nil,
-                  gate = nil, scores = nil, logits = nil, k_cache = nil, v_cache = nil;
+                  gate = nil, scores = nil, partial = nil, logits = nil, k_cache = nil, v_cache = nil;
     std::vector<float> logits_out;
 
     Impl(const Model& m, std::span<const std::byte> f, std::size_t max_ctx) : model(m), file(f) {
@@ -120,6 +123,8 @@ struct MetalSession::Impl {
         matmul_mm = pipeline("matmul_q4_0_mm");
         rope = pipeline("qk_norm_rope");
         attention = pipeline("attention");
+        attention_small = pipeline("attention_small");
+        attention_combine = pipeline("attention_combine");
     }
 
     // Wraps the mapped file in a buffer without copying: the mapping is
@@ -200,13 +205,20 @@ struct MetalSession::Impl {
         tiles_fit = embd % 64 == 0 && qdim % 64 == 0 && kvdim % 64 == 0 && ff % 64 == 0 && c.vocab_size % 64 == 0;
         // 16 score rows per attention threadgroup: (batch / 8 tokens) x kv heads threadgroups.
         scores = make(((kMaxBatch + 7) / 8) * c.kv_head_count * 16 * max_context * 4);
+        partial = make(std::size_t{8} * c.head_count * kMaxSplits * (c.head_dim + 2) * 4);
         if (c.head_count / c.kv_head_count > 2 || c.head_dim > 128 || c.head_dim % 8 != 0) {
             fail("attention kernel supports at most 2 query heads per key/value head and head_dim <= 128, a multiple of 8");
         }
+        // Partials: 8 tokens x heads x splits, each head_dim + 2 floats. The split kernel's chunk is 64
+        // positions so a long context takes more than kMaxSplits of them; the chunk then grows.
         logits = make(Engine::kMaxScoredTokens * c.vocab_size * 4);
         const std::size_t cache = std::size_t{c.layer_count} * c.kv_head_count * max_context * c.head_dim * 4;
         k_cache = make(cache);
         v_cache = make(cache);
+        // The attention kernel multiplies whole 8-position blocks, so cache rows past
+        // the sequence are read (with zero weights): they must hold finite values.
+        std::memset(k_cache.contents, 0, cache);
+        std::memset(v_cache.contents, 0, cache);
     }
 
     // ---- encoding helpers ----
@@ -257,6 +269,28 @@ struct MetalSession::Impl {
     // operand). Few rows: one fused gemv dispatch. Many: the tiled
     // simdgroup-matrix multiply per matrix. The result's half copy is written
     // when the target has one.
+    // gate and up projections with the activation applied: out = f(gate) * up.
+    // The gemv pairs the rows in one dispatch; the tiled path runs gate, then
+    // up with the epilogue reading it.
+    void encode_gated(id<MTLComputeCommandEncoder> enc, const Buf& gate_w, const Buf& up_w, std::size_t rows,
+                      std::size_t cols, Act in, std::size_t n, Mode mode, Act out) {
+        if (tiled(n)) {
+            encode_matmul(enc, {Target{&gate_w, rows, Act{out.f, nil}}}, cols, in, n);
+            encode_matmul(enc, {Target{&up_w, rows, out}}, cols, in, n, mode, out.f);
+            return;
+        }
+        [enc setComputePipelineState:matmul];
+        set(enc, gate_w, 0);
+        set(enc, up_w, 1);
+        set(enc, up_w, 2);
+        set(enc, in.f, 3);
+        for (NSUInteger i = 4; i < 7; ++i) set(enc, out.f, i);
+        const GemvParams p{{static_cast<uint32_t>(rows), 0, 0}, static_cast<uint32_t>(cols), static_cast<uint32_t>(n), mode, 1};
+        bytes(enc, p, 7);
+        set(enc, in.f, 8);
+        groups(enc, (rows * n + 3) / 4, 128);
+    }
+
     void encode_matmul(id<MTLComputeCommandEncoder> enc, std::initializer_list<Target> targets, std::size_t cols,
                        Act in, std::size_t n, Mode mode = kStore, id<MTLBuffer> aux = nil) {
         if (tiled(n)) {
@@ -276,7 +310,7 @@ struct MetalSession::Impl {
             return;
         }
         [enc setComputePipelineState:matmul];
-        GemvParams p{{0, 0, 0}, static_cast<uint32_t>(cols), static_cast<uint32_t>(n), mode};
+        GemvParams p{{0, 0, 0}, static_cast<uint32_t>(cols), static_cast<uint32_t>(n), mode, 0};
         std::size_t pairs = 0, i = 0;
         for (const Target& t : targets) {
             set(enc, *t.w, i);
@@ -300,6 +334,7 @@ struct MetalSession::Impl {
     // With BRISK_GPU_PROFILE set, each kernel class is committed and timed
     // separately (slower overall; for finding what to tune).
     const bool profiling = std::getenv("BRISK_GPU_PROFILE") != nullptr;
+    const bool timing = std::getenv("BRISK_GPU_TIME") != nullptr;  // GPU vs wall time per batch
     std::map<std::string, double> profile;
 
     void eval_batch(std::span<const Token> toks, bool all_logits) {
@@ -362,20 +397,48 @@ struct MetalSession::Impl {
                 groups(enc, (n * (c.head_count + c.kv_head_count) + 3) / 4, 128);
                 checkpoint("rope");
 
-                [enc setComputePipelineState:attention];
-                set(enc, q, 0);
-                [enc setBuffer:k_cache offset:cache_layer atIndex:1];
-                [enc setBuffer:v_cache offset:cache_layer atIndex:2];
-                set(enc, attended, 3);
-                set(enc, scores, 4);
+                // A small batch has too few (token, head) items to fill the GPU, so
+                // the small kernel spreads each one's positions over splits of 64
+                // that a second kernel merges. Batches use the tiled kernel.
+                const std::size_t visible = position + n;
+                const bool small = n <= 8;
+                uint32_t splits = 1, chunk = static_cast<uint32_t>((max_context + 7) / 8 * 8);
+                if (small) {
+                    splits = static_cast<uint32_t>(std::min<std::size_t>(kMaxSplits, (visible + 63) / 64));
+                    chunk = static_cast<uint32_t>(((visible + splits - 1) / splits + 7) / 8 * 8);
+                }
                 // BitNet normalises the attention output first, which rewrites the half copy.
                 const AttentionParams ap{static_cast<uint32_t>(n), static_cast<uint32_t>(position), c.head_count,
                                          c.kv_head_count, c.head_dim, static_cast<uint32_t>(max_context),
                                          1.0f / std::sqrt(static_cast<float>(c.head_dim)),
-                                         tiled(n) && !bitnet ? 1u : 0u};
-                bytes(enc, ap, 5);
-                set(enc, attended_h, 6);
-                groups(enc, ((n + 7) / 8) * c.kv_head_count, 128);
+                                         tiled(n) && !bitnet ? 1u : 0u, splits, chunk};
+                if (small) {
+                    [enc setComputePipelineState:attention_small];
+                    set(enc, q, 0);
+                    [enc setBuffer:k_cache offset:cache_layer atIndex:1];
+                    [enc setBuffer:v_cache offset:cache_layer atIndex:2];
+                    set(enc, partial, 3);
+                    bytes(enc, ap, 4);
+                    groups(enc, n * c.kv_head_count * splits, 128);
+                } else {
+                    [enc setComputePipelineState:attention];
+                    set(enc, q, 0);
+                    [enc setBuffer:k_cache offset:cache_layer atIndex:1];
+                    [enc setBuffer:v_cache offset:cache_layer atIndex:2];
+                    set(enc, attended, 3);
+                    set(enc, scores, 4);
+                    bytes(enc, ap, 5);
+                    set(enc, attended_h, 6);
+                    groups(enc, ((n + 7) / 8) * c.kv_head_count, 128);
+                }
+                if (small) {
+                    [enc setComputePipelineState:attention_combine];
+                    set(enc, partial, 0);
+                    set(enc, attended, 1);
+                    bytes(enc, ap, 2);
+                    set(enc, attended_h, 3);
+                    groups(enc, (n * c.head_count + 3) / 4, 128);
+                }
                 checkpoint("attention");
 
                 if (bitnet) encode_norm(enc, attended, g.attn_sub_norm, attended_a, n, qdim);
@@ -387,9 +450,8 @@ struct MetalSession::Impl {
                 checkpoint("norm");
                 // gate, then up with the activation applied against it; BitNet
                 // normalises the product afterwards (that norm writes the half copy).
-                encode_matmul(enc, {Target{&g.gate, ff, Act{gate, nil}}}, embd, normed_a, n);
-                encode_matmul(enc, {Target{&g.up, ff, bitnet ? Act{gate, nil} : gate_a}}, embd, normed_a, n,
-                              bitnet ? kReluSqrMul : kSiluMul, gate);
+                encode_gated(enc, g.gate, g.up, ff, embd, normed_a, n, bitnet ? kReluSqrMul : kSiluMul,
+                             bitnet ? Act{gate, nil} : gate_a);
                 if (bitnet) encode_norm(enc, gate, g.ffn_sub_norm, gate_a, n, ff);
                 checkpoint("matmul");
                 encode_matmul(enc, {Target{&g.down, embd, x_a}}, ff, gate_a, n, kResidual, x);
@@ -405,9 +467,14 @@ struct MetalSession::Impl {
             }
             checkpoint("output");
             [enc endEncoding];
+            const auto commit_time = std::chrono::steady_clock::now();
             [cb commit];
             [cb waitUntilCompleted];
             if (cb.error != nil) fail(std::string("command buffer failed: ") + cb.error.localizedDescription.UTF8String);
+            if (timing) {
+                const double wall = std::chrono::duration<double>(std::chrono::steady_clock::now() - commit_time).count();
+                std::fprintf(stderr, "gpu batch of %zu: gpu %.4f s, commit-to-done %.4f s\n", n, cb.GPUEndTime - cb.GPUStartTime, wall);
+            }
         }
         if (profiling) {
             std::string line = "gpu profile (s):";
@@ -506,7 +573,7 @@ struct StandaloneMatmul {
                 [enc setBuffer:out offset:0 atIndex:4 + i];
             }
             [enc setBuffer:in offset:0 atIndex:3];
-            const GemvParams p{{static_cast<uint32_t>(rows), 0, 0}, static_cast<uint32_t>(cols), static_cast<uint32_t>(n), kStore};
+            const GemvParams p{{static_cast<uint32_t>(rows), 0, 0}, static_cast<uint32_t>(cols), static_cast<uint32_t>(n), kStore, 0};
             [enc setBytes:&p length:sizeof(p) atIndex:7];
             [enc setBuffer:in offset:0 atIndex:8];
             [enc dispatchThreadgroups:MTLSizeMake(((rows + 1) / 2 * n + 3) / 4, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];

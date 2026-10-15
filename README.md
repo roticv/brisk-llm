@@ -28,20 +28,23 @@ build-release/brisk info models/Qwen3-1.7B-pure-Q4_0.gguf
 build-release/brisk generate models/Qwen3-1.7B-pure-Q4_0.gguf --chat --no-think -p "Name three primary colours."
 build-release/brisk generate models/Qwen3-1.7B-pure-Q4_0.gguf -f prompt.txt -n 200 -t 4 --draft lookup
 build-release/brisk perplexity models/Qwen3-1.7B-pure-Q4_0.gguf -f text.txt
+build-release/brisk generate models/Qwen3-1.7B-pure-Q4_0.gguf -f prompt.txt -n 200 --gpu
 ```
 
-`brisk generate` prints a timing line to stderr; `BRISK_PROFILE=1` adds a per-phase breakdown. Model files go in `models/` (ignored by git); the pure Q4_0 files used in the benchmarks are made with `llama-quantize --pure`.
+`--gpu` runs the model on the Metal GPU (Apple silicon; Q4_0 files). The weights are used in place from the memory-mapped file, the K/V cache lives on the GPU, and each batch of tokens is one command buffer. The shaders are embedded as source and compiled when the program starts, so no Metal toolchain is needed. `--warmup` evaluates the prompt once untimed first, as llama-bench does, for comparable numbers.
+
+`brisk generate` prints a timing line to stderr; `BRISK_PROFILE=1` adds a per-phase breakdown on the CPU, `BRISK_GPU_PROFILE=1` per kernel class on the GPU (each class timed in its own command buffer, so small ones read high) and `BRISK_GPU_TIME=1` the GPU time of each batch. Model files go in `models/` (ignored by git); the pure Q4_0 files used in the benchmarks are made with `llama-quantize --pure`.
 
 ## Tests
 
 ```
-ctest --test-dir build --output-on-failure         # unit tests (sanitizer build): parser, kernels, pool, tokenizer, drafter
-python3 tests/check_perplexity.py                 # perplexity against pinned values, for the model files present
+ctest --test-dir build --output-on-failure         # unit tests (sanitizer build): parser, kernels, pool, tokenizer, drafter, Metal matmul
+python3 tests/check_perplexity.py [--gpu]         # perplexity against pinned values, for the model files present
 python3 tests/compare_tokenizer.py <model.gguf>   # token ids against llama.cpp
 python3 tests/compare_perplexity.py <model.gguf>  # perplexity against llama.cpp
 ```
 
-The GitHub Actions workflow (`.github/workflows/ci.yml`) runs the unit tests under the sanitizers on macOS and Linux ARM runners, replays the fuzz corpus, and checks the pinned perplexity of a downloaded Qwen3-0.6B file. After an intentional change to the numerics, re-pin with `python3 tests/check_perplexity.py --update` once `compare_perplexity.py` confirms agreement with llama.cpp. `BRISK_KERNELS=generic|neon|dotprod|i8mm` caps the kernel set in use, to exercise the other paths on a machine that has them all; the paths agree within about 0.5% in perplexity.
+The GitHub Actions workflow (`.github/workflows/ci.yml`) runs the unit tests under the sanitizers on macOS and Linux ARM runners, replays the fuzz corpus, and checks the pinned perplexity of a downloaded Qwen3-0.6B file The Metal matmul test runs on the macOS runner. The GPU forward pass is checked locally with `check_perplexity.py --gpu` against the same pins (it needs pure Q4_0 files; the CI download has a Q6_K output matrix): the half-precision activations of the batched multiplies move the perplexity by less than 0.01%. After an intentional change to the numerics, re-pin with `python3 tests/check_perplexity.py --update` once `compare_perplexity.py` confirms agreement with llama.cpp. `BRISK_KERNELS=generic|neon|dotprod|i8mm` caps the kernel set in use, to exercise the other paths on a machine that has them all; the paths agree within about 0.5% in perplexity.
 
 The comparison scripts need `build/llama_ref`, built by `tests/ref/build.sh` against a llama.cpp checkout in `baselines/llama.cpp`. Perplexity is the authoritative check for quantised models: 8-bit activation rounding makes per-logit comparison chaotic (llama.cpp's own kernel variants disagree by up to 2 in a logit), while perplexity agrees within about 1% and float32 matches to four decimals.
 
@@ -52,10 +55,11 @@ bench/run_brisk_bench.sh     # brisk: ~500-token prompt, 128 generated tokens, m
 bench/run_llama_bench.sh     # llama-bench with the same settings
 build-release/membw          # memory read bandwidth, the ceiling for generation
 build-release/kernel_bench   # the Q4_0 kernels in isolation
+build-release/metal_bench    # the Metal Q4_0 kernels: GFLOPS and weight bandwidth per shape
 ```
 
 Benchmarks on the Air are only meaningful with nothing else running; the fanless chassis throttles under sustained compute, so medians of several runs are reported.
 
 ## Status
 
-Phases 0-2 of the roadmap are done; Phase 3 stopped after BitNet and speculative decoding, with the findings recorded in the roadmap. In short: generation at 4 threads sits within a few percent of llama.cpp either way, because both engines are at 80-90% of the memory-bandwidth ceiling; brisk is ahead on the Pi, on the M4 with all cores (where it also passes llama.cpp's Metal path), on Q4_K_M files, and on BitNet (2-3x), and behind on M4 prompt processing of Q4_0 files at 4 threads.
+Phases 0-2 of the roadmap are done; Phase 3 stopped after BitNet and speculative decoding, with the findings recorded in the roadmap; Phase 5 added a Metal backend that is level with llama.cpp's on 1.7B generation (89.6 vs 88.4 tokens/s) and 7-9% behind on prompt processing (940 vs 1034), 2.9x the CPU path. In short: generation at 4 threads sits within a few percent of llama.cpp either way, because both engines are at 80-90% of the memory-bandwidth ceiling; brisk is ahead on the Pi, on the M4 with all cores (where it also passes llama.cpp's Metal path), on Q4_K_M files, and on BitNet (2-3x), and behind on M4 prompt processing of Q4_0 files at 4 threads.

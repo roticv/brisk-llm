@@ -66,9 +66,10 @@ int main() {
     ok &= check(64, 64, 1, false);
     ok &= check(130, 2048, 3, false);
     ok &= check(1024, 2048, 7, false);
-    ok &= check(64, 64, 8, true);
+    ok &= check(128, 64, 8, true);
     ok &= check(128, 2048, 64, true);
     ok &= check(256, 1024, 100, true);
+    ok &= check(384, 96, 130, true);
     std::printf("metal_test: %s\n", ok ? "ok" : "FAILED");
     return ok ? 0 : 1;
 }
