@@ -1,6 +1,8 @@
 #include "kernels.h"
 
+#include <cstdlib>
 #include <stdexcept>
+#include <string_view>
 
 #include "cpu_features.h"
 
@@ -174,21 +176,32 @@ bool prefers_q4_0x4() {
 #endif
 }
 
+bool prefer_generic_kernels() {
+    const char* wanted = std::getenv("BRISK_KERNELS");
+    return wanted != nullptr && std::string_view(wanted) == "generic";
+}
+
 KernelSet kernels_for(WeightFormat format) {
 #if defined(__aarch64__)
-    const std::vector<NamedKernels> neon = neon_kernels(format);
-    if (!neon.empty()) return neon.back().kernels;
+    if (!prefer_generic_kernels()) {
+        const std::vector<NamedKernels> neon = neon_kernels(format);
+        if (!neon.empty()) return neon.back().kernels;
+    }
 #endif
     return generic_kernels(format);
 }
 
 std::string_view kernel_set_name() {
 #if defined(__aarch64__)
+    if (const char* wanted = std::getenv("BRISK_KERNELS"); wanted != nullptr && std::string_view(wanted) == "generic") {
+        return "generic";
+    }
     if (cpu_features().dotprod && cpu_features().i8mm) return "i8mm";
     return cpu_features().dotprod ? "dotprod" : "neon";
 #else
     return "generic";
 #endif
 }
+
 
 }  // namespace brisk::kernels

@@ -41,7 +41,7 @@ python3 tests/compare_tokenizer.py <model.gguf>   # token ids against llama.cpp
 python3 tests/compare_perplexity.py <model.gguf>  # perplexity against llama.cpp
 ```
 
-The GitHub Actions workflow (`.github/workflows/ci.yml`) runs the unit tests under the sanitizers on macOS and Linux ARM runners, replays the fuzz corpus, and checks the pinned perplexity of a downloaded Qwen3-0.6B file. After an intentional change to the numerics, re-pin with `python3 tests/check_perplexity.py --update` once `compare_perplexity.py` confirms agreement with llama.cpp.
+The GitHub Actions workflow (`.github/workflows/ci.yml`) runs the unit tests under the sanitizers on macOS and Linux ARM runners, replays the fuzz corpus, and checks the pinned perplexity of a downloaded Qwen3-0.6B file. After an intentional change to the numerics, re-pin with `python3 tests/check_perplexity.py --update` once `compare_perplexity.py` confirms agreement with llama.cpp. `BRISK_KERNELS=generic|neon|dotprod|i8mm` caps the kernel set in use, to exercise the other paths on a machine that has them all; the paths agree within about 0.5% in perplexity.
 
 The comparison scripts need `build/llama_ref`, built by `tests/ref/build.sh` against a llama.cpp checkout in `baselines/llama.cpp`. Perplexity is the authoritative check for quantised models: 8-bit activation rounding makes per-logit comparison chaotic (llama.cpp's own kernel variants disagree by up to 2 in a logit), while perplexity agrees within about 1% and float32 matches to four decimals.
 

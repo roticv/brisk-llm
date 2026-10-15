@@ -6,27 +6,27 @@
   },
   {
     "model": "Qwen3-0.6B-Q4_0.gguf",
-    "text": "README.md",
-    "perplexity": 33.1012
+    "text": "tests/perplexity_text.txt",
+    "perplexity": 28.1942
   },
   {
     "model": "Qwen3-0.6B-pure-Q4_0.gguf",
-    "text": "README.md",
-    "perplexity": 35.6474
+    "text": "tests/perplexity_text.txt",
+    "perplexity": 29.0084
   },
   {
     "model": "Qwen3-1.7B-pure-Q4_0.gguf",
-    "text": "README.md",
-    "perplexity": 23.7286
+    "text": "tests/perplexity_text.txt",
+    "perplexity": 20.0747
   },
   {
     "model": "Qwen3-1.7B-Q4_K_M.gguf",
-    "text": "README.md",
-    "perplexity": 23.1215
+    "text": "tests/perplexity_text.txt",
+    "perplexity": 18.7796
   },
   {
     "model": "bitnet-2B4T-TQ2_0-e4.gguf",
-    "text": "README.md",
-    "perplexity": 33.4719
+    "text": "tests/perplexity_text.txt",
+    "perplexity": 26.2207
   }
 ]

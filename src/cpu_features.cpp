@@ -1,6 +1,8 @@
 #include "cpu_features.h"
 
 #include <cstddef>
+#include <cstdlib>
+#include <string_view>
 
 #if defined(__APPLE__)
 #include <sys/sysctl.h>
@@ -39,8 +41,19 @@ CpuFeatures detect() {
 
 }  // namespace
 
+// BRISK_KERNELS=generic|neon|dotprod|i8mm caps the features used, for
+// testing the other kernel paths on a machine that has them all.
+CpuFeatures apply_override(CpuFeatures f) {
+    const char* wanted = std::getenv("BRISK_KERNELS");
+    if (wanted == nullptr) return f;
+    const std::string_view level(wanted);
+    if (level == "generic" || level == "neon") f.dotprod = f.i8mm = false;
+    else if (level == "dotprod") f.i8mm = false;
+    return f;
+}
+
 const CpuFeatures& cpu_features() {
-    static const CpuFeatures features = detect();
+    static const CpuFeatures features = apply_override(detect());
     return features;
 }
 
