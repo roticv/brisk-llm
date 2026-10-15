@@ -108,7 +108,7 @@ float require_f32(const GgufFile& file, const std::string& key) {
 
 }  // namespace
 
-Model::Model(const GgufFile& file) {
+Model::Model(const GgufFile& file, bool repack) : repack_(repack) {
     const auto architecture = file.get<std::string_view>("general.architecture");
     if (architecture == "qwen3") config_.architecture = Architecture::Qwen3;
     else if (architecture == "bitnet" || architecture == "bitnet-b1.58") config_.architecture = Architecture::BitNet;
@@ -233,7 +233,7 @@ Matrix Model::load_matrix(const GgufFile& file, std::string_view name, std::size
             fail("tensor '" + std::string(name) + "' has unexpected quantised data");
         }
         m.bytes = info->data;
-        if (m.format == WeightFormat::Q4_0 && rows % 4 == 0 && kernels::prefers_q4_0x4()) {
+        if (m.format == WeightFormat::Q4_0 && rows % 4 == 0 && repack_ && kernels::prefers_q4_0x4()) {
             // Interleave four rows per block for the NEON matrix kernels.
             const std::size_t blocks = cols / kBlockSize;
             std::vector<std::byte>& packed = packed_.emplace_back(rows / 4 * blocks * sizeof(BlockQ4_0x4));
@@ -241,21 +241,21 @@ Matrix Model::load_matrix(const GgufFile& file, std::string_view name, std::size
                           reinterpret_cast<BlockQ4_0x4*>(packed.data()));
             m.format = WeightFormat::Q4_0x4;
             m.bytes = packed;
-        } else if (m.format == WeightFormat::TQ2_0 && rows % 4 == 0 && kernels::prefers_q4_0x4()) {
+        } else if (m.format == WeightFormat::TQ2_0 && rows % 4 == 0 && repack_ && kernels::prefers_q4_0x4()) {
             const std::size_t blocks = cols / kSuperBlockSize;
             std::vector<std::byte>& packed = packed_.emplace_back(rows / 4 * blocks * sizeof(BlockTQ2_0x4));
             repack_tq2_0x4(reinterpret_cast<const BlockTQ2_0*>(info->data.data()), rows, blocks,
                            reinterpret_cast<BlockTQ2_0x4*>(packed.data()));
             m.format = WeightFormat::TQ2_0x4;
             m.bytes = packed;
-        } else if (m.format == WeightFormat::Q4_K && rows % 4 == 0 && kernels::prefers_q4_0x4()) {
+        } else if (m.format == WeightFormat::Q4_K && rows % 4 == 0 && repack_ && kernels::prefers_q4_0x4()) {
             const std::size_t blocks = cols / kSuperBlockSize;
             std::vector<std::byte>& packed = packed_.emplace_back(rows / 4 * blocks * sizeof(BlockQ4_Kx4));
             repack_q4_kx4(reinterpret_cast<const BlockQ4_K*>(info->data.data()), rows, blocks,
                           reinterpret_cast<BlockQ4_Kx4*>(packed.data()));
             m.format = WeightFormat::Q4_Kx4;
             m.bytes = packed;
-        } else if (m.format == WeightFormat::Q6_K && rows % 4 == 0 && kernels::prefers_q4_0x4()) {
+        } else if (m.format == WeightFormat::Q6_K && rows % 4 == 0 && repack_ && kernels::prefers_q4_0x4()) {
             const std::size_t blocks = cols / kSuperBlockSize;
             std::vector<std::byte>& packed = packed_.emplace_back(rows / 4 * blocks * sizeof(BlockQ6_Kx4));
             repack_q6_kx4(reinterpret_cast<const BlockQ6_K*>(info->data.data()), rows, blocks,
@@ -430,32 +430,6 @@ std::span<const float> Session::eval_all(std::span<const Token> tokens) {
 void Session::rollback(std::size_t position) {
     if (position > position_) fail("cannot roll forward");
     position_ = position;  // the caches keep their storage; later entries are simply overwritten
-}
-
-double Session::log_likelihood(std::span<const Token> tokens) {
-    const ModelConfig& c = model_.config();
-    if (tokens.size() < 2) fail("need at least two tokens to score");
-    for (const Token token : tokens) {
-        if (token < 0 || static_cast<std::uint32_t>(token) >= c.vocab_size) fail("token id out of range");
-    }
-    if (tokens.size() > max_context_ - position_) fail("context length exceeded");
-
-    // Smaller batches than eval(): every token's logits are kept, vocab_size floats each.
-    constexpr std::size_t kScoreBatch = kMaxScoredTokens;
-    double total = 0.0;
-    for (std::size_t begin = 0; begin < tokens.size(); begin += kScoreBatch) {
-        const std::size_t n = std::min(kScoreBatch, tokens.size() - begin);
-        eval_batch(tokens.subspan(begin, n), true);
-        // Row t predicts tokens[begin + t + 1]; the last row of the text predicts nothing.
-        for (std::size_t t = 0; t < n && begin + t + 1 < tokens.size(); ++t) {
-            const float* row = logits_.data() + t * c.vocab_size;
-            const float max = *std::max_element(row, row + c.vocab_size);
-            double sum = 0.0;
-            for (std::size_t i = 0; i < c.vocab_size; ++i) sum += std::exp(static_cast<double>(row[i] - max));
-            total += static_cast<double>(row[tokens[begin + t + 1]] - max) - std::log(sum);
-        }
-    }
-    return total;
 }
 
 void Session::eval_batch(std::span<const Token> tokens, bool all_logits) {

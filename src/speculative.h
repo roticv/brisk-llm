@@ -60,7 +60,7 @@ class Speculator {
 public:
     // `target` must already have evaluated the prompt except its last token,
     // which is `carry`; the drafter must have observed the whole prompt.
-    Speculator(Session& target, Drafter& drafter, Token carry, std::size_t draft_tokens);
+    Speculator(Engine& target, Drafter& drafter, Token carry, std::size_t draft_tokens);
 
     // Runs one round and returns the tokens it settled: the accepted guesses
     // followed by the target's own next token. Never empty.
@@ -69,7 +69,7 @@ public:
     const SpeculativeStats& stats() const { return stats_; }
 
 private:
-    Session& target_;
+    Engine& target_;
     Drafter& drafter_;
     Token carry_;
     std::size_t draft_tokens_;

@@ -66,7 +66,7 @@ std::vector<Token> LookupDrafter::draft(std::size_t count) {
 
 // ---- Speculator -------------------------------------------------------------
 
-Speculator::Speculator(Session& target, Drafter& drafter, Token carry, std::size_t draft_tokens)
+Speculator::Speculator(Engine& target, Drafter& drafter, Token carry, std::size_t draft_tokens)
     : target_(target), drafter_(drafter), carry_(carry), draft_tokens_(std::min(draft_tokens, Session::kMaxScoredTokens - 1)) {}
 
 std::vector<Token> Speculator::step() {

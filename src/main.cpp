@@ -20,6 +20,9 @@
 #include "kernels.h"
 #include "mapped_file.h"
 #include "model.h"
+#if BRISK_METAL
+#include "metal/metal_session.h"
+#endif
 #include "sampler.h"
 #include "speculative.h"
 #include "tokenizer.h"
@@ -153,6 +156,8 @@ struct GenerateOptions {
     bool stop_at_end = true;   // stop when the model ends its turn
     std::string logits_path;   // if set, the logits after the prompt are written here
     std::size_t threads = std::thread::hardware_concurrency();
+    bool gpu = false;              // run the model on the Metal GPU
+    bool warmup = false;           // evaluate the prompt once untimed before the timed run
     std::string draft;             // "lookup", or a path to a smaller model with the same tokenizer
     std::size_t draft_tokens = 5;  // guesses per round
     brisk::SamplerConfig sampler;
@@ -167,7 +172,7 @@ int cmd_generate(const GenerateOptions& options) {
     const brisk::MappedFile mapped(options.model_path);
     const brisk::GgufFile file = brisk::GgufFile::parse(mapped.bytes());
     const brisk::Tokenizer tokenizer(file);
-    const brisk::Model model(file);
+    const brisk::Model model(file, /*repack=*/!options.gpu);
     const double load_seconds = seconds_since(load_start);
 
     std::string text = options.prompt;
@@ -190,7 +195,23 @@ int cmd_generate(const GenerateOptions& options) {
 
     // Room for the prompt, the answer, and a round of speculative guesses.
     const std::size_t max_context = prompt.size() + options.max_tokens + options.draft_tokens + 1;
-    brisk::Session session(model, options.threads, max_context);
+    std::unique_ptr<brisk::Engine> engine;
+    if (options.gpu) {
+#if BRISK_METAL
+        engine = std::make_unique<brisk::MetalSession>(model, mapped.bytes(), max_context);
+#else
+        throw std::runtime_error("this build has no GPU backend");
+#endif
+    } else {
+        engine = std::make_unique<brisk::Session>(model, options.threads, max_context);
+    }
+    brisk::Engine& session = *engine;
+    if (options.warmup) {
+        // Like llama-bench: an untimed pass first, so the timed one sees warmed
+        // clocks and resident weights.
+        session.eval(prompt);
+        session.rollback(0);
+    }
     const auto prompt_start = std::chrono::steady_clock::now();
     std::span<const float> logits = session.eval(prompt);
     const double prompt_seconds = seconds_since(prompt_start);
@@ -273,8 +294,8 @@ int cmd_generate(const GenerateOptions& options) {
     }
     const double generate_seconds = seconds_since(generate_start);
 
-    if (std::getenv("BRISK_PROFILE") != nullptr) {
-        const brisk::Session::Profile& p = session.profile();
+    if (const auto* cpu = dynamic_cast<brisk::Session*>(engine.get()); cpu != nullptr && std::getenv("BRISK_PROFILE") != nullptr) {
+        const brisk::Session::Profile& p = cpu->profile();
         std::fprintf(stderr, "profile: matmul %.2f s | quantize %.2f s | attention %.2f s | norm+rope %.2f s | activation %.2f s\n",
                      p.matmul - p.quantize, p.quantize, p.attention, p.norm_rope, p.activation);
     }
@@ -295,18 +316,27 @@ int cmd_generate(const GenerateOptions& options) {
 
 // Scores a text: the model's perplexity over it, the standard check that an
 // implementation is right, since kernel errors raise it and rounding noise averages out.
-int cmd_perplexity(const std::string& model_path, const std::string& text, std::size_t threads) {
+int cmd_perplexity(const std::string& model_path, const std::string& text, std::size_t threads, bool gpu) {
     const brisk::MappedFile mapped(model_path);
     const brisk::GgufFile file = brisk::GgufFile::parse(mapped.bytes());
     const brisk::Tokenizer tokenizer(file);
-    const brisk::Model model(file);
+    const brisk::Model model(file, /*repack=*/!gpu);
     const std::vector<brisk::Token> tokens = tokenizer.encode(text);
     if (tokens.size() < 2) throw std::runtime_error("the text is too short to score");
     if (tokens.size() > model.config().context_length) throw std::runtime_error("the text exceeds the context length");
 
-    brisk::Session session(model, threads, tokens.size());
+    std::unique_ptr<brisk::Engine> engine;
+    if (gpu) {
+#if BRISK_METAL
+        engine = std::make_unique<brisk::MetalSession>(model, mapped.bytes(), tokens.size());
+#else
+        throw std::runtime_error("this build has no GPU backend");
+#endif
+    } else {
+        engine = std::make_unique<brisk::Session>(model, threads, tokens.size());
+    }
     const auto start = std::chrono::steady_clock::now();
-    const double log_likelihood = session.log_likelihood(tokens);
+    const double log_likelihood = engine->log_likelihood(tokens);
     const double scored = static_cast<double>(tokens.size() - 1);
     std::printf("tokens %zu | nll %.4f | perplexity %.4f | %.1f s\n", tokens.size(), -log_likelihood / scored,
                 std::exp(-log_likelihood / scored), seconds_since(start));
@@ -318,11 +348,13 @@ int usage() {
                  "usage: brisk info [--tensors] <model.gguf>\n"
                  "       brisk tokenize <model.gguf> [--no-special] (--batch <strings.bin> | <text>)\n"
                  "       brisk generate <model.gguf> (-p <prompt> | -f <prompt-file>) [options]\n"
-                 "       brisk perplexity <model.gguf> -f <text-file> [-t <threads>]\n"
+                 "       brisk perplexity <model.gguf> -f <text-file> [-t <threads>] [--gpu]\n"
                  "\n"
                  "generate options:\n"
                  "  -n <count>            most tokens to generate (default 128)\n"
                  "  -t <threads>          CPU threads to use (default: all cores)\n"
+                 "  --gpu                 run on the Metal GPU (Apple silicon; Q4_0 models)\n"
+                 "  --warmup              evaluate the prompt once untimed first (benchmarking)\n"
                  "  --chat                treat the prompt as a user message\n"
                  "  --no-think            with --chat, answer without a reasoning block\n"
                  "  --temp <t>            sampling temperature; 0 always picks the likeliest token (default 0)\n"
@@ -400,9 +432,13 @@ int run(const std::vector<std::string>& args) {
     if (command == "perplexity") {
         if (args.size() < 4 || args[2] != "-f") return usage();
         std::size_t threads = std::thread::hardware_concurrency();
-        if (args.size() == 6 && args[4] == "-t") threads = parse_number<std::size_t>("-t", args[5]);
-        else if (args.size() != 4) return usage();
-        return cmd_perplexity(args[1], read_text_file(args[3]), threads);
+        bool gpu = false;
+        for (std::size_t i = 4; i < args.size(); ++i) {
+            if (args[i] == "-t" && i + 1 < args.size()) threads = parse_number<std::size_t>("-t", args[++i]);
+            else if (args[i] == "--gpu") gpu = true;
+            else return usage();
+        }
+        return cmd_perplexity(args[1], read_text_file(args[3]), threads, gpu);
     }
 
     if (command == "generate") {
@@ -417,6 +453,8 @@ int run(const std::vector<std::string>& args) {
             else if (flag == "--no-think") options.think = false;
             else if (flag == "--ids") options.print_ids = true;
             else if (flag == "--no-stop") options.stop_at_end = false;
+            else if (flag == "--gpu") options.gpu = true;
+            else if (flag == "--warmup") options.warmup = true;
             else if (!has_value) return usage();
             else if (flag == "-p") { options.prompt = args[++i]; have_prompt = true; }
             else if (flag == "-f") { options.prompt = read_text_file(args[++i]); have_prompt = true; }

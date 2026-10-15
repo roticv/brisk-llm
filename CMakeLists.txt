@@ -23,6 +23,7 @@ find_package(Threads REQUIRED)
 
 add_library(brisk
     src/cpu_features.cpp
+    src/engine.cpp
     src/gguf.cpp
     src/kernels.cpp
     src/kernels_f32.cpp
@@ -45,6 +46,28 @@ endif()
 target_include_directories(brisk PUBLIC src)
 target_link_libraries(brisk PUBLIC Threads::Threads)
 
+if(APPLE)
+    option(BRISK_METAL "Build the Metal GPU backend" ON)
+endif()
+if(BRISK_METAL)
+    enable_language(OBJCXX)
+    set(CMAKE_OBJCXX_STANDARD 20)
+    set(CMAKE_OBJCXX_STANDARD_REQUIRED ON)
+    # The shader source is embedded as a string and compiled by Metal at runtime.
+    add_custom_command(
+        OUTPUT ${CMAKE_BINARY_DIR}/generated/metal_shaders.inc
+        COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/generated
+        COMMAND ${CMAKE_COMMAND} -DIN=${CMAKE_SOURCE_DIR}/src/metal/kernels.metal
+                -DOUT=${CMAKE_BINARY_DIR}/generated/metal_shaders.inc -P ${CMAKE_SOURCE_DIR}/cmake/embed_text.cmake
+        DEPENDS src/metal/kernels.metal cmake/embed_text.cmake
+        COMMENT "Embedding Metal shaders")
+    target_sources(brisk PRIVATE src/metal/metal_session.mm ${CMAKE_BINARY_DIR}/generated/metal_shaders.inc)
+    set_source_files_properties(src/metal/metal_session.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+    target_include_directories(brisk PRIVATE ${CMAKE_BINARY_DIR}/generated)
+    target_link_libraries(brisk PUBLIC "-framework Metal" "-framework Foundation")
+    target_compile_definitions(brisk PUBLIC BRISK_METAL=1)
+endif()
+
 add_executable(brisk-cli src/main.cpp)
 set_target_properties(brisk-cli PROPERTIES OUTPUT_NAME brisk)
 target_link_libraries(brisk-cli PRIVATE brisk)
@@ -65,6 +88,13 @@ add_test(NAME gguf_test COMMAND gguf_test)
 add_executable(kernels_test tests/kernels_test.cpp)
 target_link_libraries(kernels_test PRIVATE brisk)
 add_test(NAME kernels_test COMMAND kernels_test)
+if(BRISK_METAL)
+    add_executable(metal_test tests/metal_test.cpp)
+    target_link_libraries(metal_test PRIVATE brisk)
+    add_test(NAME metal_test COMMAND metal_test)
+    add_executable(metal_bench bench/metal_bench.cpp)
+    target_link_libraries(metal_bench PRIVATE brisk)
+endif()
 add_executable(thread_pool_test tests/thread_pool_test.cpp)
 target_link_libraries(thread_pool_test PRIVATE brisk)
 add_test(NAME thread_pool_test COMMAND thread_pool_test)

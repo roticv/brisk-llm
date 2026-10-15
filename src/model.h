@@ -7,6 +7,7 @@
 #include <string_view>
 #include <vector>
 
+#include "engine.h"
 #include "gguf.h"
 #include "quant.h"
 #include "thread_pool.h"
@@ -72,7 +73,9 @@ public:
 
     // The buffer `file` was parsed from must outlive the model. Throws
     // std::runtime_error if the architecture or a tensor type is unsupported.
-    explicit Model(const GgufFile& file);
+    // With `repack`, quantised matrices are rearranged at load for the CPU
+    // kernels where that helps; the Metal backend wants them as in the file.
+    explicit Model(const GgufFile& file, bool repack = true);
 
     Model(const Model&) = delete;
     Model& operator=(const Model&) = delete;
@@ -92,13 +95,14 @@ private:
     Matrix output_projection_;
     std::span<const float> output_norm_;
     std::vector<Layer> layers_;
+    bool repack_ = true;
     std::deque<std::vector<float>> owned_;  // widened tensors; deque keeps them at stable addresses
     std::deque<std::vector<std::byte>> packed_;  // repacked quantised tensors
 };
 
-// One sequence being generated: the key/value cache plus scratch space.
-// The model must outlive the session.
-class Session {
+// One sequence being generated on the CPU: the key/value cache plus scratch
+// space. The model must outlive the session.
+class Session : public Engine {
 public:
     // `threads` is the number of CPU threads to use, the caller included.
     // `max_context` bounds the sequence length (and the cache memory); 0 means
@@ -110,23 +114,11 @@ public:
     // batches, which is much faster than one at a time. The span is valid
     // until the next call. Throws std::runtime_error past the model's context
     // length.
-    std::span<const float> eval(std::span<const Token> tokens);
-    std::span<const float> eval(Token token) { return eval(std::span<const Token>(&token, 1)); }
-
-    // Like eval(), but returns logits for every token: row i (vocab_size floats)
-    // predicts the token after tokens[i]. At most kMaxScoredTokens tokens.
-    std::span<const float> eval_all(std::span<const Token> tokens);
-
-    // Forgets everything from `position` on, so the next eval() continues there.
-    void rollback(std::size_t position);
-
-    static constexpr std::size_t kMaxScoredTokens = 64;
-
-    // Appends tokens and returns the sum over i >= 1 of log p(tokens[i] | tokens[..i]),
-    // the model's log-likelihood of the text. exp(-result / (n - 1)) is the perplexity.
-    double log_likelihood(std::span<const Token> tokens);
-
-    std::size_t position() const { return position_; }
+    using Engine::eval;
+    std::span<const float> eval(std::span<const Token> tokens) override;
+    std::span<const float> eval_all(std::span<const Token> tokens) override;
+    void rollback(std::size_t position) override;
+    std::size_t position() const override { return position_; }
 
     // Seconds spent in each phase of the forward pass so far, for profiling.
     struct Profile {
