@@ -7,7 +7,7 @@ An LLM inference engine in C++20 that is faster than llama.cpp on two machines:
 - MacBook Air M4 (AArch64, NEON, `dotprod`, `i8mm`, SME2, Metal GPU, fanless; 4 performance + 6 efficiency cores)
 - Raspberry Pi 4 Model B, 4 GB (Cortex-A72 x4, baseline NEON only, 4.3 GB/s memory bandwidth)
 
-Scope is deliberately narrow: two models, CPU first, one codebase for both machines.
+Scope started narrow: two models, CPU first, one codebase for both machines. The CPU work (Phases 0-4) and the Metal backend (Phase 5) are done; Phase 6 widens the model set.
 
 | Model | Role | Baseline to beat |
 |---|---|---|
@@ -85,15 +85,14 @@ This is the phase that can move the ceiling, so it comes before any kernel polis
 
 **Done when:** BitNet outputs match bitnet.cpp and generation beats bitnet.cpp and llama.cpp on both machines; the output-layer shortcut, vocabulary pruning and speculative decoding each give a measured generation gain on Qwen3-1.7B on both machines with unchanged greedy output on the test prompts.
 
-## Phase 4: Prompt processing and remaining 4-bit headroom — not started
+## Phase 4: Prompt processing and remaining 4-bit headroom — done, criterion partly met
 
-- Cache-blocked quantised matrix multiply for prompt processing.
-- Static memory planning, fused operations, no allocation during generation.
-- Anything the profiles still show, now that the big levers are in.
+- Done: fused dispatch (Q/K/V and gate/up share one activation quantisation and one dispatch), K-quant grouped tiles (Q4_Kx4, Q6_Kx4 with smmla), strided kernel output straight into the attention layout, row-band blocking for the NEON and i8mm batched kernels, head-major K/V cache with NEON attention, and no allocation during generation. Unit tests, pinned perplexity and CI came with it.
+- Outcome on Qwen3-1.7B Q4_0: Pi prompt processing 1.9x llama.cpp and generation 12% ahead; M4 generation 8% ahead at 4 threads and 40% at 10; M4 prompt processing 6% behind at 4 threads and 12% ahead at 10.
 
 Dropped: A72-specific kernel tuning for generation. The Pi is bandwidth-bound, so it cannot pay off.
 
-**Done when:** on Qwen3-1.7B, generation is at least 15% faster and prompt processing at least 30% faster than llama.cpp on both machines.
+**Done when:** on Qwen3-1.7B, generation is at least 15% faster and prompt processing at least 30% faster than llama.cpp on both machines. Prompt processing: met on the Pi, not on the M4 at 4 threads. Generation: not met at 15% on either machine at 4 threads, and not reachable there by kernel work, since both engines sit at 80-90% of the bandwidth ceiling; met on the M4 with all cores.
 
 ## Phase 5: Mac-only acceleration — Metal backend done, at parity
 
@@ -145,6 +144,10 @@ Like-for-like on the same files (details and conditions in `bench/RESULTS.md`):
 | Pi 4, BitNet 2B4T, generation | 4.6 | 4.7 |
 
 Faster than llama.cpp: generation on the Pi, prompt processing on the Pi (1.9x on the 1.7B), generation on the M4 (8% ahead at 4 threads, 40% at 10, also past Metal), BitNet on the M4 (2-3x), Q4_K_M files on the M4, M4 prompt processing at 10 threads, lookup-drafted generation on repetitive text (2x). Not faster: M4 prompt processing on Q4_0 at 4 threads (6% behind), and on the GPU, where brisk's Metal backend is level with llama.cpp's on 1.7B generation and 7-9% behind on prompts. Both engines sit at 80-90% of the memory-bandwidth ceiling for generation, which is why the generation margins are small.
+
+## What's next
+
+Phase 6 (model families) is the open work. Of the performance items, the two with a plausible clear margin over llama.cpp are BitNet on the GPU (llama.cpp's Metal backend has no ternary kernels, so its BitNet path runs on the CPU) and speculative decoding on the GPU (`--gpu --draft lookup` already runs; unmeasured). Also open: Q6_K/Q8_0 output matrices on the GPU, a half-precision K/V cache, SME2 CPU kernels.
 
 ## Open questions
 
