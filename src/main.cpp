@@ -177,12 +177,21 @@ int cmd_generate(const GenerateOptions& options) {
 
     std::string text = options.prompt;
     if (options.chat) {
-        if (model.config().architecture == brisk::Architecture::BitNet) {
-            text = "User: " + text + "<|eot_id|>Assistant: ";
-        } else {
-            // Qwen's ChatML turn format. An empty think block tells Qwen3 to answer directly.
-            text = "<|im_start|>user\n" + text + "<|im_end|>\n<|im_start|>assistant\n";
-            if (!options.think) text += "<think>\n\n</think>\n\n";
+        switch (model.config().architecture) {
+            case brisk::Architecture::BitNet: text = "User: " + text + "<|eot_id|>Assistant: "; break;
+            case brisk::Architecture::Llama:
+                // Llama 3's header format (the BOS token is prepended below).
+                text = "<|start_header_id|>user<|end_header_id|>\n\n" + text +
+                       "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n";
+                break;
+            case brisk::Architecture::Qwen2:
+                text = "<|im_start|>user\n" + text + "<|im_end|>\n<|im_start|>assistant\n";
+                break;
+            case brisk::Architecture::Qwen3:
+                // Qwen's ChatML turn format. An empty think block tells Qwen3 to answer directly.
+                text = "<|im_start|>user\n" + text + "<|im_end|>\n<|im_start|>assistant\n";
+                if (!options.think) text += "<think>\n\n</think>\n\n";
+                break;
         }
     }
     std::vector<brisk::Token> prompt = tokenizer.encode(text);

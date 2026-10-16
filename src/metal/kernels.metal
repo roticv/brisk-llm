@@ -672,7 +672,7 @@ kernel void attention(device const float* q [[buffer(0)]],
 // coalesced 512-byte read serving every query head of the group. Writes the
 // same partials as the batched kernel for attention_combine.
 constant uint kSmallChunk = 128;  // positions per split (the host dispatches ceil(visible / kSmallChunk) splits)
-constant uint kMaxGroup = 4;     // query heads per key/value head
+constant uint kMaxGroup = 8;     // query heads per key/value head
 
 kernel void attention_small(device const float* q [[buffer(0)]],
                             device const float* k_cache [[buffer(1)]],

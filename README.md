@@ -8,7 +8,7 @@ A small LLM inference engine in C++20, built for two machines: a MacBook Air M4 
 - Weight formats: F32, F16, BF16, Q4_0, Q4_1, Q4_K, Q6_K and the ternary TQ2_0; Q4_0 and TQ2_0 are repacked at load into a four-row interleaved layout on CPUs with `i8mm`.
 - NEON kernels in three variants (baseline for the Cortex-A72, `dotprod`, `i8mm`/`smmla`), chosen at startup; batched prompt processing; a thread pool that hands out work dynamically so efficiency cores help.
 - Metal backend (`--gpu`) for Q4_0 and BitNet (TQ2_0) models on Apple silicon: weights used in place from the memory map, K/V cache on the GPU, simdgroup-matrix kernels for prompts, one command buffer per batch; shaders compiled at startup, so no Metal toolchain is needed.
-- Models: Qwen3 (0.6B, 1.7B tested) and BitNet b1.58 2B4T, with the Qwen and Llama 3 tokenizers. Other families are planned (roadmap Phase 6).
+- Models: Qwen3 (0.6B, 1.7B tested), Qwen2/2.5 (1.5B tested; also the DeepSeek-R1 distils of it), Llama 3.x (3.2-1B tested; Mistral- and SmolLM2-shaped files should load) and BitNet b1.58 2B4T, with the Qwen and Llama 3 tokenizers. `--chat` applies each family's turn format. Gemma is planned (roadmap Phase 6).
 - Greedy and temperature/top-k/top-p sampling; speculative decoding with lookup (n-gram) or model drafting, exact with respect to greedy decoding.
 
 ## Build

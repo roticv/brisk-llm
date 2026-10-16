@@ -19,6 +19,8 @@ namespace brisk {
 // structure and differ in a few extra norms and the feed-forward activation.
 enum class Architecture {
     Qwen3,   // RMS norms on Q and K per head, SiLU-gated feed-forward
+    Qwen2,   // Qwen2/2.5 and the DeepSeek-R1 distils of them: Q/K/V biases, no Q/K norms
+    Llama,   // Llama 3.x, Mistral, SmolLM2 and other Llama-shaped models: adjacent-pair RoPE
     BitNet,  // ternary weights, extra norms before the output projections, squared-ReLU feed-forward
 };
 
@@ -34,6 +36,12 @@ struct ModelConfig {
     std::uint32_t context_length = 0;  // longest sequence the model was trained on
     float rope_base = 0.0f;
     float rms_epsilon = 0.0f;
+    // RoPE pairs element i with i + head_dim/2 ("NeoX": Qwen, BitNet) or with
+    // i + 1 for even i ("normal": Llama).
+    bool rope_neox = true;
+    // Per-frequency divisors of the RoPE angles (Llama 3's long-context
+    // scaling, from rope_freqs.weight); empty when the angles are unscaled.
+    std::vector<float> rope_factors;
 };
 
 // A weight matrix stored row by row: `rows` outputs, each over `cols` inputs.
@@ -62,6 +70,9 @@ public:
         Matrix value;
         std::span<const float> query_norm;         // Qwen3: per-head norm of Q (empty otherwise)
         std::span<const float> key_norm;           // Qwen3: per-head norm of K
+        std::span<const float> query_bias;         // Qwen2: biases added to the projections (empty otherwise)
+        std::span<const float> key_bias;
+        std::span<const float> value_bias;
         std::span<const float> attention_sub_norm;  // BitNet: norm of the attention result before the output projection
         Matrix attention_output;
         std::span<const float> feed_forward_norm;

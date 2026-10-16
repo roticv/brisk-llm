@@ -235,10 +235,10 @@ struct MetalSession::Impl {
         attended_h = make(kMaxBatch * qdim * 2);
         gate_h = make(kMaxBatch * ff * 2);
         tiles_fit = embd % 64 == 0 && qdim % 64 == 0 && kvdim % 64 == 0 && ff % 64 == 0 && c.vocab_size % 64 == 0;
-        if (c.head_count / c.kv_head_count > 4 || c.head_dim > 128 || c.head_dim % 8 != 0) {
-            fail("attention kernel supports at most 4 query heads per key/value head and head_dim <= 128, a multiple of 8");
+        if (c.head_count / c.kv_head_count > 8 || c.head_dim > 128 || c.head_dim % 8 != 0) {
+            fail("attention kernel supports at most 8 query heads per key/value head and head_dim <= 128, a multiple of 8");
         }
-        block_tokens = 16 / (c.head_count / c.kv_head_count);  // 16 query rows per threadgroup
+        block_tokens = std::max<std::size_t>(1, 16 / (c.head_count / c.kv_head_count));  // at most 16 query rows per threadgroup
         // 16 score rows per attention threadgroup: (batch / block_tokens) x kv heads threadgroups.
         scores = make(((kMaxBatch + block_tokens - 1) / block_tokens) * c.kv_head_count * 16 * max_context * 4);
         // Partials: kSmallBatch tokens x heads x splits, each head_dim + 2 floats.

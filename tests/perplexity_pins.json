@@ -28,5 +28,15 @@
     "model": "bitnet-2B4T-TQ2_0-e4.gguf",
     "text": "tests/perplexity_text.txt",
     "perplexity": 26.2207
+  },
+  {
+    "model": "Llama-3.2-1B-Instruct-Q4_K_M.gguf",
+    "text": "tests/perplexity_text.txt",
+    "perplexity": 27.7986
+  },
+  {
+    "model": "Qwen2.5-1.5B-Instruct-Q4_K_M.gguf",
+    "text": "tests/perplexity_text.txt",
+    "perplexity": 15.0395
   }
 ]

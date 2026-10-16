@@ -78,18 +78,24 @@ void rms_norm(std::span<const float> x, std::span<const float> weight, float eps
     for (std::size_t i = 0; i < x.size(); ++i) out[i] = x[i] * scale * weight[i];
 }
 
-// Rotary position embedding in the "NeoX" layout: element i is paired with
-// element i + dim/2. `rope` holds cos, sin for each pair.
-void apply_rope(std::span<float> head, std::span<const float> rope) {
+// Rotary position embedding. `rope` holds cos, sin for each pair; in the
+// "NeoX" layout element i is paired with element i + dim/2, in the "normal"
+// one element 2i with 2i + 1.
+void apply_rope(std::span<float> head, std::span<const float> rope, bool neox) {
     const std::size_t half = head.size() / 2;
     for (std::size_t i = 0; i < half; ++i) {
         const float c = rope[2 * i];
         const float s = rope[2 * i + 1];
-        const float x0 = head[i];
-        const float x1 = head[i + half];
-        head[i] = x0 * c - x1 * s;
-        head[i + half] = x0 * s + x1 * c;
+        float& a = head[neox ? i : 2 * i];
+        float& b = head[neox ? i + half : 2 * i + 1];
+        const float x0 = a, x1 = b;
+        a = x0 * c - x1 * s;
+        b = x0 * s + x1 * c;
     }
+}
+
+void add_bias(std::span<float> x, std::span<const float> bias) {
+    for (std::size_t i = 0; i < x.size(); ++i) x[i] += bias[i];
 }
 
 float silu(float x) { return x / (1.0f + std::exp(-x)); }
@@ -111,10 +117,16 @@ float require_f32(const GgufFile& file, const std::string& key) {
 Model::Model(const GgufFile& file, bool repack) : repack_(repack) {
     const auto architecture = file.get<std::string_view>("general.architecture");
     if (architecture == "qwen3") config_.architecture = Architecture::Qwen3;
+    else if (architecture == "qwen2") config_.architecture = Architecture::Qwen2;
+    else if (architecture == "llama") config_.architecture = Architecture::Llama;
     else if (architecture == "bitnet" || architecture == "bitnet-b1.58") config_.architecture = Architecture::BitNet;
-    else fail("unsupported architecture '" + std::string(architecture.value_or("(none)")) + "'; qwen3 and bitnet are supported");
+    else {
+        fail("unsupported architecture '" + std::string(architecture.value_or("(none)")) +
+             "'; qwen3, qwen2, llama and bitnet are supported");
+    }
     const std::string prefix = std::string(*architecture) + ".";
     const bool bitnet = config_.architecture == Architecture::BitNet;
+    config_.rope_neox = config_.architecture != Architecture::Llama;
 
     config_.embedding_dim = require_u32(file, prefix + "embedding_length");
     config_.layer_count = require_u32(file, prefix + "block_count");
@@ -152,6 +164,12 @@ Model::Model(const GgufFile& file, bool repack) : repack_(repack) {
     const std::size_t kv_dim = static_cast<std::size_t>(config_.kv_head_count) * config_.head_dim;
     const std::size_t ff = config_.feed_forward_dim;
 
+    // Llama 3's rope scaling ships as per-frequency factors.
+    if (file.tensor("rope_freqs.weight") != nullptr) {
+        const std::span<const float> factors = load(file, "rope_freqs.weight", config_.head_dim / 2);
+        config_.rope_factors.assign(factors.begin(), factors.end());
+    }
+
     token_embedding_ = load_matrix(file, "token_embd.weight", config_.vocab_size, embd);
     // Without a separate output matrix the token embedding is reused for it.
     output_projection_ = file.tensor("output.weight") != nullptr
@@ -170,9 +188,15 @@ Model::Model(const GgufFile& file, bool repack) : repack_(repack) {
         if (bitnet) {
             layer.attention_sub_norm = load(file, block + "attn_sub_norm.weight", embd);
             layer.feed_forward_sub_norm = load(file, block + "ffn_sub_norm.weight", ff);
-        } else {
+        } else if (config_.architecture == Architecture::Qwen3) {
             layer.query_norm = load(file, block + "attn_q_norm.weight", config_.head_dim);
             layer.key_norm = load(file, block + "attn_k_norm.weight", config_.head_dim);
+        }
+        // Projection biases (Qwen2 has them; some Llama-shaped models too). All or none.
+        if (file.tensor(block + "attn_q.bias") != nullptr) {
+            layer.query_bias = load(file, block + "attn_q.bias", query_dim);
+            layer.key_bias = load(file, block + "attn_k.bias", kv_dim);
+            layer.value_bias = load(file, block + "attn_v.bias", kv_dim);
         }
         layer.attention_output = load_matrix(file, block + "attn_output.weight", embd, query_dim);
         layer.feed_forward_norm = load(file, block + "ffn_norm.weight", embd);
@@ -450,8 +474,9 @@ void Session::eval_batch(std::span<const Token> tokens, bool all_logits) {
         float theta = static_cast<float>(position_ + t);
         float* rope = rope_.data() + t * head_dim;
         for (std::size_t i = 0; i < head_dim / 2; ++i) {
-            rope[2 * i] = std::cos(theta);
-            rope[2 * i + 1] = std::sin(theta);
+            const float angle = c.rope_factors.empty() ? theta : theta / c.rope_factors[i];
+            rope[2 * i] = std::cos(angle);
+            rope[2 * i + 1] = std::sin(angle);
             theta *= theta_scale;
         }
     }
@@ -496,15 +521,20 @@ void Session::eval_batch(std::span<const Token> tokens, bool all_logits) {
         Timed* phase = new Timed(profile_.norm_rope);
         pool_.run(n, [&](std::size_t t) {
             const std::span<const float> rope(rope_.data() + t * head_dim, head_dim);
+            if (!layer.query_bias.empty()) {
+                add_bias({query_.data() + t * query_dim, query_dim}, layer.query_bias);
+                add_bias({new_keys + t * kv_dim, kv_dim}, layer.key_bias);
+                add_bias({new_values + t * kv_dim, kv_dim}, layer.value_bias);
+            }
             for (std::size_t h = 0; h < c.head_count; ++h) {
                 const std::span<float> q(query_.data() + t * query_dim + h * head_dim, head_dim);
                 if (!layer.query_norm.empty()) rms_norm(q, layer.query_norm, c.rms_epsilon, q);
-                apply_rope(q, rope);
+                apply_rope(q, rope, c.rope_neox);
             }
             for (std::size_t h = 0; h < c.kv_head_count; ++h) {
                 const std::span<float> k(new_keys + t * kv_dim + h * head_dim, head_dim);
                 if (!layer.key_norm.empty()) rms_norm(k, layer.key_norm, c.rms_epsilon, k);
-                apply_rope(k, rope);
+                apply_rope(k, rope, c.rope_neox);
                 std::copy_n(k.data(), head_dim, cache_row(keys, h, position_ + t));
                 std::copy_n(new_values + t * kv_dim + h * head_dim, head_dim, cache_row(values, h, position_ + t));
             }
