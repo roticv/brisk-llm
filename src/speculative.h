@@ -51,7 +51,8 @@ private:
 };
 
 struct SpeculativeStats {
-    std::size_t rounds = 0;
+    std::size_t rounds = 0;   // rounds that drafted
+    std::size_t plain = 0;    // rounds that decoded one token without drafting (backed off)
     std::size_t drafted = 0;
     std::size_t accepted = 0;
 };
@@ -63,8 +64,14 @@ public:
     Speculator(Engine& target, Drafter& drafter, Token carry, std::size_t draft_tokens);
 
     // Runs one round and returns the tokens it settled: the accepted guesses
-    // followed by the target's own next token. Never empty.
+    // followed by the target's own next token. Never empty. A round whose
+    // guesses were all rejected is followed by plain single-token rounds,
+    // their number doubling each time it happens again (up to kMaxBackoff),
+    // so a drafter that is not helping costs little; accepted guesses bring
+    // full drafting back, halving the back-off each time.
     std::vector<Token> step();
+
+    static constexpr std::size_t kMaxBackoff = 32;
 
     const SpeculativeStats& stats() const { return stats_; }
 
@@ -73,6 +80,8 @@ private:
     Drafter& drafter_;
     Token carry_;
     std::size_t draft_tokens_;
+    std::size_t backoff_ = 0;    // plain rounds to run before drafting again
+    std::size_t last_backoff_ = 0;
     SpeculativeStats stats_;
     std::vector<Token> batch_;
 };

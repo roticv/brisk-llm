@@ -50,7 +50,8 @@ struct AttentionParams {
     float scale;
     uint32_t write_half, splits, chunk;
 };
-constexpr uint32_t kMaxSplits = 16;  // position ranges a small batch's attention is spread over
+constexpr std::size_t kSmallChunk = 128;  // positions per split of a small batch's attention (as in the kernel)
+constexpr std::size_t kSmallBatch = 8;    // rows that take the gemv and the split attention
 
 // A tensor on the GPU: a buffer and a byte offset into it.
 struct Buf {
@@ -205,12 +206,11 @@ struct MetalSession::Impl {
         tiles_fit = embd % 64 == 0 && qdim % 64 == 0 && kvdim % 64 == 0 && ff % 64 == 0 && c.vocab_size % 64 == 0;
         // 16 score rows per attention threadgroup: (batch / 8 tokens) x kv heads threadgroups.
         scores = make(((kMaxBatch + 7) / 8) * c.kv_head_count * 16 * max_context * 4);
-        partial = make(std::size_t{8} * c.head_count * kMaxSplits * (c.head_dim + 2) * 4);
+        partial = make(kSmallBatch * c.head_count * ((max_context + kSmallChunk - 1) / kSmallChunk) * (c.head_dim + 2) * 4);
         if (c.head_count / c.kv_head_count > 2 || c.head_dim > 128 || c.head_dim % 8 != 0) {
             fail("attention kernel supports at most 2 query heads per key/value head and head_dim <= 128, a multiple of 8");
         }
-        // Partials: 8 tokens x heads x splits, each head_dim + 2 floats. The split kernel's chunk is 64
-        // positions so a long context takes more than kMaxSplits of them; the chunk then grows.
+        // Partials: kSmallBatch tokens x heads x splits, each head_dim + 2 floats.
         logits = make(Engine::kMaxScoredTokens * c.vocab_size * 4);
         const std::size_t cache = std::size_t{c.layer_count} * c.kv_head_count * max_context * c.head_dim * 4;
         k_cache = make(cache);
@@ -244,7 +244,7 @@ struct MetalSession::Impl {
         id<MTLBuffer> h = nil;
     };
 
-    bool tiled(std::size_t n) const { return tiles_fit && n >= 8; }
+    bool tiled(std::size_t n) const { return tiles_fit && n > kSmallBatch; }
 
     void encode_norm(id<MTLComputeCommandEncoder> enc, id<MTLBuffer> in, const Buf& w, Act out, std::size_t rows,
                      std::size_t dim, NSUInteger in_offset = 0, NSUInteger out_offset = 0) {
@@ -398,14 +398,14 @@ struct MetalSession::Impl {
                 checkpoint("rope");
 
                 // A small batch has too few (token, head) items to fill the GPU, so
-                // the small kernel spreads each one's positions over splits of 64
-                // that a second kernel merges. Batches use the tiled kernel.
+                // the small kernel spreads each one's positions over splits of
+                // kSmallChunk that a second kernel merges. Batches use the tiled kernel.
                 const std::size_t visible = position + n;
-                const bool small = n <= 8;
+                const bool small = n <= kSmallBatch;
                 uint32_t splits = 1, chunk = static_cast<uint32_t>((max_context + 7) / 8 * 8);
                 if (small) {
-                    splits = static_cast<uint32_t>(std::min<std::size_t>(kMaxSplits, (visible + 63) / 64));
-                    chunk = static_cast<uint32_t>(((visible + splits - 1) / splits + 7) / 8 * 8);
+                    splits = static_cast<uint32_t>((visible + kSmallChunk - 1) / kSmallChunk);
+                    chunk = static_cast<uint32_t>(kSmallChunk);
                 }
                 // BitNet normalises the attention output first, which rewrites the half copy.
                 const AttentionParams ap{static_cast<uint32_t>(n), static_cast<uint32_t>(position), c.head_count,

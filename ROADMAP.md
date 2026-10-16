@@ -147,7 +147,7 @@ Faster than llama.cpp: generation on the Pi, prompt processing on the Pi (1.9x o
 
 ## What's next
 
-Phase 6 (model families) is the open work. Of the performance items, the two with a plausible clear margin over llama.cpp are BitNet on the GPU (llama.cpp's Metal backend has no ternary kernels, so its BitNet path runs on the CPU) and speculative decoding on the GPU (`--gpu --draft lookup` already runs; unmeasured). Also open: Q6_K/Q8_0 output matrices on the GPU, a half-precision K/V cache, SME2 CPU kernels.
+Phase 6 (model families) is the open work. Of the performance items, the one with a plausible clear margin over llama.cpp is BitNet on the GPU (llama.cpp's Metal backend has no ternary kernels, so its BitNet path runs on the CPU). Speculative decoding on the GPU is measured (`bench/RESULTS.md`): 2.9x on repeated text with 24 lookup guesses, a 26% loss on fresh text even with the new back-off, because a verify batch of n tokens costs about 0.7 n single tokens on the GPU; a batched gemv that reads the weights once per batch (like llama.cpp's `mul_mv_mma`) would fix that and five attempts at it were slower than the plain gemv. Also open: Q6_K/Q8_0 output matrices on the GPU, a half-precision K/V cache, SME2 CPU kernels.
 
 ## Open questions
 

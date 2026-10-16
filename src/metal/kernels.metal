@@ -530,7 +530,7 @@ kernel void attention(device const float* q [[buffer(0)]],
 // positions; the lanes hold 4 dimensions each, so a key or value row is one
 // coalesced 512-byte read serving every query head of the group. Writes the
 // same partials as the batched kernel for attention_combine.
-constant uint kSmallChunk = 64;  // positions per split
+constant uint kSmallChunk = 128;  // positions per split (the host dispatches ceil(visible / kSmallChunk) splits)
 constant uint kMaxGroup = 4;     // query heads per key/value head
 
 kernel void attention_small(device const float* q [[buffer(0)]],
@@ -549,7 +549,7 @@ kernel void attention_small(device const float* q [[buffer(0)]],
     const uint split = tg % p.splits;
     const uint t = (tg / p.splits) / p.kv_head_count, kv = (tg / p.splits) % p.kv_head_count;
     const uint visible = p.position0 + t + 1;
-    const uint pos0 = split * p.chunk, end = min(visible, pos0 + p.chunk);
+    const uint pos0 = split * kSmallChunk, end = min(visible, pos0 + kSmallChunk);
     device const float* keys = k_cache + (ulong)kv * p.max_context * p.head_dim;
     device const float* values = v_cache + (ulong)kv * p.max_context * p.head_dim;
     const uint d4 = lane * 4;

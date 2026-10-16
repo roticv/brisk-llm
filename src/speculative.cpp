@@ -70,6 +70,16 @@ Speculator::Speculator(Engine& target, Drafter& drafter, Token carry, std::size_
     : target_(target), drafter_(drafter), carry_(carry), draft_tokens_(std::min(draft_tokens, Session::kMaxScoredTokens - 1)) {}
 
 std::vector<Token> Speculator::step() {
+    if (backoff_ > 0) {
+        --backoff_;
+        const std::span<const float> logits = target_.eval(carry_);
+        const Token next = argmax(logits);
+        std::vector<Token> settled{next};
+        drafter_.observe(settled);
+        carry_ = next;
+        stats_.plain += 1;
+        return settled;
+    }
     const std::vector<Token> guesses = drafter_.draft(draft_tokens_);
     const std::size_t base = target_.position();  // the carry token goes here
 
@@ -98,6 +108,12 @@ std::vector<Token> Speculator::step() {
     stats_.rounds += 1;
     stats_.drafted += guesses.size();
     stats_.accepted += accepted;
+    if (accepted == 0 && !guesses.empty()) {
+        last_backoff_ = std::min(kMaxBackoff, last_backoff_ == 0 ? 1 : last_backoff_ * 2);
+        backoff_ = last_backoff_;
+    } else {
+        last_backoff_ /= 2;  // recover gradually: one lucky guess does not mean the drafter is back on track
+    }
     return settled;
 }
 

@@ -272,9 +272,9 @@ int cmd_generate(const GenerateOptions& options) {
         const brisk::SpeculativeStats& st = speculator.stats();
         std::fprintf(stderr,
                      "load %.2f s | prompt %zu tokens, %.1f tokens/s | generation %zu tokens, %.1f tokens/s | "
-                     "%zu rounds, %zu of %zu guesses accepted | %zu threads, %.*s kernels\n",
+                     "%zu drafted rounds + %zu plain, %zu of %zu guesses accepted | %zu threads, %.*s kernels\n",
                      load_seconds, prompt.size(), static_cast<double>(prompt.size()) / prompt_seconds, generated.size(),
-                     static_cast<double>(generated.size()) / generate_seconds, st.rounds, st.accepted, st.drafted,
+                     static_cast<double>(generated.size()) / generate_seconds, st.rounds, st.plain, st.accepted, st.drafted,
                      options.threads, static_cast<int>(brisk::kernels::kernel_set_name().size()),
                      brisk::kernels::kernel_set_name().data());
         return 0;

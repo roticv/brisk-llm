@@ -90,6 +90,17 @@ Generation after a 497-token prompt (context the `tg64` numbers do not have): 80
 
 Where the time goes on the 1.7B prompt (GPU time of the batch, 0.53 s): the tiled matmul takes about 0.47 s at 2.8-3.0 TFLOPS, which is 85-90% of the 3.25 TFLOPS that a register-only `simdgroup_multiply_accumulate` loop reaches on this GPU (`bench/metal_bench`; llama.cpp's own matmul measures 2.6 TFLOPS in its `test-backend-ops perf`); attention is 0.03 s; the rest is small. So the 9% gap to llama.cpp on prompt processing is not in the matmul kernel but spread over the remaining passes and launch gaps. In generation the layer gemvs read the weights at ~90 GB/s and the large output matrix at 117 GB/s (of 120 measured by `membw`), so the per-layer dispatches are what costs; the 0.6B, with its smaller matrices, loses more to that. First-run numbers are 10-15% lower than warmed ones: the GPU clock ramps and the mapped weights are touched for the first time.
 
+#### Speculative decoding on the GPU
+
+Qwen3-1.7B pure Q4_0, `--gpu`, greedy, lookup (n-gram) drafting, output identical to plain decoding. The Speculator now backs off after a round with no accepted guess (plain single-token rounds, doubling up to 32, halved again on success), which is what keeps the fresh-answer penalty bounded.
+
+| Text | plain | lookup, 5 guesses | 12 guesses | 24 guesses |
+|---|---:|---:|---:|---:|
+| fresh answer (200 tokens) | 80-90 | 59 (was 42 before the back-off) | | |
+| "repeat the text above" (200 tokens) | 78 | 113 | 125 | 234 (99% accepted) |
+
+For comparison the CPU at 4 threads: fresh 68 plain / 54 with lookup; repeat 163 at 12 guesses. The GPU gains more at long drafts (one 25-token verify costs about two single tokens) and less at short ones, because a verify batch of n tokens costs about 0.7 n single tokens on the GPU against about 0.4 n on the CPU: the gemv reads the weights once per activation row. Five kernels were tried to read them once per batch instead (accumulating all rows in one simdgroup; one simdgroup per row sharing a threadgroup; an 8-row simdgroup-matrix kernel in three layouts, with transposed activations and staged slices; paired aligned block loads) and every one was slower than the plain gemv, including at a single token, because on this GPU the extra registers or threadgroup memory cut the resident simdgroups faster than the saved traffic paid back. llama.cpp's `mul_mv_mma` kernel solves the same problem, so a working design exists; it was not reached here.
+
 Measured along the way: a 128x64 tile with 8 simdgroups ran 3x slower (register pressure), as did unrolling the gemv's block loop; halving threadgroup memory per tile changed nothing; block-major 8x8 operand layouts with contiguous `simdgroup_load`s gave +8%; fusing the residual adds and SiLU gate into the matmul epilogues and writing half activations from the producers gave +5%; splitting a single token's attention over position chunks took long-context generation from 68 to 80 tokens/s. A `uint` load at a 2-byte-aligned address inside an 18-byte Q4_0 block is silently rounded down to 4 bytes on this GPU; `metal_test` exists because of it.
 
 ## Raspberry Pi 4 Model B (4 GB, Cortex-A72 x4, Debian 13, 64-bit)
