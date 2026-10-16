@@ -34,7 +34,7 @@ build-release/brisk generate models/Qwen3-1.7B-pure-Q4_0.gguf -f prompt.txt -n 2
 
 `--gpu` runs the model on the Metal GPU (Apple silicon; Q4_0 files, and the BitNet TQ2_0 file with a Q4_0 embedding). The weights are used in place from the memory-mapped file, the K/V cache lives on the GPU, and each batch of tokens is one command buffer. The shaders are embedded as source and compiled when the program starts, so no Metal toolchain is needed. `--warmup` evaluates the prompt once untimed first, as llama-bench does, for comparable numbers.
 
-`brisk generate` prints a timing line to stderr; `BRISK_PROFILE=1` adds a per-phase breakdown on the CPU, `BRISK_GPU_PROFILE=1` per kernel class on the GPU (each class timed in its own command buffer, so small ones read high) and `BRISK_GPU_TIME=1` the GPU time of each batch. Model files go in `models/` (ignored by git); the pure Q4_0 files used in the benchmarks are made with `llama-quantize --pure`.
+`brisk generate` prints a timing line to stderr; `BRISK_EVAL_CHUNK=1` makes `perplexity` score one token at a time (the generation kernels rather than the batched ones); `BRISK_PROFILE=1` adds a per-phase breakdown on the CPU, `BRISK_GPU_PROFILE=1` per kernel class on the GPU (each class timed in its own command buffer, so small ones read high) and `BRISK_GPU_TIME=1` the GPU time of each batch. Model files go in `models/` (ignored by git); the pure Q4_0 files used in the benchmarks are made with `llama-quantize --pure`.
 
 ## Tests
 
@@ -68,4 +68,4 @@ The CPU work (roadmap Phases 0-4) and the Metal backend (Phase 5) are done; Phas
 Against llama.cpp on the same files (details in `bench/RESULTS.md`):
 
 - **CPU:** generation at 4 threads is within a few percent either way, because both engines sit at 80-90% of the memory-bandwidth ceiling. brisk is ahead on the Pi (generation 12%, prompt processing 1.9x on Qwen3-1.7B), on the M4 with all cores (40%), on Q4_K_M files, and on BitNet (2-3x); behind on M4 prompt processing of Q4_0 files at 4 threads (6%).
-- **GPU:** level with llama.cpp's Metal backend on Qwen3-1.7B generation (89.6 vs 88.4 tokens/s) and 7-9% behind on prompt processing (940 vs 1034), which is 2.9x the CPU path. The batched matmul runs at 85-90% of the GPU's measured matrix peak, so the rest of that gap is outside the kernel.
+- **GPU:** level with llama.cpp's Metal backend on Qwen3-1.7B generation (89.6 vs 88.4 tokens/s), 11% ahead on BitNet generation (93 vs 84), and 3-9% behind on prompt processing (940 vs 1034 on the 1.7B), which is 2.9x the CPU path. The batched matmul runs at 85-90% of the GPU's measured matrix peak, so the rest of that gap is outside the kernel.

@@ -96,11 +96,13 @@ The TQ2_0 file (e4: Q4_0 embedding and output) with `--gpu`, paced as above, med
 
 | | prompt (498 / 512 tokens) | generation (64, short context) |
 |---|---:|---:|
-| brisk GPU | 594 | 70 |
-| llama.cpp Metal | 608 | 85 |
+| brisk GPU | 634 | 93 |
+| llama.cpp Metal | 655 | 84 |
 | brisk CPU, 4 / 10 threads | | 67 / 102 |
 
-Perplexity on the GPU matches the pin to 0.02%. The ternary gemv is the limit: 537 MB of layer weights per token take about 11 ms (50 GB/s), nowhere near the 120 GB/s the Q4_0 output matrix reads at. The integer decode (shift, mask, convert per 2-bit field) ran at 42 GB/s; llama.cpp's float decode (a byte converted once, `floor(v / 4^l)` with telescoped activation coefficients shared across rows) brought it to 50; four rows per simdgroup to share the activations made it slower again, as every wider gemv has on this GPU. So on the Mac the fastest way to run BitNet remains brisk's CPU path with all ten cores, and the ternary GPU kernel is at 80% of llama.cpp's.
+Perplexity on the GPU matches the pin to 0.02% through the tile (batches) and 0.19% through the gemv (`BRISK_EVAL_CHUNK=1`, the half-precision decode's rounding).
+
+How the ternary gemv got from 42 to 90 GB/s, measured in isolation on the 6912x2560 gate matrix (`metal_gemv_tq2_0_seconds`): the first kernel (two rows per simdgroup, a quarter block per lane, integer shift-and-mask decode) read weights at 42 GB/s; swapping the decode for llama.cpp's float one (`floor(v / 4^l)` of the byte with telescoped activation coefficients) alone gave 50; copying llama.cpp's structure (four rows per simdgroup, two simdgroups per threadgroup, four blocks in flight with eight lanes each, coefficients shared across the rows) gave 77-82 and generation parity with llama.cpp; the same kernel with the decode removed reads at 121-131 GB/s, so the decode was the remaining cost; running the decode in half precision (exact for bytes and their floor divisions; coefficients scaled by 1/64 to stay in range, since the first attempt overflowed to inf on a long generation while the 64-token perplexity check passed) with eight rows per simdgroup reached 86-91 GB/s. Vectorising the float decode across the lane's four bytes changed nothing (the compiler had done it), and eight rows without the half decode was slower than four.
 
 #### Speculative decoding on the GPU
 

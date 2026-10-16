@@ -52,6 +52,7 @@ struct AttentionParams {
 };
 constexpr std::size_t kSmallChunk = 128;  // positions per split of a small batch's attention (as in the kernel)
 constexpr std::size_t kSmallBatch = 8;    // rows that take the gemv and the split attention
+constexpr std::size_t kTernaryRows = 8;   // row streams per simdgroup of the ternary gemv (as in the kernel)
 
 // The 64x64 tile kernel specialised for a weight format (0 = Q4_0, 1 = TQ2_0).
 id<MTLComputePipelineState> tile_pipeline(id<MTLDevice> device, id<MTLLibrary> library, uint32_t format) {
@@ -136,7 +137,16 @@ struct MetalSession::Impl {
         embed = pipeline("embed_q4_0");
         rms_norm = pipeline("rms_norm");
         matmul = pipeline("matmul_q4_0");
-        matmul_tq2 = pipeline("matmul_tq2_0");
+        {
+            // The ternary gemv references a benchmark-only function constant, so it is built
+            // through the specialisation API, with no constants set.
+            id<MTLFunction> fn = [library newFunctionWithName:@"matmul_tq2_0"
+                                               constantValues:[MTLFunctionConstantValues new]
+                                                        error:&error];
+            if (fn == nil) fail(std::string("ternary gemv: ") + error.localizedDescription.UTF8String);
+            matmul_tq2 = [device newComputePipelineStateWithFunction:fn error:&error];
+            if (matmul_tq2 == nil) fail(std::string("ternary gemv pipeline: ") + error.localizedDescription.UTF8String);
+        }
         matmul_mm = tile_pipeline(device, library, 0);
         matmul_mm_tq2 = tile_pipeline(device, library, 1);
         rope = pipeline("qk_norm_rope");
@@ -311,8 +321,8 @@ struct MetalSession::Impl {
         const GemvParams p{{static_cast<uint32_t>(rows), 0, 0}, static_cast<uint32_t>(cols), static_cast<uint32_t>(n), mode, 1};
         bytes(enc, p, 7);
         set(enc, in.f, 8);
-        // Ternary: groups of 2 rows (of both matrices), 2 simdgroups per threadgroup.
-        if (ternary) groups(enc, ((rows + 1) / 2 * n + 1) / 2, 64);
+        // Ternary: groups of kTernaryRows / 2 rows (of both matrices), 2 simdgroups per threadgroup.
+        if (ternary) groups(enc, ((rows + kTernaryRows / 2 - 1) / (kTernaryRows / 2) * n + 1) / 2, 64);
         else groups(enc, (rows * n + 3) / 4, 128);
     }
 
@@ -342,7 +352,7 @@ struct MetalSession::Impl {
             set(enc, *t.w, i);
             set(enc, t.out.f, 4 + i);
             p.rows[i] = static_cast<uint32_t>(t.rows);
-            pairs += ternary ? (t.rows + 3) / 4 : (t.rows + 1) / 2;
+            pairs += ternary ? (t.rows + kTernaryRows - 1) / kTernaryRows : (t.rows + 1) / 2;
             ++i;
         }
         for (; i < 3; ++i) {  // unused slots: bind something valid
@@ -559,6 +569,7 @@ namespace {
 struct StandaloneMatmul {
     id<MTLDevice> device = nil;
     id<MTLCommandQueue> queue = nil;
+    id<MTLLibrary> library = nil;
     id<MTLComputePipelineState> gemv = nil, mm = nil;
 
     StandaloneMatmul() {
@@ -566,7 +577,7 @@ struct StandaloneMatmul {
         if (device == nil) fail("no Metal device");
         queue = [device newCommandQueue];
         NSError* error = nil;
-        id<MTLLibrary> library = [device newLibraryWithSource:[NSString stringWithUTF8String:kShaderSource]
+        library = [device newLibraryWithSource:[NSString stringWithUTF8String:kShaderSource]
                                                       options:[MTLCompileOptions new]
                                                         error:&error];
         if (library == nil) fail(std::string("shader compilation failed: ") + error.localizedDescription.UTF8String);
@@ -644,6 +655,44 @@ double metal_matmul_q4_0_seconds(std::size_t rows, std::size_t cols, std::size_t
         id<MTLCommandBuffer> cb = [m.queue commandBuffer];
         id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
         for (int i = 0; i < iterations; ++i) m.encode(enc, w, in, half_in, out, rows, cols, n, tiled);
+        [enc endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
+        return (cb.GPUEndTime - cb.GPUStartTime) / iterations;
+    }
+}
+
+double metal_gemv_tq2_0_seconds(std::size_t rows, std::size_t cols, int iterations, int variant) {
+    @autoreleasepool {
+        StandaloneMatmul m;
+        NSError* error = nil;
+        MTLFunctionConstantValues* constants = [MTLFunctionConstantValues new];
+        const uint32_t v = static_cast<uint32_t>(variant);
+        [constants setConstantValue:&v type:MTLDataTypeUInt atIndex:1];
+        id<MTLFunction> fn = [m.library newFunctionWithName:@"matmul_tq2_0" constantValues:constants error:&error];
+        if (fn == nil) fail(std::string("ternary gemv specialisation: ") + error.localizedDescription.UTF8String);
+        id<MTLComputePipelineState> pso = [m.device newComputePipelineStateWithFunction:fn error:&error];
+        if (pso == nil) fail("ternary gemv pipeline");
+        id<MTLBuffer> w = [m.device newBufferWithLength:rows * cols / 256 * 66 options:MTLResourceStorageModeShared];
+        id<MTLBuffer> in = [m.device newBufferWithLength:cols * 4 options:MTLResourceStorageModeShared];
+        id<MTLBuffer> out = [m.device newBufferWithLength:rows * 4 options:MTLResourceStorageModeShared];
+        std::memset(w.contents, 0x5A, w.length);
+        std::memset(in.contents, 0, in.length);
+        id<MTLCommandBuffer> cb = [m.queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        [enc setComputePipelineState:pso];
+        for (NSUInteger i = 0; i < 3; ++i) {
+            [enc setBuffer:w offset:0 atIndex:i];
+            [enc setBuffer:out offset:0 atIndex:4 + i];
+        }
+        [enc setBuffer:in offset:0 atIndex:3];
+        [enc setBuffer:in offset:0 atIndex:8];
+        const GemvParams p{{static_cast<uint32_t>(rows), 0, 0}, static_cast<uint32_t>(cols), 1, kStore, 0};
+        [enc setBytes:&p length:sizeof(p) atIndex:7];
+        const std::size_t groups = (rows + kTernaryRows - 1) / kTernaryRows;
+        for (int i = 0; i < iterations; ++i) {
+            [enc dispatchThreadgroups:MTLSizeMake((groups + 1) / 2, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+        }
         [enc endEncoding];
         [cb commit];
         [cb waitUntilCompleted];

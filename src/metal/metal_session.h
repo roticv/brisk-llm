@@ -41,6 +41,11 @@ private:
 std::vector<float> metal_matmul_q4_0(std::span<const std::byte> weights, std::size_t rows, std::size_t cols,
                                      std::span<const float> x, std::size_t n, bool tiled);
 
+// For benchmarks: GPU seconds per gemv of a rows x cols TQ2_0 matrix by one
+// activation row, over `iterations` back-to-back dispatches. `variant` 0 is
+// the production kernel; others are experiments compiled from the same source.
+double metal_gemv_tq2_0_seconds(std::size_t rows, std::size_t cols, int iterations, int variant = 0);
+
 // For benchmarks: GPU seconds per multiply of a rows x cols Q4_0 matrix by n
 // activation rows, over `iterations` back-to-back dispatches of one command buffer.
 double metal_matmul_q4_0_seconds(std::size_t rows, std::size_t cols, std::size_t n, bool tiled, int iterations);

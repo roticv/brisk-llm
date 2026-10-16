@@ -248,6 +248,12 @@ inline float4 tq2_codes(uint4 bytes, uint l) {
 // sum_l q_l y_l = sum_l f_l (y_l - 4 y_{l-1}); the coefficients and the
 // activation sum (for the -1 offset) are shared by the four rows. Rows past
 // the end are clamped (read, not written).
+constant uint kTernaryRows = 8;  // row streams per simdgroup (the host dispatches to match)
+// Experiment switch for the standalone benchmark (unset in production): 1
+// skips the decode and sums the raw bytes, to measure the access pattern's ceiling.
+constant uint kTernaryVariant [[function_constant(1)]];
+constant bool kTernaryHasVariant = is_function_constant_defined(kTernaryVariant);
+
 kernel void matmul_tq2_0(device const uchar* w0 [[buffer(0)]],
                          device const uchar* w1 [[buffer(1)]],
                          device const uchar* w2 [[buffer(2)]],
@@ -261,8 +267,10 @@ kernel void matmul_tq2_0(device const uchar* w0 [[buffer(0)]],
                          uint sg [[simdgroup_index_in_threadgroup]],
                          uint lane [[thread_index_in_simdgroup]]) {
     const bool paired = p.paired != 0;
-    const uint groups0 = paired ? (p.rows[0] + 1) / 2 : (p.rows[0] + 3) / 4;
-    const uint groups1 = paired ? 0 : (p.rows[1] + 3) / 4, groups2 = paired ? 0 : (p.rows[2] + 3) / 4;
+    constexpr uint R = kTernaryRows;           // row streams per simdgroup
+    constexpr uint RM = kTernaryRows / 2;      // rows per matrix when paired
+    const uint groups0 = paired ? (p.rows[0] + RM - 1) / RM : (p.rows[0] + R - 1) / R;
+    const uint groups1 = paired ? 0 : (p.rows[1] + R - 1) / R, groups2 = paired ? 0 : (p.rows[2] + R - 1) / R;
     const uint item = tg * 2 + sg;
     if (item >= (groups0 + groups1 + groups2) * p.n) return;
     uint group = item / p.n;
@@ -279,9 +287,9 @@ kernel void matmul_tq2_0(device const uchar* w0 [[buffer(0)]],
     }
     const uint blocks = p.cols / 256;
     const ulong row_bytes = (ulong)blocks * 66;
-    const uint row0 = paired ? group * 2 : group * 4;
-    device const uchar* stream[4];
-    for (uint s = 0; s < 4; ++s) {
+    const uint row0 = paired ? group * RM : group * R;
+    device const uchar* stream[R];
+    for (uint s = 0; s < R; ++s) {
         const uint r = paired ? row0 + s / 2 : row0 + s;
         device const uchar* base = (paired && (s % 2 == 1)) ? w1 : w;
         stream[s] = base + min(r, rows - 1) * row_bytes;
@@ -289,38 +297,49 @@ kernel void matmul_tq2_0(device const uchar* w0 [[buffer(0)]],
     const uint blk = lane / 8, htg = lane % 8;  // block in flight, lane within it
     device const float4* yb4 = (device const float4*)(x + t * p.cols + 4 * htg + blk * 256);
 
-    float sumf[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float sumf[R];
+    for (uint s = 0; s < R; ++s) sumf[s] = 0.0f;
     for (uint ib = blk; ib < blocks; ib += 4) {
         for (uint h = 0; h < 2; ++h) {
+            // y_l holds the activations of the lane's 4 bytes at bit pair l; the
+            // coefficients are vectors over the 4 bytes, so the decode is 4-wide.
             const float4 y0 = yb4[0 + 32 * h], y1 = yb4[8 + 32 * h], y2 = yb4[16 + 32 * h], y3 = yb4[24 + 32 * h];
-            float4 coef[4];
-            float sumy = 0.0f;
-            for (uint j = 0; j < 4; ++j) {
-                coef[j] = float4(y0[j], y1[j] - 4.0f * y0[j], y2[j] - 4.0f * y1[j], y3[j] - 4.0f * y2[j]);
-                sumy += (y0[j] + y1[j]) + (y2[j] + y3[j]);
-            }
-            for (uint s = 0; s < 4; ++s) {
+            const float4 c1 = y1 - 4.0f * y0, c2 = y2 - 4.0f * y1, c3 = y3 - 4.0f * y2;
+            const float4 ysum = (y0 + y1) + (y2 + y3);
+            const float sumy = (ysum.x + ysum.y) + (ysum.z + ysum.w);
+            // The decode runs in half precision (bytes and their floor divisions
+            // are exact in half; the activations lose their low bits, which the
+            // perplexity check does not notice), which this GPU issues faster.
+            const uint variant = kTernaryHasVariant ? kTernaryVariant : 0;
+            // Scaled by 1/64 so that byte x coefficient products stay well inside half's range.
+            const half4 hy0 = half4(y0 * (1.0f / 64)), hc1 = half4(c1 * (1.0f / 64)), hc2 = half4(c2 * (1.0f / 64)),
+                        hc3 = half4(c3 * (1.0f / 64));
+            for (uint s = 0; s < R; ++s) {
                 device const uchar* b = stream[s] + ib * 66;
-                device const uchar* qs = b + 4 * htg + 32 * h;
-                float sum = -sumy;
-                for (uint j = 0; j < 4; ++j) {
-                    const float v = float(qs[j]);
-                    const float f1 = floor(v * 0.25f), f2 = floor(v * 0.0625f), f3 = floor(v * 0.015625f);
-                    sum += coef[j][0] * v + coef[j][1] * f1 + coef[j][2] * f2 + coef[j][3] * f3;
+                const half4 v = half4(*(device const packed_uchar4*)(b + 4 * htg + 32 * h));
+                if (variant == 1) {  // loads only
+                    sumf[s] += float((v.x + v.y) + (v.z + v.w)) + float(*(device const half*)(b + 64));
+                    continue;
                 }
+                half4 r = v * hy0;
+                r = fma(floor(v * 0.25h), hc1, r);
+                r = fma(floor(v * 0.0625h), hc2, r);
+                r = fma(floor(v * 0.015625h), hc3, r);
+                const float sum = float((r.x + r.y) + (r.z + r.w)) * 64.0f - sumy;
                 sumf[s] += float(*(device const half*)(b + 64)) * sum;
             }
         }
         yb4 += 256;  // 4 blocks on
     }
-    float total[4];
-    for (uint s = 0; s < 4; ++s) total[s] = simd_sum(sumf[s]);
+    float total[R];
+    for (uint s = 0; s < R; ++s) total[s] = simd_sum(sumf[s]);
     if (lane == 0) {
         if (paired) {
-            out[t * rows + row0] = epilogue(p.mode, total[1], total[0]);
-            if (row0 + 1 < rows) out[t * rows + row0 + 1] = epilogue(p.mode, total[3], total[2]);
+            for (uint i = 0; i < RM; ++i) {
+                if (row0 + i < rows) out[t * rows + row0 + i] = epilogue(p.mode, total[2 * i + 1], total[2 * i]);
+            }
         } else {
-            for (uint s = 0; s < 4; ++s) {
+            for (uint s = 0; s < R; ++s) {
                 if (row0 + s < rows) out[t * rows + row0 + s] = epilogue(p.mode, total[s], aux[t * rows + row0 + s]);
             }
         }
