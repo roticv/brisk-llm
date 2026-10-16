@@ -238,13 +238,16 @@ inline float4 tq2_codes(uint4 bytes, uint l) {
     return float4(extract_bits(bytes, 2 * l, 2));
 }
 
-// Gemv for TQ2_0 matrices with the same shape as matmul_q4_0: one simdgroup
-// per two rows and one activation row, the 4 simdgroups of a threadgroup
-// taking consecutive row pairs across the three matrices. Each lane takes a
-// quarter of a block (16 bytes = 64 values: 4 words, each giving 4 runs of 4
-// values at bit pairs 0..3) so that rows of 10 blocks (2560 columns) still
-// keep most lanes busy. Blocks are 2-byte aligned, so the bytes come in as
-// packed_ushort4 (8-byte loads at 2-byte alignment).
+// Gemv for TQ2_0 matrices, structured after llama.cpp's kernel_mul_mv_tq2_0:
+// four row streams per simdgroup (rows r .. r + 3 of one matrix, or rows r,
+// r + 1 of both the gate and up matrices when paired), two simdgroups per
+// threadgroup, and within a simdgroup four blocks in flight with eight lanes
+// per block, each lane taking 4 bytes of each 32-byte half of its block
+// (elements 4 htg + 32 l + 128 h, l = 0..3). The decode is float: with v a
+// byte as float and f_l = floor(v / 4^l) = q_l + 4 f_{l+1},
+// sum_l q_l y_l = sum_l f_l (y_l - 4 y_{l-1}); the coefficients and the
+// activation sum (for the -1 offset) are shared by the four rows. Rows past
+// the end are clamped (read, not written).
 kernel void matmul_tq2_0(device const uchar* w0 [[buffer(0)]],
                          device const uchar* w1 [[buffer(1)]],
                          device const uchar* w2 [[buffer(2)]],
@@ -258,71 +261,68 @@ kernel void matmul_tq2_0(device const uchar* w0 [[buffer(0)]],
                          uint sg [[simdgroup_index_in_threadgroup]],
                          uint lane [[thread_index_in_simdgroup]]) {
     const bool paired = p.paired != 0;
-    const uint pairs0 = paired ? p.rows[0] : (p.rows[0] + 1) / 2;
-    const uint pairs1 = paired ? 0 : (p.rows[1] + 1) / 2, pairs2 = paired ? 0 : (p.rows[2] + 1) / 2;
-    const uint item = tg * 4 + sg;
-    if (item >= (pairs0 + pairs1 + pairs2) * p.n) return;
-    uint pair = item / p.n;
+    const uint groups0 = paired ? (p.rows[0] + 1) / 2 : (p.rows[0] + 3) / 4;
+    const uint groups1 = paired ? 0 : (p.rows[1] + 3) / 4, groups2 = paired ? 0 : (p.rows[2] + 3) / 4;
+    const uint item = tg * 2 + sg;
+    if (item >= (groups0 + groups1 + groups2) * p.n) return;
+    uint group = item / p.n;
     const uint t = item % p.n;
     device const uchar* w;
     device float* out;
     uint rows;
-    if (pair < pairs0) {
+    if (group < groups0) {
         w = w0; out = out0; rows = p.rows[0];
-    } else if (pair < pairs0 + pairs1) {
-        pair -= pairs0; w = w1; out = out1; rows = p.rows[1];
+    } else if (group < groups0 + groups1) {
+        group -= groups0; w = w1; out = out1; rows = p.rows[1];
     } else {
-        pair -= pairs0 + pairs1; w = w2; out = out2; rows = p.rows[2];
+        group -= groups0 + groups1; w = w2; out = out2; rows = p.rows[2];
     }
     const uint blocks = p.cols / 256;
-    const uint row0 = paired ? pair : pair * 2;
-    const bool two = paired || row0 + 1 < rows;
-    device const uchar* wrow0 = w + (ulong)row0 * blocks * 66;
-    device const uchar* wrow1 = paired ? w1 + (ulong)row0 * blocks * 66 : wrow0 + (two ? blocks * 66 : 0);
-    device const float4* xrow = (device const float4*)(x + t * p.cols);
-
-    float acc0 = 0.0f, acc1 = 0.0f;
-    for (uint item4 = lane; item4 < blocks * 4; item4 += 32) {
-        const uint b = item4 / 4, quarter = item4 % 4;
-        // Bytes [16 * quarter, + 16): j = 32 * (quarter / 2), m0 = 16 * (quarter % 2).
-        const uint j = 32 * (quarter / 2), m0 = 16 * (quarter % 2);
-        device const uchar* blk0 = wrow0 + b * 66;
-        device const uchar* blk1 = wrow1 + b * 66;
-        const float d0 = float(*(device const half*)(blk0 + 64));
-        const float d1 = float(*(device const half*)(blk1 + 64));
-        // Float decode (after llama.cpp): with v a byte as float and f_l =
-        // floor(v / 4^l) = q_l + 4 f_{l+1}, sum_l q_l y_l = sum_l f_l (y_l - 4 y_{l-1}).
-        // The coefficients and the activation sum are shared by both rows.
-        float s0 = 0.0f, s1 = 0.0f;
-        for (uint k = 0; k < 4; ++k) {  // bytes j + m0 + 4k .. + 3: elements j*4 + 32 l + m0 + 4k .. + 3 for l = 0..3
-            float4 y[4];
-            for (uint l = 0; l < 4; ++l) y[l] = xrow[(b * 256 + j * 4 + 32 * l + m0 + 4 * k) / 4];
-            const float4 c1 = y[1] - 4.0f * y[0], c2 = y[2] - 4.0f * y[1], c3 = y[3] - 4.0f * y[2];
-            const float4 ysum = (y[0] + y[1]) + (y[2] + y[3]);
-            const float sumy = ysum.x + ysum.y + ysum.z + ysum.w;
-            const float4 v0 = float4(*(device const packed_uchar4*)(blk0 + j + m0 + 4 * k));
-            const float4 v1 = float4(*(device const packed_uchar4*)(blk1 + j + m0 + 4 * k));
-            float4 r0 = v0 * y[0], r1 = v1 * y[0];
-            r0 = fma(floor(v0 * 0.25f), c1, r0);
-            r1 = fma(floor(v1 * 0.25f), c1, r1);
-            r0 = fma(floor(v0 * 0.0625f), c2, r0);
-            r1 = fma(floor(v1 * 0.0625f), c2, r1);
-            r0 = fma(floor(v0 * 0.015625f), c3, r0);
-            r1 = fma(floor(v1 * 0.015625f), c3, r1);
-            s0 += (r0.x + r0.y + r0.z + r0.w) - sumy;
-            s1 += (r1.x + r1.y + r1.z + r1.w) - sumy;
-        }
-        acc0 += s0 * d0;
-        acc1 += s1 * d1;
+    const ulong row_bytes = (ulong)blocks * 66;
+    const uint row0 = paired ? group * 2 : group * 4;
+    device const uchar* stream[4];
+    for (uint s = 0; s < 4; ++s) {
+        const uint r = paired ? row0 + s / 2 : row0 + s;
+        device const uchar* base = (paired && (s % 2 == 1)) ? w1 : w;
+        stream[s] = base + min(r, rows - 1) * row_bytes;
     }
-    acc0 = simd_sum(acc0);
-    acc1 = simd_sum(acc1);
+    const uint blk = lane / 8, htg = lane % 8;  // block in flight, lane within it
+    device const float4* yb4 = (device const float4*)(x + t * p.cols + 4 * htg + blk * 256);
+
+    float sumf[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    for (uint ib = blk; ib < blocks; ib += 4) {
+        for (uint h = 0; h < 2; ++h) {
+            const float4 y0 = yb4[0 + 32 * h], y1 = yb4[8 + 32 * h], y2 = yb4[16 + 32 * h], y3 = yb4[24 + 32 * h];
+            float4 coef[4];
+            float sumy = 0.0f;
+            for (uint j = 0; j < 4; ++j) {
+                coef[j] = float4(y0[j], y1[j] - 4.0f * y0[j], y2[j] - 4.0f * y1[j], y3[j] - 4.0f * y2[j]);
+                sumy += (y0[j] + y1[j]) + (y2[j] + y3[j]);
+            }
+            for (uint s = 0; s < 4; ++s) {
+                device const uchar* b = stream[s] + ib * 66;
+                device const uchar* qs = b + 4 * htg + 32 * h;
+                float sum = -sumy;
+                for (uint j = 0; j < 4; ++j) {
+                    const float v = float(qs[j]);
+                    const float f1 = floor(v * 0.25f), f2 = floor(v * 0.0625f), f3 = floor(v * 0.015625f);
+                    sum += coef[j][0] * v + coef[j][1] * f1 + coef[j][2] * f2 + coef[j][3] * f3;
+                }
+                sumf[s] += float(*(device const half*)(b + 64)) * sum;
+            }
+        }
+        yb4 += 256;  // 4 blocks on
+    }
+    float total[4];
+    for (uint s = 0; s < 4; ++s) total[s] = simd_sum(sumf[s]);
     if (lane == 0) {
         if (paired) {
-            out[t * rows + row0] = epilogue(p.mode, acc1, acc0);
+            out[t * rows + row0] = epilogue(p.mode, total[1], total[0]);
+            if (row0 + 1 < rows) out[t * rows + row0 + 1] = epilogue(p.mode, total[3], total[2]);
         } else {
-            out[t * rows + row0] = epilogue(p.mode, acc0, aux[t * rows + row0]);
-            if (two) out[t * rows + row0 + 1] = epilogue(p.mode, acc1, aux[t * rows + row0 + 1]);
+            for (uint s = 0; s < 4; ++s) {
+                if (row0 + s < rows) out[t * rows + row0 + s] = epilogue(p.mode, total[s], aux[t * rows + row0 + s]);
+            }
         }
     }
 }

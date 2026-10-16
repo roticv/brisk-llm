@@ -301,7 +301,8 @@ struct MetalSession::Impl {
             encode_matmul(enc, {Target{&up_w, rows, out}}, cols, in, n, mode, out.f);
             return;
         }
-        [enc setComputePipelineState:gate_w.format == WeightFormat::TQ2_0 ? matmul_tq2 : matmul];
+        const bool ternary = gate_w.format == WeightFormat::TQ2_0;
+        [enc setComputePipelineState:ternary ? matmul_tq2 : matmul];
         set(enc, gate_w, 0);
         set(enc, up_w, 1);
         set(enc, up_w, 2);
@@ -310,7 +311,9 @@ struct MetalSession::Impl {
         const GemvParams p{{static_cast<uint32_t>(rows), 0, 0}, static_cast<uint32_t>(cols), static_cast<uint32_t>(n), mode, 1};
         bytes(enc, p, 7);
         set(enc, in.f, 8);
-        groups(enc, (rows * n + 3) / 4, 128);
+        // Ternary: groups of 2 rows (of both matrices), 2 simdgroups per threadgroup.
+        if (ternary) groups(enc, ((rows + 1) / 2 * n + 1) / 2, 64);
+        else groups(enc, (rows * n + 3) / 4, 128);
     }
 
     void encode_matmul(id<MTLComputeCommandEncoder> enc, std::initializer_list<Target> targets, std::size_t cols,
@@ -331,14 +334,15 @@ struct MetalSession::Impl {
             }
             return;
         }
-        [enc setComputePipelineState:targets.begin()->w->format == WeightFormat::TQ2_0 ? matmul_tq2 : matmul];
+        const bool ternary = targets.begin()->w->format == WeightFormat::TQ2_0;
+        [enc setComputePipelineState:ternary ? matmul_tq2 : matmul];
         GemvParams p{{0, 0, 0}, static_cast<uint32_t>(cols), static_cast<uint32_t>(n), mode, 0};
-        std::size_t pairs = 0, i = 0;
+        std::size_t pairs = 0, i = 0;  // row groups: pairs for Q4_0, quads for TQ2_0
         for (const Target& t : targets) {
             set(enc, *t.w, i);
             set(enc, t.out.f, 4 + i);
             p.rows[i] = static_cast<uint32_t>(t.rows);
-            pairs += (t.rows + 1) / 2;
+            pairs += ternary ? (t.rows + 3) / 4 : (t.rows + 1) / 2;
             ++i;
         }
         for (; i < 3; ++i) {  // unused slots: bind something valid
@@ -348,7 +352,8 @@ struct MetalSession::Impl {
         set(enc, in.f, 3);
         bytes(enc, p, 7);
         set(enc, aux != nil ? aux : in.f, 8);
-        groups(enc, (pairs * n + 3) / 4, 128);
+        if (ternary) groups(enc, (pairs * n + 1) / 2, 64);
+        else groups(enc, (pairs * n + 3) / 4, 128);
     }
 
     // ---- the forward pass ----
