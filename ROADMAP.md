@@ -103,10 +103,23 @@ Dropped: A72-specific kernel tuning for generation. The Pi is bandwidth-bound, s
 
 **Done when (original):** the Mac numbers beat llama.cpp's best configuration. Reached for generation on the 1.7B (level), not for prompt processing (7-9% behind) or the 0.6B.
 
+## Phase 6: More model families — not started
+
+brisk loads Qwen3 and BitNet b1.58 only. Most of what people run locally is a handful of other families, and most downloads are Q4_K_M files (Q4_K with Q6_K, sometimes Q5_K, for attention V and the output) rather than Q4_0. In order of cost:
+
+1. **Llama 3.x, Mistral, SmolLM2, DeepSeek-R1-distill-Llama** (GGUF architecture `llama`) and **Qwen2.5, R1-distill-Qwen** (`qwen2`). Same forward pass as Qwen3 without the per-head q/k norms; `qwen2` adds q/k/v biases, some `llama` variants attention bias. The Llama 3 tokenizer exists already (BitNet uses it). Mostly loader work; about a day for both.
+2. **Q5_K weights**, so the Q4_K_M files of these families load. One kernel family in the Q4_K/Q6_K pattern (CPU), later on the GPU.
+3. **Q6_K and Q8_0 output matrices on the GPU**, so `--gpu` takes the common Q4_0 downloads, which carry a Q6_K output.
+4. **Gemma 3** (`gemma3`; 270M-27B, with Google's QAT Q4_0 files a natural fit). Differs in more places: `(1 + w)` RMSNorm with pre- and post-norms around attention and the FFN, GeGLU, √dim embedding scaling, alternating local (sliding window 1024) and global attention layers with their own RoPE bases, head dim 256 (the Metal attention kernels assume at most 128), and a SentencePiece tokenizer with a 262k vocabulary (a new tokenizer; the output matrix is a third of the 1B's weights, which costs on the Pi). Two to three days. Gemma 4, if released, to be checked against this list from its model card.
+5. **Phi-4-mini** (`phi3`), if wanted.
+
+Each family is checked the way Qwen3 was: tokenizer ids against llama.cpp on the test strings, perplexity within 1% on the pinned texts, and a pin added.
+
+**Done when:** the Q4_K_M downloads of Llama 3.x, Qwen2.5 and Gemma 3 load and match llama.cpp's perplexity on both machines, with the GPU path taking their output matrices.
+
 ## Later, if wanted
 
 - OpenAI-compatible HTTP server.
-- More model families (Gemma, Llama).
 - Sparsity experiments (skipping inactive neurons).
 - Layer pruning and 3-bit weights, which trade some quality for fewer bytes.
 - Own weight file format, if GGUF layout becomes the bottleneck.
