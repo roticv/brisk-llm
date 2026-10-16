@@ -55,6 +55,10 @@ jobs:
       - name: Perplexity against pinned values
         run: python3 tests/check_perplexity.py build-release/brisk
 
+      - name: Perplexity against pinned values on the GPU
+        if: runner.os == 'macOS'
+        run: python3 tests/check_perplexity.py build-release/brisk --gpu
+
       - name: Smoke test generation
         run: |
           build-release/brisk generate models/Qwen3-0.6B-Q4_0.gguf --chat --no-think \

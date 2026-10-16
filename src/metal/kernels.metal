@@ -66,6 +66,9 @@ struct RopeParams {
     float eps;
     float rope_base;
     uint has_qk_norm;   // Qwen3: RMS norm per head before RoPE
+    uint neox;          // pair element i with i + head_dim/2 (else 2i with 2i + 1)
+    uint has_bias;      // Qwen2: biases added to the projections first
+    uint has_factors;   // Llama 3: per-frequency divisors of the angles
 };
 
 struct AttentionParams {
@@ -223,6 +226,165 @@ kernel void matmul_q4_0(device const uchar* w0 [[buffer(0)]],
     }
 }
 
+// ---- K-quants ----------------------------------------------------------------
+//
+// Q4_K: 256 values in 144 bytes: half d, half dmin, 12 bytes of 6-bit scales
+// and minimums for 8 sub-blocks of 32, 128 bytes of nibbles (chunk c of 32
+// bytes holds sub-block 2c in the low nibbles and 2c + 1 in the high).
+// Q6_K: 256 values in 210 bytes: 128 bytes of low nibbles, 64 bytes of high
+// bit pairs, 16 signed scales (one per 16 values), half d at byte 208.
+
+// Scale and minimum of sub-block j of a Q4_K block.
+inline void q4k_scale_min(device const uchar* scales, uint j, thread uint& scale, thread uint& min) {
+    if (j < 4) {
+        scale = scales[j] & 63;
+        min = scales[j + 4] & 63;
+    } else {
+        scale = (scales[j + 4] & 0xF) | ((scales[j - 4] >> 6) << 4);
+        min = (scales[j + 4] >> 4) | ((scales[j] >> 6) << 4);
+    }
+}
+
+// Sub-block `sub` (32 values) of a Q4_K row, as eight float4s.
+inline void q4k_subblock(device const uchar* row, uint sub, thread float4 (&v)[8]) {
+    device const uchar* blk = row + (sub / 8) * 144;
+    const uint j = sub % 8;
+    const float d = float(*(device const half*)blk), dmin = float(*(device const half*)(blk + 2));
+    uint scale, min;
+    q4k_scale_min(blk + 4, j, scale, min);
+    const float ds = d * float(scale), dm = dmin * float(min);
+    device const uint* q = (device const uint*)(blk + 16 + (j / 2) * 32);  // 4-byte aligned: 144 k + 16 + 32 c
+    const uint shift = (j % 2) * 4;
+    for (uint k = 0; k < 8; ++k) {
+        v[k] = float4(uint4(q[k]) >> (uint4(0, 8, 16, 24) + shift) & 0xF) * ds - dm;
+    }
+}
+
+// Sub-block `sub` (32 values) of a Q6_K row, as eight float4s.
+inline void q6k_subblock(device const uchar* row, uint sub, thread float4 (&v)[8]) {
+    device const uchar* blk = row + (sub / 8) * 210;
+    const uint j = sub % 8, half_ = j / 4, m = j % 4;
+    const float d = float(*(device const half*)(blk + 208));
+    const float s0 = d * float(int(as_type<char>(blk[192 + 2 * j]))), s1 = d * float(int(as_type<char>(blk[192 + 2 * j + 1])));
+    device const ushort* ql = (device const ushort*)(blk + half_ * 64 + (m % 2) * 32);  // 2-byte aligned
+    device const ushort* qh = (device const ushort*)(blk + 128 + half_ * 32);
+    const uint lshift = (m / 2) * 4, hshift = 2 * m;
+    for (uint k = 0; k < 8; ++k) {
+        const uint lo = uint(ql[2 * k]) | (uint(ql[2 * k + 1]) << 16);
+        const uint hi = uint(qh[2 * k]) | (uint(qh[2 * k + 1]) << 16);
+        const uint4 q = (uint4(lo) >> (uint4(0, 8, 16, 24) + lshift) & 0xF) | ((uint4(hi) >> (uint4(0, 8, 16, 24) + hshift) & 3) << 4);
+        v[k] = (float4(q) - 32.0f) * (k < 4 ? s0 : s1);
+    }
+}
+
+// Block `sub` (32 values) of a Q4_1 row (20-byte blocks: half d, half m, 16
+// bytes of nibbles; value = d q + m), as eight float4s.
+inline void q4_1_subblock(device const uchar* row, uint sub, thread float4 (&v)[8]) {
+    device const uchar* blk = row + sub * 20;
+    const float d = float(*(device const half*)blk), m = float(*(device const half*)(blk + 2));
+    device const uint* q = (device const uint*)(blk + 4);  // 4-byte aligned: 20 k + 4
+    for (uint k = 0; k < 4; ++k) {
+        v[k] = float4(uint4(q[k]) >> uint4(0, 8, 16, 24) & 0xF) * d + m;
+        v[4 + k] = float4(uint4(q[k]) >> uint4(4, 12, 20, 28) & 0xF) * d + m;
+    }
+}
+
+// Row stride in bytes of a format with 32-value sub-blocks: 2 = Q4_K, 3 = Q6_K, 4 = Q4_1.
+inline ulong subblock_row_bytes(uint format, uint cols) {
+    return format == 2 ? (ulong)(cols / 256) * 144 : format == 3 ? (ulong)(cols / 256) * 210 : (ulong)(cols / 32) * 20;
+}
+
+inline void subblock_dequant(uint format, device const uchar* row, uint sub, thread float4 (&v)[8]) {
+    if (format == 2) q4k_subblock(row, sub, v);
+    else if (format == 3) q6k_subblock(row, sub, v);
+    else q4_1_subblock(row, sub, v);
+}
+
+// Embedding rows of a K-quant table: one thread per (token, sub-block of 32).
+constant uint kEmbedFormat [[function_constant(3)]];  // 2 = Q4_K, 3 = Q6_K, 4 = Q4_1
+
+kernel void embed_k(device const uchar* table [[buffer(0)]],
+                    device const int* tokens [[buffer(1)]],
+                    device float* out [[buffer(2)]],
+                    constant uint& dim [[buffer(3)]],
+                    uint2 gid [[thread_position_in_grid]]) {
+    const uint sub = gid.x, t = gid.y;
+    device const uchar* row = table + (ulong)tokens[t] * subblock_row_bytes(kEmbedFormat, dim);
+    float4 v[8];
+    subblock_dequant(kEmbedFormat, row, sub, v);
+    device float4* o = (device float4*)(out + t * dim + sub * 32);
+    for (uint k = 0; k < 8; ++k) o[k] = v[k];
+}
+
+// Gemv for K-quant matrices (a function constant picks the format), with
+// the dispatch shape of matmul_q4_0: one simdgroup per two rows and one
+// activation row, 4 simdgroups per threadgroup over consecutive row pairs,
+// the lanes taking 32-value sub-blocks in turn.
+constant uint kGemvFormat [[function_constant(2)]];  // 2 = Q4_K, 3 = Q6_K, 4 = Q4_1
+
+kernel void matmul_k(device const uchar* w0 [[buffer(0)]],
+                     device const uchar* w1 [[buffer(1)]],
+                     device const uchar* w2 [[buffer(2)]],
+                     device const float* x [[buffer(3)]],
+                     device float* out0 [[buffer(4)]],
+                     device float* out1 [[buffer(5)]],
+                     device float* out2 [[buffer(6)]],
+                     constant GemvParams& p [[buffer(7)]],
+                     device const float* aux [[buffer(8)]],
+                     uint tg [[threadgroup_position_in_grid]],
+                     uint sg [[simdgroup_index_in_threadgroup]],
+                     uint lane [[thread_index_in_simdgroup]]) {
+    const bool paired = p.paired != 0;
+    const uint pairs0 = paired ? p.rows[0] : (p.rows[0] + 1) / 2;
+    const uint pairs1 = paired ? 0 : (p.rows[1] + 1) / 2, pairs2 = paired ? 0 : (p.rows[2] + 1) / 2;
+    const uint item = tg * 4 + sg;
+    if (item >= (pairs0 + pairs1 + pairs2) * p.n) return;
+    uint pair = item / p.n;
+    const uint t = item % p.n;
+    device const uchar* w;
+    device float* out;
+    uint rows;
+    if (pair < pairs0) {
+        w = w0; out = out0; rows = p.rows[0];
+    } else if (pair < pairs0 + pairs1) {
+        pair -= pairs0; w = w1; out = out1; rows = p.rows[1];
+    } else {
+        pair -= pairs0 + pairs1; w = w2; out = out2; rows = p.rows[2];
+    }
+    const ulong row_bytes = subblock_row_bytes(kGemvFormat, p.cols);
+    const uint row0 = paired ? pair : pair * 2;
+    const bool two = paired || row0 + 1 < rows;
+    device const uchar* wrow0 = w + row0 * row_bytes;
+    device const uchar* wrow1 = paired ? w1 + row0 * row_bytes : wrow0 + (two ? row_bytes : 0);
+    device const float4* xrow = (device const float4*)(x + t * p.cols);
+    const uint subs = p.cols / 32;
+
+    float acc0 = 0.0f, acc1 = 0.0f;
+    for (uint sub = lane; sub < subs; sub += 32) {
+        float4 va[8], vb[8];
+        subblock_dequant(kGemvFormat, wrow0, sub, va);
+        subblock_dequant(kGemvFormat, wrow1, sub, vb);
+        float4 s0 = 0.0f, s1 = 0.0f;
+        for (uint i = 0; i < 8; ++i) {
+            const float4 xv = xrow[sub * 8 + i];
+            s0 += va[i] * xv;
+            s1 += vb[i] * xv;
+        }
+        acc0 += s0.x + s0.y + s0.z + s0.w;
+        acc1 += s1.x + s1.y + s1.z + s1.w;
+    }
+    acc0 = simd_sum(acc0);
+    acc1 = simd_sum(acc1);
+    if (lane == 0) {
+        if (paired) {
+            out[t * rows + row0] = epilogue(p.mode, acc1, acc0);
+        } else {
+            out[t * rows + row0] = epilogue(p.mode, acc0, aux[t * rows + row0]);
+            if (two) out[t * rows + row0 + 1] = epilogue(p.mode, acc1, aux[t * rows + row0 + 1]);
+        }
+    }
+}
+
 // ---- TQ2_0 (ternary) ---------------------------------------------------------
 //
 // A block is 256 values in 64 bytes of 2-bit codes (0, 1, 2 for -1, 0, +1)
@@ -355,7 +517,7 @@ kernel void matmul_tq2_0(device const uchar* w0 [[buffer(0)]],
 // matrix loads are contiguous; each simdgroup then accumulates a 32-token x
 // 32-row quarter with 8x8 matrix multiplies. Each step's loads are issued
 // before the previous step's multiplies so they overlap.
-// The tile's weight format: 0 = Q4_0, 1 = TQ2_0 (a function constant, so each is its own pipeline).
+// The tile's weight format: 0 = Q4_0, 1 = TQ2_0, 2 = Q4_K, 3 = Q6_K, 4 = Q4_1 (a function constant, so each is its own pipeline).
 constant uint kTileFormat [[function_constant(0)]];
 
 kernel void matmul_q4_0_mm(device const uchar* w [[buffer(0)]],
@@ -373,6 +535,7 @@ kernel void matmul_q4_0_mm(device const uchar* w [[buffer(0)]],
     const uint row0 = tg.x * 64, t0 = tg.y * 64;
     const uint blocks = p.cols / 32;  // steps of 32 columns
     const bool ternary = kTileFormat == 1;
+    const bool kquant = kTileFormat >= 2;
 
     simdgroup_float8x8 acc[4][4];  // [token block][row block]
     for (uint i = 0; i < 4; ++i) {
@@ -386,7 +549,9 @@ kernel void matmul_q4_0_mm(device const uchar* w [[buffer(0)]],
     const uint r = tid / 2, high = tid % 2;
     const uint t = tid % 64, k0 = (tid / 64) * 16;
     const bool valid = t0 + t < p.n;
-    device const uchar* wrow = w + (ulong)(row0 + r) * (ternary ? p.cols / 256 * 66 : blocks * 18);
+    const ulong row_bytes = kTileFormat == 0 ? (ulong)blocks * 18
+                            : kTileFormat == 1 ? (ulong)(p.cols / 256) * 66 : subblock_row_bytes(kTileFormat, p.cols);
+    device const uchar* wrow = w + (ulong)(row0 + r) * row_bytes;
     device const half4* xsrc = (device const half4*)(x + (t0 + (valid ? t : 0)) * p.cols + k0);
     threadgroup half* wdst = sa + 64 * ((high * 2) * 8 + r / 8) + r % 8;  // k = high * 16, then + 8 per block
     threadgroup half4* xdst = (threadgroup half4*)(sb + 64 * ((t / 8) * 4 + k0 / 8) + 8 * (t % 8));
@@ -396,8 +561,11 @@ kernel void matmul_q4_0_mm(device const uchar* w [[buffer(0)]],
     ushort wq[8];
     half4 xv[4];
     uint tl = 0;  // ternary: the bit pair of this step's 32 columns
+    float4 kv[8];  // K-quants: the step's sub-block, dequantised at load
     auto load = [&](uint b) {
-        if (ternary) {
+        if (kquant) {
+            subblock_dequant(kTileFormat, wrow, b, kv);
+        } else if (ternary) {
             // Columns [32 b, + 32) are bit pair l of bytes j .. j + 31 of block 32 b / 256;
             // this thread's 16 columns are bytes j + 16 high .. + 15: 4 words.
             const uint c0 = b * 32;
@@ -417,8 +585,9 @@ kernel void matmul_q4_0_mm(device const uchar* w [[buffer(0)]],
     auto store = [&]() {
         for (uint k = 0; k < 4; ++k) {
             const uint wv = uint(wq[2 * k]) | (uint(wq[2 * k + 1]) << 16);
-            const half4 v = ternary ? (half4(extract_bits(uint4(wv) >> uint4(0, 8, 16, 24), 2 * tl, 2)) - 1.0h) * wd
-                                    : (half4(uint4(wv) >> (uint4(0, 8, 16, 24) + shift) & 0xF) - 8.0h) * wd;
+            const half4 v = kquant ? half4(kv[high * 4 + k])
+                            : ternary ? (half4(extract_bits(uint4(wv) >> uint4(0, 8, 16, 24), 2 * tl, 2)) - 1.0h) * wd
+                                      : (half4(uint4(wv) >> (uint4(0, 8, 16, 24) + shift) & 0xF) - 8.0h) * wd;
             // Elements 4k .. 4k+3 of this half: k index 4k + j; block 4k/8, row within block 4k%8 + j.
             const uint kb = (4 * k) / 8, kr = (4 * k) % 8;
             wdst[64 * 8 * kb + 8 * kr] = v.x;
@@ -485,6 +654,11 @@ kernel void qk_norm_rope(device float* q [[buffer(0)]],
                          device float* k_cache [[buffer(5)]],
                          device float* v_cache [[buffer(6)]],
                          constant RopeParams& p [[buffer(7)]],
+                         device const float* q_bias [[buffer(8)]],
+                         device const float* k_bias [[buffer(9)]],
+                         device const float* v_bias [[buffer(10)]],
+                         device const float* factors [[buffer(11)]],
+                         device float* v_stage_out [[buffer(12)]],
                          uint tg [[threadgroup_position_in_grid]],
                          uint sg [[simdgroup_index_in_threadgroup]],
                          uint lane [[thread_index_in_simdgroup]]) {
@@ -499,6 +673,14 @@ kernel void qk_norm_rope(device float* q [[buffer(0)]],
                                  : k_stage + (t * p.kv_head_count + kv) * p.head_dim;
     device const float* norm = is_query ? q_norm : k_norm;
 
+    if (p.has_bias) {
+        device const float* bias = is_query ? q_bias + h * p.head_dim : k_bias + kv * p.head_dim;
+        for (uint i = lane; i < p.head_dim; i += 32) vec[i] += bias[i];
+        if (!is_query) {  // the value head's bias, added in place before the cache copy below
+            device float* vs = v_stage_out + (t * p.kv_head_count + kv) * p.head_dim;
+            for (uint i = lane; i < p.head_dim; i += 32) vs[i] += v_bias[kv * p.head_dim + i];
+        }
+    }
     if (p.has_qk_norm) {
         float sum = 0.0f;
         for (uint i = lane; i < p.head_dim; i += 32) sum += vec[i] * vec[i];
@@ -508,11 +690,13 @@ kernel void qk_norm_rope(device float* q [[buffer(0)]],
     }
     const uint half_dim = p.head_dim / 2;
     for (uint i = lane; i < half_dim; i += 32) {
-        const float theta = float(position) * pow(p.rope_base, -2.0f * float(i) / float(p.head_dim));
+        float theta = float(position) * pow(p.rope_base, -2.0f * float(i) / float(p.head_dim));
+        if (p.has_factors) theta /= factors[i];
         const float c = cos(theta), s = sin(theta);
-        const float x0 = vec[i], x1 = vec[i + half_dim];
-        vec[i] = x0 * c - x1 * s;
-        vec[i + half_dim] = x0 * s + x1 * c;
+        const uint a = p.neox ? i : 2 * i, b = p.neox ? i + half_dim : 2 * i + 1;
+        const float x0 = vec[a], x1 = vec[b];
+        vec[a] = x0 * c - x1 * s;
+        vec[b] = x0 * s + x1 * c;
     }
     if (!is_query) {
         device float* kc = k_cache + ((ulong)kv * p.max_context + position) * p.head_dim;
@@ -684,7 +868,7 @@ kernel void attention_small(device const float* q [[buffer(0)]],
                             uint lane [[thread_index_in_simdgroup]],
                             uint sg [[simdgroup_index_in_threadgroup]]) {
     threadgroup float sc[kMaxGroup * kSmallChunk];
-    threadgroup float4 part[4][kMaxGroup][32];  // per-simdgroup value sums, lanes' float4s
+    threadgroup float4 part[4][kMaxGroup][32];  // per-simdgroup value sums, lanes' float4s (16 KB at kMaxGroup 8)
     threadgroup float stats[kMaxGroup][2];      // max, sum per query
     const uint group = p.head_count / p.kv_head_count;
     const uint split = tg % p.splits;
@@ -714,20 +898,20 @@ kernel void attention_small(device const float* q [[buffer(0)]],
 
     // Softmax statistics per query over the split (simdgroup g handles query g).
     const uint count = end > pos0 ? end - pos0 : 0;
-    if (sg < group) {
+    for (uint g = sg; g < group; g += 4) {  // simdgroup sg handles queries sg, sg + 4
         float m = -INFINITY;
-        for (uint i = lane; i < count; i += 32) m = max(m, sc[sg * kSmallChunk + i]);
+        for (uint i = lane; i < count; i += 32) m = max(m, sc[g * kSmallChunk + i]);
         m = simd_max(m);
         float sum = 0.0f;
         for (uint i = lane; i < count; i += 32) {
-            const float e = exp(sc[sg * kSmallChunk + i] - m);
-            sc[sg * kSmallChunk + i] = e;
+            const float e = exp(sc[g * kSmallChunk + i] - m);
+            sc[g * kSmallChunk + i] = e;
             sum += e;
         }
         sum = simd_sum(sum);
         if (lane == 0) {
-            stats[sg][0] = m;
-            stats[sg][1] = sum;
+            stats[g][0] = m;
+            stats[g][1] = sum;
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -741,14 +925,15 @@ kernel void attention_small(device const float* q [[buffer(0)]],
     }
     for (uint g = 0; g < group; ++g) part[sg][g][lane] = acc[g];
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (sg < group && has_dim) {
-        const float4 total = part[0][sg][lane] + part[1][sg][lane] + part[2][sg][lane] + part[3][sg][lane];
-        const ulong slot = ((ulong)t * p.head_count + kv * group + sg) * p.splits + split;
+    for (uint g = sg; g < group; g += 4) {
+        if (!has_dim) break;
+        const float4 total = part[0][g][lane] + part[1][g][lane] + part[2][g][lane] + part[3][g][lane];
+        const ulong slot = ((ulong)t * p.head_count + kv * group + g) * p.splits + split;
         device float* o = partial + slot * (p.head_dim + 2);
         *(device float4*)(o + d4) = total;
         if (lane == 0) {
-            o[p.head_dim] = stats[sg][0];
-            o[p.head_dim + 1] = stats[sg][1];
+            o[p.head_dim] = stats[g][0];
+            o[p.head_dim + 1] = stats[g][1];
         }
     }
 }

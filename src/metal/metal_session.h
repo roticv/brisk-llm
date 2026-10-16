@@ -7,6 +7,7 @@
 
 #include "engine.h"
 #include "model.h"
+#include "quant.h"
 
 namespace brisk {
 
@@ -35,11 +36,12 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
-// For tests: multiplies a Q4_0 matrix (rows x cols, GGUF blocks) by n rows of
-// activations on the GPU, returning out[t][row]. `tiled` selects the batched
-// simdgroup-matrix kernel; otherwise the gemv kernel is used.
-std::vector<float> metal_matmul_q4_0(std::span<const std::byte> weights, std::size_t rows, std::size_t cols,
-                                     std::span<const float> x, std::size_t n, bool tiled);
+// For tests: multiplies a quantised matrix (rows x cols, GGUF blocks of
+// `format`: Q4_0, Q4_1, Q4_K or Q6_K) by n rows of activations on the GPU,
+// returning out[t][row]. `tiled` selects the 64x64 simdgroup-matrix kernel;
+// otherwise the gemv kernel is used.
+std::vector<float> metal_matmul(WeightFormat format, std::span<const std::byte> weights, std::size_t rows,
+                                std::size_t cols, std::span<const float> x, std::size_t n, bool tiled);
 
 // For benchmarks: GPU seconds per gemv of a rows x cols TQ2_0 matrix by one
 // activation row, over `iterations` back-to-back dispatches. `variant` 0 is

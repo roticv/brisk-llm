@@ -43,7 +43,7 @@ struct NormParams {
 struct RopeParams {
     uint32_t n, position0, head_count, kv_head_count, head_dim, max_context;
     float eps, rope_base;
-    uint32_t has_qk_norm;
+    uint32_t has_qk_norm, neox, has_bias, has_factors;
 };
 struct AttentionParams {
     uint32_t n, position0, head_count, kv_head_count, head_dim, max_context;
@@ -66,6 +66,31 @@ id<MTLComputePipelineState> tile_pipeline(id<MTLDevice> device, id<MTLLibrary> l
     return pso;
 }
 
+// A kernel specialised by one uint function constant.
+id<MTLComputePipelineState> specialised_pipeline(id<MTLDevice> device, id<MTLLibrary> library, const char* name,
+                                                 NSUInteger index, uint32_t value) {
+    MTLFunctionConstantValues* constants = [MTLFunctionConstantValues new];
+    [constants setConstantValue:&value type:MTLDataTypeUInt atIndex:index];
+    NSError* error = nil;
+    id<MTLFunction> fn = [library newFunctionWithName:[NSString stringWithUTF8String:name] constantValues:constants error:&error];
+    if (fn == nil) fail(std::string("specialisation of ") + name + ": " + error.localizedDescription.UTF8String);
+    id<MTLComputePipelineState> pso = [device newComputePipelineStateWithFunction:fn error:&error];
+    if (pso == nil) fail(std::string("pipeline for ") + name + ": " + error.localizedDescription.UTF8String);
+    return pso;
+}
+
+// The K-quant gemv specialised for a format (2 = Q4_K, 3 = Q6_K).
+id<MTLComputePipelineState> kquant_gemv_pipeline(id<MTLDevice> device, id<MTLLibrary> library, uint32_t format) {
+    MTLFunctionConstantValues* constants = [MTLFunctionConstantValues new];
+    [constants setConstantValue:&format type:MTLDataTypeUInt atIndex:2];
+    NSError* error = nil;
+    id<MTLFunction> fn = [library newFunctionWithName:@"matmul_k" constantValues:constants error:&error];
+    if (fn == nil) fail(std::string("K-quant gemv specialisation: ") + error.localizedDescription.UTF8String);
+    id<MTLComputePipelineState> pso = [device newComputePipelineStateWithFunction:fn error:&error];
+    if (pso == nil) fail(std::string("K-quant gemv pipeline: ") + error.localizedDescription.UTF8String);
+    return pso;
+}
+
 // A tensor on the GPU: a buffer and a byte offset into it.
 struct Buf {
     id<MTLBuffer> buffer = nil;
@@ -85,8 +110,10 @@ struct MetalSession::Impl {
 
     id<MTLDevice> device = nil;
     id<MTLCommandQueue> queue = nil;
-    id<MTLComputePipelineState> embed = nil, rms_norm = nil, matmul = nil, matmul_tq2 = nil, matmul_mm = nil,
-                                matmul_mm_tq2 = nil, rope = nil, attention = nil,
+    id<MTLComputePipelineState> embed = nil, embed_q4k = nil, embed_q6k = nil, embed_q41 = nil, rms_norm = nil, matmul = nil, matmul_tq2 = nil, matmul_q4k = nil,
+                                matmul_q6k = nil, matmul_q41 = nil, matmul_mm = nil, matmul_mm_tq2 = nil,
+                                matmul_mm_q4k = nil, matmul_mm_q6k = nil, matmul_mm_q41 = nil, rope = nil,
+                                attention = nil,
                                 attention_small = nil, attention_combine = nil;
     std::size_t block_tokens = 8;  // tokens per threadgroup of the batched attention
     bool tiles_fit = false;  // every matrix has rows and columns in multiples of 64, as the tiled kernel needs
@@ -95,10 +122,10 @@ struct MetalSession::Impl {
     std::vector<id<MTLBuffer>> owned;  // tensors that had to be copied (widened norms)
 
     struct Layer {
-        Buf attn_norm, q, k, v, q_norm, k_norm, attn_sub_norm, o, ffn_norm, gate, up, ffn_sub_norm, down;
+        Buf attn_norm, q, k, v, q_norm, k_norm, q_bias, k_bias, v_bias, attn_sub_norm, o, ffn_norm, gate, up, ffn_sub_norm, down;
     };
     std::vector<Layer> layers;
-    Buf token_embd, output, output_norm;
+    Buf token_embd, output, output_norm, rope_factors;
 
     // Scratch, one row per token of the batch, and the caches.
     // Half copies of the activations the tiled matmul reads, written by their producers.
@@ -149,6 +176,15 @@ struct MetalSession::Impl {
         }
         matmul_mm = tile_pipeline(device, library, 0);
         matmul_mm_tq2 = tile_pipeline(device, library, 1);
+        matmul_mm_q4k = tile_pipeline(device, library, 2);
+        matmul_mm_q6k = tile_pipeline(device, library, 3);
+        embed_q4k = specialised_pipeline(device, library, "embed_k", 3, 2);
+        embed_q6k = specialised_pipeline(device, library, "embed_k", 3, 3);
+        matmul_q4k = kquant_gemv_pipeline(device, library, 2);
+        matmul_q6k = kquant_gemv_pipeline(device, library, 3);
+        matmul_q41 = kquant_gemv_pipeline(device, library, 4);
+        matmul_mm_q41 = tile_pipeline(device, library, 4);
+        embed_q41 = specialised_pipeline(device, library, "embed_k", 3, 4);
         rope = pipeline("qk_norm_rope");
         attention = pipeline("attention");
         attention_small = pipeline("attention_small");
@@ -167,9 +203,10 @@ struct MetalSession::Impl {
         if (weights == nil) fail("cannot wrap the model file in a GPU buffer");
 
         token_embd = matrix(model.token_embedding(), "token_embd.weight");
-        if (token_embd.format != WeightFormat::Q4_0) fail("the Metal backend needs a Q4_0 token embedding");
+        if (token_embd.format == WeightFormat::TQ2_0) fail("the Metal backend needs a Q4_0 or K-quant token embedding");
         output = matrix(model.output_projection(), "output.weight");
         output_norm = floats(model.output_norm());
+        if (!model.config().rope_factors.empty()) rope_factors = floats(model.config().rope_factors);
         for (const Model::Layer& l : model.layers()) {
             Layer g;
             g.attn_norm = floats(l.attention_norm);
@@ -178,6 +215,11 @@ struct MetalSession::Impl {
             g.v = matrix(l.value, "attn_v");
             if (!l.query_norm.empty()) g.q_norm = floats(l.query_norm);
             if (!l.key_norm.empty()) g.k_norm = floats(l.key_norm);
+            if (!l.query_bias.empty()) {
+                g.q_bias = floats(l.query_bias);
+                g.k_bias = floats(l.key_bias);
+                g.v_bias = floats(l.value_bias);
+            }
             if (!l.attention_sub_norm.empty()) g.attn_sub_norm = floats(l.attention_sub_norm);
             g.o = matrix(l.attention_output, "attn_output");
             g.ffn_norm = floats(l.feed_forward_norm);
@@ -195,12 +237,15 @@ struct MetalSession::Impl {
     }
 
     Buf matrix(const Matrix& m, const char* name) {
-        const bool supported = m.format == WeightFormat::Q4_0 || m.format == WeightFormat::TQ2_0;
+        const bool supported = m.format == WeightFormat::Q4_0 || m.format == WeightFormat::Q4_1 ||
+                               m.format == WeightFormat::TQ2_0 || m.format == WeightFormat::Q4_K ||
+                               m.format == WeightFormat::Q6_K;
         if (!supported || !in_file(m.bytes.data(), m.bytes.size())) {
             fail(std::string("the Metal backend needs ") + name +
-                 " as Q4_0 or TQ2_0 in the file (load the model without repacking)");
+                 " as Q4_0, Q4_1, Q4_K, Q6_K or TQ2_0 in the file (load the model without repacking)");
         }
-        if (m.format == WeightFormat::TQ2_0 && m.cols % 256 != 0) fail(std::string("TQ2_0 columns not a multiple of 256: ") + name);
+        const bool super_blocks = m.format == WeightFormat::TQ2_0 || m.format == WeightFormat::Q4_K || m.format == WeightFormat::Q6_K;
+        if (super_blocks && m.cols % 256 != 0) fail(std::string("columns not a multiple of 256: ") + name);
         return {weights, static_cast<NSUInteger>(m.bytes.data() - file.data()), m.format};
     }
 
@@ -278,6 +323,25 @@ struct MetalSession::Impl {
 
     bool tiled(std::size_t n) const { return tiles_fit && n > kSmallBatch; }
 
+    id<MTLComputePipelineState> tile_for(WeightFormat f) const {
+        switch (f) {
+            case WeightFormat::TQ2_0: return matmul_mm_tq2;
+            case WeightFormat::Q4_K: return matmul_mm_q4k;
+            case WeightFormat::Q6_K: return matmul_mm_q6k;
+            case WeightFormat::Q4_1: return matmul_mm_q41;
+            default: return matmul_mm;
+        }
+    }
+    id<MTLComputePipelineState> gemv_for(WeightFormat f) const {
+        switch (f) {
+            case WeightFormat::TQ2_0: return matmul_tq2;
+            case WeightFormat::Q4_K: return matmul_q4k;
+            case WeightFormat::Q6_K: return matmul_q6k;
+            case WeightFormat::Q4_1: return matmul_q41;
+            default: return matmul;
+        }
+    }
+
     void encode_norm(id<MTLComputeCommandEncoder> enc, id<MTLBuffer> in, const Buf& w, Act out, std::size_t rows,
                      std::size_t dim, NSUInteger in_offset = 0, NSUInteger out_offset = 0) {
         [enc setComputePipelineState:rms_norm];
@@ -306,13 +370,13 @@ struct MetalSession::Impl {
     // up with the epilogue reading it.
     void encode_gated(id<MTLComputeCommandEncoder> enc, const Buf& gate_w, const Buf& up_w, std::size_t rows,
                       std::size_t cols, Act in, std::size_t n, Mode mode, Act out) {
-        if (tiled(n)) {
+        if (tiled(n) || gate_w.format != up_w.format) {
             encode_matmul(enc, {Target{&gate_w, rows, Act{out.f, nil}}}, cols, in, n);
             encode_matmul(enc, {Target{&up_w, rows, out}}, cols, in, n, mode, out.f);
             return;
         }
         const bool ternary = gate_w.format == WeightFormat::TQ2_0;
-        [enc setComputePipelineState:ternary ? matmul_tq2 : matmul];
+        [enc setComputePipelineState:gemv_for(gate_w.format)];
         set(enc, gate_w, 0);
         set(enc, up_w, 1);
         set(enc, up_w, 2);
@@ -330,7 +394,7 @@ struct MetalSession::Impl {
                        Act in, std::size_t n, Mode mode = kStore, id<MTLBuffer> aux = nil) {
         if (tiled(n)) {
             for (const Target& t : targets) {
-                [enc setComputePipelineState:t.w->format == WeightFormat::TQ2_0 ? matmul_mm_tq2 : matmul_mm];
+                [enc setComputePipelineState:tile_for(t.w->format)];
                 set(enc, *t.w, 0);
                 set(enc, in.h, 1);
                 set(enc, t.out.f, 2);
@@ -344,10 +408,18 @@ struct MetalSession::Impl {
             }
             return;
         }
-        const bool ternary = targets.begin()->w->format == WeightFormat::TQ2_0;
-        [enc setComputePipelineState:ternary ? matmul_tq2 : matmul];
+        // One dispatch per weight format (a Q4_K_M file mixes Q4_K and Q6_K in a layer).
+        const WeightFormat format = targets.begin()->w->format;
+        bool mixed = false;
+        for (const Target& t : targets) mixed |= t.w->format != format;
+        if (mixed) {
+            for (const Target& t : targets) encode_matmul(enc, {t}, cols, in, n, mode, aux);
+            return;
+        }
+        const bool ternary = format == WeightFormat::TQ2_0;
+        [enc setComputePipelineState:gemv_for(format)];
         GemvParams p{{0, 0, 0}, static_cast<uint32_t>(cols), static_cast<uint32_t>(n), mode, 0};
-        std::size_t pairs = 0, i = 0;  // row groups: pairs for Q4_0, quads for TQ2_0
+        std::size_t pairs = 0, i = 0;  // row groups: pairs, or kTernaryRows for TQ2_0
         for (const Target& t : targets) {
             set(enc, *t.w, i);
             set(enc, t.out.f, 4 + i);
@@ -400,7 +472,10 @@ struct MetalSession::Impl {
                 enc = [cb computeCommandEncoder];
             };
 
-            [enc setComputePipelineState:embed];
+            [enc setComputePipelineState:token_embd.format == WeightFormat::Q4_K   ? embed_q4k
+                                        : token_embd.format == WeightFormat::Q6_K ? embed_q6k
+                                        : token_embd.format == WeightFormat::Q4_1 ? embed_q41
+                                                                                  : embed];
             set(enc, token_embd, 0);
             set(enc, tokens, 1);
             set(enc, x, 2);
@@ -429,8 +504,14 @@ struct MetalSession::Impl {
                 [enc setBuffer:v_cache offset:cache_layer atIndex:6];
                 const RopeParams rp{static_cast<uint32_t>(n), static_cast<uint32_t>(position), c.head_count, c.kv_head_count,
                                     c.head_dim, static_cast<uint32_t>(max_context), c.rms_epsilon, c.rope_base,
-                                    g.q_norm.buffer != nil ? 1u : 0u};
+                                    g.q_norm.buffer != nil ? 1u : 0u, c.rope_neox ? 1u : 0u,
+                                    g.q_bias.buffer != nil ? 1u : 0u, rope_factors.buffer != nil ? 1u : 0u};
                 bytes(enc, rp, 7);
+                set(enc, g.q_bias.buffer != nil ? g.q_bias : g.attn_norm, 8);  // unused when has_bias is 0
+                set(enc, g.k_bias.buffer != nil ? g.k_bias : g.attn_norm, 9);
+                set(enc, g.v_bias.buffer != nil ? g.v_bias : g.attn_norm, 10);
+                set(enc, rope_factors.buffer != nil ? rope_factors : g.attn_norm, 11);
+                set(enc, v_stage, 12);
                 groups(enc, (n * (c.head_count + c.kv_head_count) + 3) / 4, 128);
                 checkpoint("rope");
 
@@ -592,6 +673,23 @@ struct StandaloneMatmul {
         mm = tile_pipeline(device, library, 0);
     }
 
+    // Pipelines for a format other than Q4_0 (ternary not covered here).
+    static uint32_t format_id(WeightFormat f) {
+        switch (f) {
+            case WeightFormat::Q4_K: return 2;
+            case WeightFormat::Q6_K: return 3;
+            case WeightFormat::Q4_1: return 4;
+            default: return 0;
+        }
+    }
+    void select(WeightFormat format) {
+        if (format == WeightFormat::Q4_0) return;
+        const uint32_t id = format_id(format);
+        if (id == 0) fail("the standalone matmul takes Q4_0, Q4_1, Q4_K or Q6_K");
+        gemv = kquant_gemv_pipeline(device, library, id);
+        mm = tile_pipeline(device, library, id);
+    }
+
     void encode(id<MTLComputeCommandEncoder> enc, id<MTLBuffer> w, id<MTLBuffer> in, id<MTLBuffer> half_in,
                 id<MTLBuffer> out, std::size_t rows, std::size_t cols, std::size_t n, bool tiled) {
         if (tiled) {
@@ -621,10 +719,11 @@ struct StandaloneMatmul {
 
 }  // namespace
 
-std::vector<float> metal_matmul_q4_0(std::span<const std::byte> weights, std::size_t rows, std::size_t cols,
-                                     std::span<const float> x, std::size_t n, bool tiled) {
+std::vector<float> metal_matmul(WeightFormat format, std::span<const std::byte> weights, std::size_t rows,
+                                std::size_t cols, std::span<const float> x, std::size_t n, bool tiled) {
     @autoreleasepool {
         StandaloneMatmul m;
+        m.select(format);
         id<MTLBuffer> w = [m.device newBufferWithBytes:weights.data() length:weights.size() options:MTLResourceStorageModeShared];
         id<MTLBuffer> in = [m.device newBufferWithBytes:x.data() length:x.size_bytes() options:MTLResourceStorageModeShared];
         id<MTLBuffer> half_in = [m.device newBufferWithLength:x.size() * 2 options:MTLResourceStorageModeShared];

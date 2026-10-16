@@ -1,4 +1,5 @@
-// Checks the Metal Q4_0 matmul kernels against the CPU reference kernels.
+// Checks the Metal matmul kernels (gemv and 64x64 tile, each weight format)
+// against a float reference on random blocks.
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -13,45 +14,92 @@ using namespace brisk;
 
 namespace {
 
-bool check(std::size_t rows, std::size_t cols, std::size_t n, bool tiled) {
-    std::mt19937 rng(static_cast<unsigned>(rows * 31 + cols * 7 + n));
+const char* name(WeightFormat f) {
+    switch (f) {
+        case WeightFormat::Q4_0: return "q4_0";
+        case WeightFormat::Q4_1: return "q4_1";
+        case WeightFormat::Q4_K: return "q4_k";
+        case WeightFormat::Q6_K: return "q6_k";
+        default: return "?";
+    }
+}
+
+// Random blocks of `format` for rows x cols, and their dequantised values.
+std::vector<std::byte> random_blocks(WeightFormat format, std::size_t rows, std::size_t cols, std::mt19937& rng,
+                                     std::vector<float>& values) {
+    const std::size_t count = rows * cols;
+    const std::size_t blocks = count / block_elements(format);
+    std::vector<std::byte> bytes(blocks * block_bytes(format));
+    std::uniform_int_distribution<int> byte(0, 255);
+    std::uniform_real_distribution<float> scale(0.02f, 0.1f);
+    for (std::size_t b = 0; b < blocks; ++b) {
+        std::byte* blk = bytes.data() + b * block_bytes(format);
+        for (std::size_t i = 0; i < block_bytes(format); ++i) blk[i] = static_cast<std::byte>(byte(rng));
+        // Sane scales: random bytes make inf/NaN halves.
+        const std::uint16_t d = float_to_half(scale(rng));
+        switch (format) {
+            case WeightFormat::Q4_0: std::memcpy(blk, &d, 2); break;
+            case WeightFormat::Q4_1: {
+                const std::uint16_t m = float_to_half(scale(rng) - 0.06f);
+                std::memcpy(blk, &d, 2);
+                std::memcpy(blk + 2, &m, 2);
+                break;
+            }
+            case WeightFormat::Q4_K: {
+                const std::uint16_t dmin = float_to_half(scale(rng) * 0.1f);
+                std::memcpy(blk, &d, 2);
+                std::memcpy(blk + 2, &dmin, 2);
+                break;
+            }
+            case WeightFormat::Q6_K: std::memcpy(blk + 208, &d, 2); break;
+            default: break;
+        }
+    }
+    values.resize(count);
+    switch (format) {
+        case WeightFormat::Q4_0: dequantize_q4_0(reinterpret_cast<const BlockQ4_0*>(bytes.data()), values.data(), count); break;
+        case WeightFormat::Q4_1: dequantize_q4_1(reinterpret_cast<const BlockQ4_1*>(bytes.data()), values.data(), count); break;
+        case WeightFormat::Q4_K: dequantize_q4_k(reinterpret_cast<const BlockQ4_K*>(bytes.data()), values.data(), count); break;
+        case WeightFormat::Q6_K: dequantize_q6_k(reinterpret_cast<const BlockQ6_K*>(bytes.data()), values.data(), count); break;
+        default: break;
+    }
+    return bytes;
+}
+
+bool check(WeightFormat format, std::size_t rows, std::size_t cols, std::size_t n, bool tiled) {
+    std::mt19937 rng(static_cast<unsigned>(rows * 31 + cols * 7 + n + static_cast<unsigned>(format) * 101));
     std::normal_distribution<float> dist;
     std::vector<float> x(n * cols);
     for (float& v : x) v = dist(rng);
-    // Random blocks: a scale around 0.1 and uniformly random nibbles.
-    std::vector<BlockQ4_0> blocks(rows * cols / 32);
-    std::uniform_int_distribution<int> nibble(0, 255);
-    for (BlockQ4_0& b : blocks) {
-        const std::uint16_t d = float_to_half(0.05f + 0.1f * std::uniform_real_distribution<float>()(rng));
-        std::memcpy(&b, &d, 2);
-        for (std::uint8_t& q : b.qs) q = static_cast<std::uint8_t>(nibble(rng));
-    }
-    const std::span<const std::byte> bytes(reinterpret_cast<const std::byte*>(blocks.data()),
-                                           blocks.size() * sizeof(BlockQ4_0));
+    std::vector<float> w;
+    const std::vector<std::byte> bytes = random_blocks(format, rows, cols, rng, w);
 
     // Reference: the dequantised weights against the exact float activations.
-    std::vector<float> w(rows * cols);
-    dequantize_q4_0(blocks.data(), w.data(), w.size());
     std::vector<float> expected(rows * n);
-    for (std::size_t t = 0; t < n; ++t) {
-        for (std::size_t r = 0; r < rows; ++r) {
+    double scale = 0.0;  // typical magnitude of a weight, for the tolerance
+    for (std::size_t r = 0; r < rows; ++r) {
+        for (std::size_t t = 0; t < n; ++t) {
             double sum = 0.0;
             for (std::size_t c = 0; c < cols; ++c) sum += double(w[r * cols + c]) * x[t * cols + c];
             expected[t * rows + r] = static_cast<float>(sum);
         }
+        for (std::size_t c = 0; c < cols; ++c) scale += std::fabs(w[r * cols + c]);
     }
-    const std::vector<float> got = metal_matmul_q4_0(bytes, rows, cols, x, n, tiled);
+    scale /= double(rows * cols);
+    const std::vector<float> got = metal_matmul(format, bytes, rows, cols, x, n, tiled);
 
     if (std::getenv("METAL_TEST_DUMP") != nullptr) {
-        for (std::size_t i = 0; i < std::min<std::size_t>(8, expected.size()); ++i) std::printf("  [%zu] expected %g got %g\n", i, expected[i], got[i]);
+        for (std::size_t i = 0; i < std::min<std::size_t>(8, expected.size()); ++i) {
+            std::printf("  [%zu] expected %g got %g\n", i, expected[i], got[i]);
+        }
     }
     double worst = 0.0;
     for (std::size_t i = 0; i < expected.size(); ++i) worst = std::max(worst, std::fabs(double(expected[i]) - got[i]));
-    // Half activations in the tiled kernel: relative error ~1e-3 of a dot of `cols` unit terms.
-    const double tolerance = (tiled ? 4e-3 : 1e-4) * std::sqrt(double(cols));
+    // Half activations in the tiled kernel: relative error ~1e-3 of a dot of `cols` terms of size `scale`.
+    const double tolerance = (tiled ? 4e-3 : 1e-4) * std::sqrt(double(cols)) * std::max(scale, 0.3);
     const bool ok = worst <= tolerance;
-    std::printf("%s rows %zu cols %zu n %zu: max abs error %.3g (tolerance %.3g) %s\n", tiled ? "tiled" : "gemv ", rows,
-                cols, n, worst, tolerance, ok ? "ok" : "FAILED");
+    std::printf("%s %s rows %zu cols %zu n %zu: max abs error %.3g (tolerance %.3g) %s\n", name(format),
+                tiled ? "tiled" : "gemv ", rows, cols, n, worst, tolerance, ok ? "ok" : "FAILED");
     return ok;
 }
 
@@ -63,13 +111,19 @@ int main() {
         return 0;
     }
     bool ok = true;
-    ok &= check(64, 64, 1, false);
-    ok &= check(130, 2048, 3, false);
-    ok &= check(1024, 2048, 7, false);
-    ok &= check(128, 64, 8, true);
-    ok &= check(128, 2048, 64, true);
-    ok &= check(256, 1024, 100, true);
-    ok &= check(384, 96, 130, true);
+    ok &= check(WeightFormat::Q4_0, 64, 64, 1, false);
+    ok &= check(WeightFormat::Q4_0, 130, 2048, 3, false);
+    ok &= check(WeightFormat::Q4_0, 1024, 2048, 7, false);
+    ok &= check(WeightFormat::Q4_0, 128, 64, 8, true);
+    ok &= check(WeightFormat::Q4_0, 128, 2048, 64, true);
+    ok &= check(WeightFormat::Q4_0, 256, 1024, 100, true);
+    ok &= check(WeightFormat::Q4_0, 384, 96, 130, true);
+    for (const WeightFormat f : {WeightFormat::Q4_1, WeightFormat::Q4_K, WeightFormat::Q6_K}) {
+        const std::size_t cols = f == WeightFormat::Q4_1 ? 1056 : 1280;
+        ok &= check(f, 66, cols, 1, false);
+        ok &= check(f, 130, cols, 3, false);
+        ok &= check(f, 128, cols, 70, true);
+    }
     std::printf("metal_test: %s\n", ok ? "ok" : "FAILED");
     return ok ? 0 : 1;
 }
