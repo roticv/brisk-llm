@@ -290,25 +290,30 @@ kernel void matmul_tq2_0(device const uchar* w0 [[buffer(0)]],
         device const uchar* blk1 = wrow1 + b * 66;
         const float d0 = float(*(device const half*)(blk0 + 64));
         const float d1 = float(*(device const half*)(blk1 + 64));
-        const ushort4 ua0 = *(device const packed_ushort4*)(blk0 + j + m0), ub0 = *(device const packed_ushort4*)(blk0 + j + m0 + 8);
-        const ushort4 ua1 = *(device const packed_ushort4*)(blk1 + j + m0), ub1 = *(device const packed_ushort4*)(blk1 + j + m0 + 8);
-        const uint4 words0 = uint4(ua0.x, ua0.z, ub0.x, ub0.z) | (uint4(ua0.y, ua0.w, ub0.y, ub0.w) << 16);
-        const uint4 words1 = uint4(ua1.x, ua1.z, ub1.x, ub1.z) | (uint4(ua1.y, ua1.w, ub1.y, ub1.w) << 16);
-        float4 s0 = 0.0f, s1 = 0.0f, xsum = 0.0f;
-        for (uint k = 0; k < 4; ++k) {  // word k: bytes j + m0 + 4k .. + 3
-            const uint4 q0 = uint4(words0[k]) >> uint4(0, 8, 16, 24);
-            const uint4 q1 = uint4(words1[k]) >> uint4(0, 8, 16, 24);
-            for (uint l = 0; l < 4; ++l) {
-                const float4 xv = xrow[(b * 256 + j * 4 + 32 * l + m0 + 4 * k) / 4];
-                xsum += xv;
-                s0 = fma(tq2_codes(q0, l), xv, s0);
-                s1 = fma(tq2_codes(q1, l), xv, s1);
-            }
+        // Float decode (after llama.cpp): with v a byte as float and f_l =
+        // floor(v / 4^l) = q_l + 4 f_{l+1}, sum_l q_l y_l = sum_l f_l (y_l - 4 y_{l-1}).
+        // The coefficients and the activation sum are shared by both rows.
+        float s0 = 0.0f, s1 = 0.0f;
+        for (uint k = 0; k < 4; ++k) {  // bytes j + m0 + 4k .. + 3: elements j*4 + 32 l + m0 + 4k .. + 3 for l = 0..3
+            float4 y[4];
+            for (uint l = 0; l < 4; ++l) y[l] = xrow[(b * 256 + j * 4 + 32 * l + m0 + 4 * k) / 4];
+            const float4 c1 = y[1] - 4.0f * y[0], c2 = y[2] - 4.0f * y[1], c3 = y[3] - 4.0f * y[2];
+            const float4 ysum = (y[0] + y[1]) + (y[2] + y[3]);
+            const float sumy = ysum.x + ysum.y + ysum.z + ysum.w;
+            const float4 v0 = float4(*(device const packed_uchar4*)(blk0 + j + m0 + 4 * k));
+            const float4 v1 = float4(*(device const packed_uchar4*)(blk1 + j + m0 + 4 * k));
+            float4 r0 = v0 * y[0], r1 = v1 * y[0];
+            r0 = fma(floor(v0 * 0.25f), c1, r0);
+            r1 = fma(floor(v1 * 0.25f), c1, r1);
+            r0 = fma(floor(v0 * 0.0625f), c2, r0);
+            r1 = fma(floor(v1 * 0.0625f), c2, r1);
+            r0 = fma(floor(v0 * 0.015625f), c3, r0);
+            r1 = fma(floor(v1 * 0.015625f), c3, r1);
+            s0 += (r0.x + r0.y + r0.z + r0.w) - sumy;
+            s1 += (r1.x + r1.y + r1.z + r1.w) - sumy;
         }
-        s0 -= xsum;
-        s1 -= xsum;
-        acc0 += (s0.x + s0.y + s0.z + s0.w) * d0;
-        acc1 += (s1.x + s1.y + s1.z + s1.w) * d1;
+        acc0 += s0 * d0;
+        acc1 += s1 * d1;
     }
     acc0 = simd_sum(acc0);
     acc1 = simd_sum(acc1);

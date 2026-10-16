@@ -90,6 +90,18 @@ Generation after a 497-token prompt (context the `tg64` numbers do not have): 80
 
 Where the time goes on the 1.7B prompt (GPU time of the batch, 0.53 s): the tiled matmul takes about 0.47 s at 2.8-3.0 TFLOPS, which is 85-90% of the 3.25 TFLOPS that a register-only `simdgroup_multiply_accumulate` loop reaches on this GPU (`bench/metal_bench`; llama.cpp's own matmul measures 2.6 TFLOPS in its `test-backend-ops perf`); attention is 0.03 s; the rest is small. So the 9% gap to llama.cpp on prompt processing is not in the matmul kernel but spread over the remaining passes and launch gaps. In generation the layer gemvs read the weights at ~90 GB/s and the large output matrix at 117 GB/s (of 120 measured by `membw`), so the per-layer dispatches are what costs; the 0.6B, with its smaller matrices, loses more to that. First-run numbers are 10-15% lower than warmed ones: the GPU clock ramps and the mapped weights are touched for the first time.
 
+#### BitNet b1.58 2B4T on the GPU
+
+The TQ2_0 file (e4: Q4_0 embedding and output) with `--gpu`, paced as above, medians of 3, against llama.cpp's Metal backend, which does have TQ2_0 kernels, and brisk's own CPU path. Tokens/s.
+
+| | prompt (498 / 512 tokens) | generation (64, short context) |
+|---|---:|---:|
+| brisk GPU | 594 | 70 |
+| llama.cpp Metal | 608 | 85 |
+| brisk CPU, 4 / 10 threads | | 67 / 102 |
+
+Perplexity on the GPU matches the pin to 0.02%. The ternary gemv is the limit: 537 MB of layer weights per token take about 11 ms (50 GB/s), nowhere near the 120 GB/s the Q4_0 output matrix reads at. The integer decode (shift, mask, convert per 2-bit field) ran at 42 GB/s; llama.cpp's float decode (a byte converted once, `floor(v / 4^l)` with telescoped activation coefficients shared across rows) brought it to 50; four rows per simdgroup to share the activations made it slower again, as every wider gemv has on this GPU. So on the Mac the fastest way to run BitNet remains brisk's CPU path with all ten cores, and the ternary GPU kernel is at 80% of llama.cpp's.
+
 #### Speculative decoding on the GPU
 
 Qwen3-1.7B pure Q4_0, `--gpu`, greedy, lookup (n-gram) drafting, output identical to plain decoding. The Speculator now backs off after a round with no accepted guess (plain single-token rounds, doubling up to 32, halved again on success), which is what keeps the fresh-answer penalty bounded.
