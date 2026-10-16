@@ -1,13 +1,14 @@
 # brisk-llm
 
-A small CPU inference engine for LLMs in C++20, built for two machines: a MacBook Air M4 and a Raspberry Pi 4. It runs Qwen3 and BitNet b1.58 models from GGUF files and aims to match or beat llama.cpp on them. `ROADMAP.md` has the plan and where it stands; `bench/RESULTS.md` has the measurements.
+A small LLM inference engine in C++20, built for two machines: a MacBook Air M4 (CPU and Metal GPU) and a Raspberry Pi 4. It runs Qwen3 and BitNet b1.58 models from GGUF files and aims to match or beat llama.cpp on them. `ROADMAP.md` has the plan and where it stands; `bench/RESULTS.md` has the measurements.
 
 ## What it does
 
 - Reads GGUF files directly (bounds-checked parser, fuzzed), using quantised weights in place from the memory map.
 - Weight formats: F32, F16, BF16, Q4_0, Q4_1, Q4_K, Q6_K and the ternary TQ2_0; Q4_0 and TQ2_0 are repacked at load into a four-row interleaved layout on CPUs with `i8mm`.
 - NEON kernels in three variants (baseline for the Cortex-A72, `dotprod`, `i8mm`/`smmla`), chosen at startup; batched prompt processing; a thread pool that hands out work dynamically so efficiency cores help.
-- Models: Qwen3 (0.6B, 1.7B tested) and BitNet b1.58 2B4T, with the Qwen and Llama 3 tokenizers.
+- Metal backend (`--gpu`) for Q4_0 models on Apple silicon: weights used in place from the memory map, K/V cache on the GPU, simdgroup-matrix kernels for prompts, one command buffer per batch; shaders compiled at startup, so no Metal toolchain is needed.
+- Models: Qwen3 (0.6B, 1.7B tested) and BitNet b1.58 2B4T, with the Qwen and Llama 3 tokenizers. Other families are planned (roadmap Phase 6).
 - Greedy and temperature/top-k/top-p sampling; speculative decoding with lookup (n-gram) or model drafting, exact with respect to greedy decoding.
 
 ## Build
@@ -62,4 +63,9 @@ Benchmarks on the Air are only meaningful with nothing else running; the fanless
 
 ## Status
 
-Phases 0-2 of the roadmap are done; Phase 3 stopped after BitNet and speculative decoding, with the findings recorded in the roadmap; Phase 5 added a Metal backend that is level with llama.cpp's on 1.7B generation (89.6 vs 88.4 tokens/s) and 7-9% behind on prompt processing (940 vs 1034), 2.9x the CPU path. In short: generation at 4 threads sits within a few percent of llama.cpp either way, because both engines are at 80-90% of the memory-bandwidth ceiling; brisk is ahead on the Pi, on the M4 with all cores (where it also passes llama.cpp's Metal path), on Q4_K_M files, and on BitNet (2-3x), and behind on M4 prompt processing of Q4_0 files at 4 threads.
+The CPU work (roadmap Phases 0-4) and the Metal backend (Phase 5) are done; Phase 6, more model families, is next.
+
+Against llama.cpp on the same files (details in `bench/RESULTS.md`):
+
+- **CPU:** generation at 4 threads is within a few percent either way, because both engines sit at 80-90% of the memory-bandwidth ceiling. brisk is ahead on the Pi (generation 12%, prompt processing 1.9x on Qwen3-1.7B), on the M4 with all cores (40%), on Q4_K_M files, and on BitNet (2-3x); behind on M4 prompt processing of Q4_0 files at 4 threads (6%).
+- **GPU:** level with llama.cpp's Metal backend on Qwen3-1.7B generation (89.6 vs 88.4 tokens/s) and 7-9% behind on prompt processing (940 vs 1034), which is 2.9x the CPU path. The batched matmul runs at 85-90% of the GPU's measured matrix peak, so the rest of that gap is outside the kernel.
