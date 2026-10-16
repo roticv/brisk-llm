@@ -79,6 +79,7 @@ struct AttentionParams {
     uint write_half;  // also write the output as half, for the tiled output projection
     uint splits;      // position ranges per (token block, kv head); > 1 writes partials for attention_combine
     uint chunk;       // positions per split, a multiple of 8
+    uint block_tokens;  // tokens per threadgroup of the batched kernel: kMaxQueries / group
 };
 
 // ---- embedding ---------------------------------------------------------------
@@ -222,6 +223,105 @@ kernel void matmul_q4_0(device const uchar* w0 [[buffer(0)]],
     }
 }
 
+// ---- TQ2_0 (ternary) ---------------------------------------------------------
+//
+// A block is 256 values in 64 bytes of 2-bit codes (0, 1, 2 for -1, 0, +1)
+// followed by a half scale: 66 bytes. Byte j + m (j in {0, 32}, m < 32)
+// holds, at bits 2l, element j * 4 + 32 * l + m. So 32 consecutive elements
+// starting at a multiple of 32 are one bit pair of 32 consecutive bytes.
+
+// Four consecutive ternary codes at bit pair l of a word's bytes, as float4
+// in {0, 1, 2}; `bytes` is the word spread over the components (word >> 0,
+// 8, 16, 24). The -1 offset is applied by the caller as a subtraction of the
+// activations' sum: sum((q - 1) x) = sum(q x) - sum(x).
+inline float4 tq2_codes(uint4 bytes, uint l) {
+    return float4(extract_bits(bytes, 2 * l, 2));
+}
+
+// Gemv for TQ2_0 matrices with the same shape as matmul_q4_0: one simdgroup
+// per two rows and one activation row, the 4 simdgroups of a threadgroup
+// taking consecutive row pairs across the three matrices. Each lane takes a
+// quarter of a block (16 bytes = 64 values: 4 words, each giving 4 runs of 4
+// values at bit pairs 0..3) so that rows of 10 blocks (2560 columns) still
+// keep most lanes busy. Blocks are 2-byte aligned, so the bytes come in as
+// packed_ushort4 (8-byte loads at 2-byte alignment).
+kernel void matmul_tq2_0(device const uchar* w0 [[buffer(0)]],
+                         device const uchar* w1 [[buffer(1)]],
+                         device const uchar* w2 [[buffer(2)]],
+                         device const float* x [[buffer(3)]],
+                         device float* out0 [[buffer(4)]],
+                         device float* out1 [[buffer(5)]],
+                         device float* out2 [[buffer(6)]],
+                         constant GemvParams& p [[buffer(7)]],
+                         device const float* aux [[buffer(8)]],
+                         uint tg [[threadgroup_position_in_grid]],
+                         uint sg [[simdgroup_index_in_threadgroup]],
+                         uint lane [[thread_index_in_simdgroup]]) {
+    const bool paired = p.paired != 0;
+    const uint pairs0 = paired ? p.rows[0] : (p.rows[0] + 1) / 2;
+    const uint pairs1 = paired ? 0 : (p.rows[1] + 1) / 2, pairs2 = paired ? 0 : (p.rows[2] + 1) / 2;
+    const uint item = tg * 4 + sg;
+    if (item >= (pairs0 + pairs1 + pairs2) * p.n) return;
+    uint pair = item / p.n;
+    const uint t = item % p.n;
+    device const uchar* w;
+    device float* out;
+    uint rows;
+    if (pair < pairs0) {
+        w = w0; out = out0; rows = p.rows[0];
+    } else if (pair < pairs0 + pairs1) {
+        pair -= pairs0; w = w1; out = out1; rows = p.rows[1];
+    } else {
+        pair -= pairs0 + pairs1; w = w2; out = out2; rows = p.rows[2];
+    }
+    const uint blocks = p.cols / 256;
+    const uint row0 = paired ? pair : pair * 2;
+    const bool two = paired || row0 + 1 < rows;
+    device const uchar* wrow0 = w + (ulong)row0 * blocks * 66;
+    device const uchar* wrow1 = paired ? w1 + (ulong)row0 * blocks * 66 : wrow0 + (two ? blocks * 66 : 0);
+    device const float4* xrow = (device const float4*)(x + t * p.cols);
+
+    float acc0 = 0.0f, acc1 = 0.0f;
+    for (uint item4 = lane; item4 < blocks * 4; item4 += 32) {
+        const uint b = item4 / 4, quarter = item4 % 4;
+        // Bytes [16 * quarter, + 16): j = 32 * (quarter / 2), m0 = 16 * (quarter % 2).
+        const uint j = 32 * (quarter / 2), m0 = 16 * (quarter % 2);
+        device const uchar* blk0 = wrow0 + b * 66;
+        device const uchar* blk1 = wrow1 + b * 66;
+        const float d0 = float(*(device const half*)(blk0 + 64));
+        const float d1 = float(*(device const half*)(blk1 + 64));
+        const ushort4 ua0 = *(device const packed_ushort4*)(blk0 + j + m0), ub0 = *(device const packed_ushort4*)(blk0 + j + m0 + 8);
+        const ushort4 ua1 = *(device const packed_ushort4*)(blk1 + j + m0), ub1 = *(device const packed_ushort4*)(blk1 + j + m0 + 8);
+        const uint4 words0 = uint4(ua0.x, ua0.z, ub0.x, ub0.z) | (uint4(ua0.y, ua0.w, ub0.y, ub0.w) << 16);
+        const uint4 words1 = uint4(ua1.x, ua1.z, ub1.x, ub1.z) | (uint4(ua1.y, ua1.w, ub1.y, ub1.w) << 16);
+        float4 s0 = 0.0f, s1 = 0.0f, xsum = 0.0f;
+        for (uint k = 0; k < 4; ++k) {  // word k: bytes j + m0 + 4k .. + 3
+            const uint4 q0 = uint4(words0[k]) >> uint4(0, 8, 16, 24);
+            const uint4 q1 = uint4(words1[k]) >> uint4(0, 8, 16, 24);
+            for (uint l = 0; l < 4; ++l) {
+                const float4 xv = xrow[(b * 256 + j * 4 + 32 * l + m0 + 4 * k) / 4];
+                xsum += xv;
+                s0 = fma(tq2_codes(q0, l), xv, s0);
+                s1 = fma(tq2_codes(q1, l), xv, s1);
+            }
+        }
+        s0 -= xsum;
+        s1 -= xsum;
+        acc0 += (s0.x + s0.y + s0.z + s0.w) * d0;
+        acc1 += (s1.x + s1.y + s1.z + s1.w) * d1;
+    }
+    acc0 = simd_sum(acc0);
+    acc1 = simd_sum(acc1);
+    if (lane == 0) {
+        if (paired) {
+            out[t * rows + row0] = epilogue(p.mode, acc1, acc0);
+        } else {
+            out[t * rows + row0] = epilogue(p.mode, acc0, aux[t * rows + row0]);
+            if (two) out[t * rows + row0 + 1] = epilogue(p.mode, acc1, aux[t * rows + row0 + 1]);
+        }
+    }
+}
+
 // Batched multiply on simdgroup matrices: each threadgroup (128 threads, 4
 // simdgroups) produces a 64-token x 64-row tile of out[t][row], computed as
 // X (tokens x k) times W^T (k x rows) so the accumulators store straight to
@@ -231,6 +331,9 @@ kernel void matmul_q4_0(device const uchar* w0 [[buffer(0)]],
 // matrix loads are contiguous; each simdgroup then accumulates a 32-token x
 // 32-row quarter with 8x8 matrix multiplies. Each step's loads are issued
 // before the previous step's multiplies so they overlap.
+// The tile's weight format: 0 = Q4_0, 1 = TQ2_0 (a function constant, so each is its own pipeline).
+constant uint kTileFormat [[function_constant(0)]];
+
 kernel void matmul_q4_0_mm(device const uchar* w [[buffer(0)]],
                            device const half* x [[buffer(1)]],
                            device float* out [[buffer(2)]],
@@ -244,7 +347,8 @@ kernel void matmul_q4_0_mm(device const uchar* w [[buffer(0)]],
     threadgroup half* sa = (threadgroup half*)shared4;  // weights: block (kb, rb) at 64 * (kb * 8 + rb), [k % 8][row % 8]
     threadgroup half* sb = sa + 64 * 32;                // activations: block (tb, kb) at 64 * (tb * 4 + kb), [t % 8][k % 8]
     const uint row0 = tg.x * 64, t0 = tg.y * 64;
-    const uint blocks = p.cols / 32;
+    const uint blocks = p.cols / 32;  // steps of 32 columns
+    const bool ternary = kTileFormat == 1;
 
     simdgroup_float8x8 acc[4][4];  // [token block][row block]
     for (uint i = 0; i < 4; ++i) {
@@ -258,7 +362,7 @@ kernel void matmul_q4_0_mm(device const uchar* w [[buffer(0)]],
     const uint r = tid / 2, high = tid % 2;
     const uint t = tid % 64, k0 = (tid / 64) * 16;
     const bool valid = t0 + t < p.n;
-    device const uchar* wrow = w + (ulong)(row0 + r) * blocks * 18;
+    device const uchar* wrow = w + (ulong)(row0 + r) * (ternary ? p.cols / 256 * 66 : blocks * 18);
     device const half4* xsrc = (device const half4*)(x + (t0 + (valid ? t : 0)) * p.cols + k0);
     threadgroup half* wdst = sa + 64 * ((high * 2) * 8 + r / 8) + r % 8;  // k = high * 16, then + 8 per block
     threadgroup half4* xdst = (threadgroup half4*)(sb + 64 * ((t / 8) * 4 + k0 / 8) + 8 * (t % 8));
@@ -267,16 +371,30 @@ kernel void matmul_q4_0_mm(device const uchar* w [[buffer(0)]],
     half wd;
     ushort wq[8];
     half4 xv[4];
+    uint tl = 0;  // ternary: the bit pair of this step's 32 columns
     auto load = [&](uint b) {
-        device const Q4Block* blk = (device const Q4Block*)(wrow + b * 18);
-        wd = blk->d;
-        for (uint i = 0; i < 8; ++i) wq[i] = blk->qs[i];
+        if (ternary) {
+            // Columns [32 b, + 32) are bit pair l of bytes j .. j + 31 of block 32 b / 256;
+            // this thread's 16 columns are bytes j + 16 high .. + 15: 4 words.
+            const uint c0 = b * 32;
+            device const uchar* blk = wrow + (c0 / 256) * 66;
+            const uint j = ((c0 % 256) / 128) * 32;
+            tl = (c0 % 128) / 32;
+            wd = *(device const half*)(blk + 64);
+            device const ushort* u = (device const ushort*)(blk + j + 16 * high);
+            for (uint i = 0; i < 8; ++i) wq[i] = u[i];
+        } else {
+            device const Q4Block* blk = (device const Q4Block*)(wrow + b * 18);
+            wd = blk->d;
+            for (uint i = 0; i < 8; ++i) wq[i] = blk->qs[i];
+        }
         for (uint k = 0; k < 4; ++k) xv[k] = valid ? xsrc[b * 8 + k] : half4(0.0h);
     };
     auto store = [&]() {
         for (uint k = 0; k < 4; ++k) {
             const uint wv = uint(wq[2 * k]) | (uint(wq[2 * k + 1]) << 16);
-            const half4 v = (half4(uint4(wv) >> (uint4(0, 8, 16, 24) + shift) & 0xF) - 8.0h) * wd;
+            const half4 v = ternary ? (half4(extract_bits(uint4(wv) >> uint4(0, 8, 16, 24), 2 * tl, 2)) - 1.0h) * wd
+                                    : (half4(uint4(wv) >> (uint4(0, 8, 16, 24) + shift) & 0xF) - 8.0h) * wd;
             // Elements 4k .. 4k+3 of this half: k index 4k + j; block 4k/8, row within block 4k%8 + j.
             const uint kb = (4 * k) / 8, kr = (4 * k) % 8;
             wdst[64 * 8 * kb + 8 * kr] = v.x;
@@ -389,8 +507,7 @@ kernel void qk_norm_rope(device float* q [[buffer(0)]],
 // block's queries for the heads sharing that key/value head are held in
 // threadgroup memory, so each cached key and value row is read once for all
 // of them. Scores go to a scratch region of 16 rows per threadgroup.
-constant uint kTokenBlock = 8;
-constant uint kMaxQueries = 16;  // kTokenBlock * (query heads per key/value head), at most 2 heads
+constant uint kMaxQueries = 16;  // tokens per block * query heads per key/value head (p.block_tokens * group)
 
 kernel void attention(device const float* q [[buffer(0)]],
                       device const float* k_cache [[buffer(1)]],
@@ -410,8 +527,8 @@ kernel void attention(device const float* q [[buffer(0)]],
     const uint group = p.head_count / kv_heads;  // query heads per key/value head
     const uint split = tg % p.splits;
     const uint block = (tg / p.splits) / kv_heads, kv = (tg / p.splits) % kv_heads;
-    const uint t0 = block * kTokenBlock;
-    const uint tokens = min(kTokenBlock, p.n - t0);
+    const uint t0 = block * p.block_tokens;
+    const uint tokens = min(p.block_tokens, p.n - t0);
     const uint queries = tokens * group;
     // This threadgroup's positions: [pos0, visible_last), a slice of what the block's last token sees.
     const uint pos0 = split * p.chunk;
