@@ -118,6 +118,8 @@ int main(int argc, char** argv) {
     }
 
     std::vector<llama_token> prompt = tokenize(vocab, read_file(argv[3]));
+    // brisk's generate command prepends the BOS token when the model uses one; match it in eval mode.
+    if (mode == "eval" && llama_vocab_get_add_bos(vocab)) prompt.insert(prompt.begin(), llama_vocab_bos(vocab));
     const int n_vocab = llama_vocab_n_tokens(vocab);
 
     if (mode == "perplexity") {

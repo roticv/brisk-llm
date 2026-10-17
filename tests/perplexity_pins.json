@@ -38,5 +38,10 @@
     "model": "Qwen2.5-1.5B-Instruct-Q4_K_M.gguf",
     "text": "tests/perplexity_text.txt",
     "perplexity": 15.0395
+  },
+  {
+    "model": "gemma-3-1b-it-pure-Q4_0.gguf",
+    "text": "tests/perplexity_text.txt",
+    "perplexity": 46.0316
   }
 ]

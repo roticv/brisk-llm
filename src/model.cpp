@@ -99,6 +99,7 @@ void add_bias(std::span<float> x, std::span<const float> bias) {
 }
 
 float silu(float x) { return x / (1.0f + std::exp(-x)); }
+float gelu(float x) { return 0.5f * x * (1.0f + std::tanh(0.7978845608f * (x + 0.044715f * x * x * x))); }
 
 std::uint32_t require_u32(const GgufFile& file, const std::string& key) {
     const auto value = file.get<std::uint32_t>(key);
@@ -119,14 +120,22 @@ Model::Model(const GgufFile& file, bool repack) : repack_(repack) {
     if (architecture == "qwen3") config_.architecture = Architecture::Qwen3;
     else if (architecture == "qwen2") config_.architecture = Architecture::Qwen2;
     else if (architecture == "llama") config_.architecture = Architecture::Llama;
+    else if (architecture == "gemma3") config_.architecture = Architecture::Gemma3;
     else if (architecture == "bitnet" || architecture == "bitnet-b1.58") config_.architecture = Architecture::BitNet;
     else {
         fail("unsupported architecture '" + std::string(architecture.value_or("(none)")) +
-             "'; qwen3, qwen2, llama and bitnet are supported");
+             "'; qwen3, qwen2, llama, gemma3 and bitnet are supported");
     }
     const std::string prefix = std::string(*architecture) + ".";
     const bool bitnet = config_.architecture == Architecture::BitNet;
     config_.rope_neox = config_.architecture != Architecture::Llama;
+    if (config_.architecture == Architecture::Gemma3) {
+        config_.sliding_window = file.get<std::uint32_t>(prefix + "attention.sliding_window").value_or(0);
+        config_.rope_base_local = file.get<float>(prefix + "rope.freq_base_swa").value_or(10000.0f);
+        config_.rope_scale = 1.0f / file.get<float>(prefix + "rope.scaling.factor").value_or(1.0f);
+        config_.final_softcap = file.get<float>(prefix + "final_logit_softcapping").value_or(0.0f);
+        config_.gelu = true;
+    }
 
     config_.embedding_dim = require_u32(file, prefix + "embedding_length");
     config_.layer_count = require_u32(file, prefix + "block_count");
@@ -148,6 +157,7 @@ Model::Model(const GgufFile& file, bool repack) : repack_(repack) {
     config_.head_dim = file.get<std::uint32_t>(prefix + "attention.key_length")
                            .value_or(config_.embedding_dim / config_.head_count);
     if (config_.head_dim == 0 || config_.head_dim % 32 != 0) fail("head size must be a non-zero multiple of 32");
+    if (config_.architecture == Architecture::Gemma3) config_.embedding_scale = std::sqrt(static_cast<float>(config_.embedding_dim));
     if (file.get<std::uint32_t>(prefix + "attention.value_length").value_or(config_.head_dim) != config_.head_dim) {
         fail("key and value head sizes differ");
     }
@@ -188,9 +198,13 @@ Model::Model(const GgufFile& file, bool repack) : repack_(repack) {
         if (bitnet) {
             layer.attention_sub_norm = load(file, block + "attn_sub_norm.weight", embd);
             layer.feed_forward_sub_norm = load(file, block + "ffn_sub_norm.weight", ff);
-        } else if (config_.architecture == Architecture::Qwen3) {
+        } else if (config_.architecture == Architecture::Qwen3 || config_.architecture == Architecture::Gemma3) {
             layer.query_norm = load(file, block + "attn_q_norm.weight", config_.head_dim);
             layer.key_norm = load(file, block + "attn_k_norm.weight", config_.head_dim);
+        }
+        if (config_.architecture == Architecture::Gemma3) {
+            layer.attention_post_norm = load(file, block + "post_attention_norm.weight", embd);
+            layer.feed_forward_post_norm = load(file, block + "post_ffw_norm.weight", embd);
         }
         // Projection biases (Qwen2 has them; some Llama-shaped models too). All or none.
         if (file.tensor(block + "attn_q.bias") != nullptr) {
@@ -423,6 +437,7 @@ Session::Session(const Model& model, std::size_t threads, std::size_t max_contex
     gate_.resize(kMaxBatch * c.feed_forward_dim);
     up_.resize(kMaxBatch * c.feed_forward_dim);
     rope_.resize(kMaxBatch * c.head_dim);
+    rope_local_.resize(kMaxBatch * c.head_dim);
     logits_.resize(c.vocab_size);
 }
 
@@ -469,21 +484,28 @@ void Session::eval_batch(std::span<const Token> tokens, bool all_logits) {
 
     // Angles are built by repeated multiplication, as llama.cpp does, so the
     // rounding matches.
-    const float theta_scale = std::pow(c.rope_base, -2.0f / static_cast<float>(head_dim));
-    for (std::size_t t = 0; t < n; ++t) {
-        float theta = static_cast<float>(position_ + t);
-        float* rope = rope_.data() + t * head_dim;
-        for (std::size_t i = 0; i < head_dim / 2; ++i) {
-            const float angle = c.rope_factors.empty() ? theta : theta / c.rope_factors[i];
-            rope[2 * i] = std::cos(angle);
-            rope[2 * i + 1] = std::sin(angle);
-            theta *= theta_scale;
+    auto build_rope = [&](std::vector<float>& table, float base, float scale) {
+        const float theta_scale = std::pow(base, -2.0f / static_cast<float>(head_dim));
+        for (std::size_t t = 0; t < n; ++t) {
+            float theta = static_cast<float>(position_ + t) * scale;
+            float* rope = table.data() + t * head_dim;
+            for (std::size_t i = 0; i < head_dim / 2; ++i) {
+                const float angle = c.rope_factors.empty() ? theta : theta / c.rope_factors[i];
+                rope[2 * i] = std::cos(angle);
+                rope[2 * i + 1] = std::sin(angle);
+                theta *= theta_scale;
+            }
         }
-    }
+    };
+    build_rope(rope_, c.rope_base, c.rope_scale);
+    if (c.sliding_window != 0) build_rope(rope_local_, c.rope_base_local, 1.0f);
 
     for (std::size_t t = 0; t < n; ++t) {
-        embedding_row(model_.token_embedding(), static_cast<std::size_t>(tokens[t]),
-                      std::span<float>(hidden_.data() + t * embd, embd));
+        const std::span<float> h(hidden_.data() + t * embd, embd);
+        embedding_row(model_.token_embedding(), static_cast<std::size_t>(tokens[t]), h);
+        if (c.embedding_scale != 1.0f) {
+            for (float& v : h) v *= c.embedding_scale;
+        }
     }
     scores_.resize(n * c.head_count * length);
 
@@ -519,8 +541,9 @@ void Session::eval_batch(std::span<const Token> tokens, bool all_logits) {
         }
 
         Timed* phase = new Timed(profile_.norm_rope);
+        const bool slides = c.layer_slides(l);
         pool_.run(n, [&](std::size_t t) {
-            const std::span<const float> rope(rope_.data() + t * head_dim, head_dim);
+            const std::span<const float> rope((slides ? rope_local_ : rope_).data() + t * head_dim, head_dim);
             if (!layer.query_bias.empty()) {
                 add_bias({query_.data() + t * query_dim, query_dim}, layer.query_bias);
                 add_bias({new_keys + t * kv_dim, kv_dim}, layer.key_bias);
@@ -576,11 +599,13 @@ void Session::eval_batch(std::span<const Token> tokens, bool all_logits) {
                                 rows_out);
             for (std::size_t t = t0; t < t1; ++t) {
                 const std::size_t visible = position_ + t + 1;
+                // A sliding-window layer sees only the last `sliding_window` positions.
+                const std::size_t start = slides && visible > c.sliding_window ? visible - c.sliding_window : 0;
                 for (std::size_t g = 0; g < heads_per_kv; ++g) {
-                    kernels::softmax_f32(std::span<float>(score_row(t, g), visible));
+                    kernels::softmax_f32(std::span<float>(score_row(t, g) + start, visible - start));
                 }
-                kernels::weighted_sum_f32(cache_row(values, kv, 0), head_dim, visible, score_row(t, 0), length,
-                                          heads_per_kv, head_dim,
+                kernels::weighted_sum_f32(cache_row(values, kv, start), head_dim, visible - start,
+                                          score_row(t, 0) + start, length, heads_per_kv, head_dim,
                                           attended_.data() + t * query_dim + kv * heads_per_kv * head_dim);
             }
         });
@@ -597,7 +622,11 @@ void Session::eval_batch(std::span<const Token> tokens, bool all_logits) {
             const Timed timed(profile_.norm_rope);
             pool_.run(n, [&](std::size_t t) {
                 float* h = hidden_.data() + t * embd;
-                const float* p = projected_.data() + t * embd;
+                float* p = projected_.data() + t * embd;
+                if (!layer.attention_post_norm.empty()) {
+                    const std::span<float> ps(p, embd);
+                    rms_norm(ps, layer.attention_post_norm, c.rms_epsilon, ps);
+                }
                 for (std::size_t i = 0; i < embd; ++i) h[i] += p[i];
                 rms_norm(rows(hidden_, t, embd), layer.feed_forward_norm, c.rms_epsilon, rows(normed_, t, embd));
             });
@@ -616,6 +645,8 @@ void Session::eval_batch(std::span<const Token> tokens, bool all_logits) {
                         const float r = std::max(g[i], 0.0f);
                         g[i] = r * r * u[i];
                     }
+                } else if (c.gelu) {
+                    for (std::size_t i = 0; i < c.feed_forward_dim; ++i) g[i] = gelu(g[i]) * u[i];
                 } else {
                     for (std::size_t i = 0; i < c.feed_forward_dim; ++i) g[i] = silu(g[i]) * u[i];
                 }
@@ -630,7 +661,11 @@ void Session::eval_batch(std::span<const Token> tokens, bool all_logits) {
             const Timed timed(profile_.norm_rope);
             pool_.run(n, [&](std::size_t t) {
                 float* h = hidden_.data() + t * embd;
-                const float* p = projected_.data() + t * embd;
+                float* p = projected_.data() + t * embd;
+                if (!layer.feed_forward_post_norm.empty()) {
+                    const std::span<float> ps(p, embd);
+                    rms_norm(ps, layer.feed_forward_post_norm, c.rms_epsilon, ps);
+                }
                 for (std::size_t i = 0; i < embd; ++i) h[i] += p[i];
             });
         }
@@ -646,6 +681,10 @@ void Session::eval_batch(std::span<const Token> tokens, bool all_logits) {
         // Only the last token's logits are needed.
         rms_norm(rows(hidden_, n - 1, embd), model_.output_norm(), c.rms_epsilon, rows(normed_, 0, embd));
         multiply(model_.output_projection(), normed_.data(), 1, logits_.data());
+    }
+    if (c.final_softcap != 0.0f) {
+        const std::size_t count = (all_logits ? n : 1) * c.vocab_size;
+        for (std::size_t i = 0; i < count; ++i) logits_[i] = c.final_softcap * std::tanh(logits_[i] / c.final_softcap);
     }
 
     position_ += n;

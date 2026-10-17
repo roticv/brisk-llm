@@ -187,6 +187,9 @@ int cmd_generate(const GenerateOptions& options) {
             case brisk::Architecture::Qwen2:
                 text = "<|im_start|>user\n" + text + "<|im_end|>\n<|im_start|>assistant\n";
                 break;
+            case brisk::Architecture::Gemma3:
+                text = "<start_of_turn>user\n" + text + "<end_of_turn>\n<start_of_turn>model\n";
+                break;
             case brisk::Architecture::Qwen3:
                 // Qwen's ChatML turn format. An empty think block tells Qwen3 to answer directly.
                 text = "<|im_start|>user\n" + text + "<|im_end|>\n<|im_start|>assistant\n";

@@ -27,9 +27,10 @@ inline std::vector<std::string_view> pretokenize_qwen2(std::string_view text) {
     return pretokenize(text, PreTokenizer::Qwen2);
 }
 
-// Byte-level BPE tokenizer for GGUF files with tokenizer.ggml.model == "gpt2"
-// and the "qwen2" (Qwen2, Qwen2.5, Qwen3) or "llama-bpe" (Llama 3, BitNet
-// b1.58 2B4T) pre-tokenizer.
+// Tokenizer for GGUF files: byte-level BPE (tokenizer.ggml.model == "gpt2"
+// with the "qwen2" or "llama-bpe" pre-tokenizer: Qwen2/2.5/3, Llama 3,
+// BitNet) or SentencePiece (model == "llama": Gemma), the latter merging
+// adjacent pieces by vocabulary score with byte fallback, as llama.cpp does.
 class Tokenizer {
 public:
     // Throws std::runtime_error if the file has no supported tokenizer.
@@ -69,6 +70,7 @@ private:
 
     std::uint32_t intern(const std::string& bytes);
     void encode_word(std::string_view word, std::vector<Token>& out) const;
+    void encode_sentencepiece(std::string_view text, bool prefix_space, std::vector<Token>& out) const;
 
     std::vector<std::string> pieces_;  // raw bytes per token id
     std::vector<std::int32_t> types_;
@@ -76,6 +78,15 @@ private:
     std::vector<Token> end_tokens_;
     PreTokenizer pre_ = PreTokenizer::Qwen2;
     Token bos_ = -1;
+
+    // SentencePiece: the vocabulary keyed by its raw pieces (spaces as U+2581),
+    // their scores, the byte-fallback tokens, and whether a word-initial space
+    // is implied.
+    bool sentencepiece_ = false;
+    bool add_space_prefix_ = false;
+    std::unordered_map<std::string, Token> spm_pieces_;
+    std::vector<float> scores_;
+    Token byte_tokens_[256] = {};
 
     // BPE works on symbol ids. Ids below vocab_size() are token ids; higher
     // ids are merge operands or results that are not themselves tokens.

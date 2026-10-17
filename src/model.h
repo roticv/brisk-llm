@@ -21,6 +21,7 @@ enum class Architecture {
     Qwen3,   // RMS norms on Q and K per head, SiLU-gated feed-forward
     Qwen2,   // Qwen2/2.5 and the DeepSeek-R1 distils of them: Q/K/V biases, no Q/K norms
     Llama,   // Llama 3.x, Mistral, SmolLM2 and other Llama-shaped models: adjacent-pair RoPE
+    Gemma3,  // Q/K norms, norms after attention and the feed-forward, GELU gating, sliding-window layers
     BitNet,  // ternary weights, extra norms before the output projections, squared-ReLU feed-forward
 };
 
@@ -42,6 +43,17 @@ struct ModelConfig {
     // Per-frequency divisors of the RoPE angles (Llama 3's long-context
     // scaling, from rope_freqs.weight); empty when the angles are unscaled.
     std::vector<float> rope_factors;
+    // Gemma 3: every layer whose index is not 5 mod 6 attends only to the
+    // last `sliding_window` positions and uses `rope_base_local`; the global
+    // layers use rope_base scaled by `rope_scale`. 0 when no layer slides.
+    std::uint32_t sliding_window = 0;
+    float rope_base_local = 10000.0f;
+    float rope_scale = 1.0f;
+    float embedding_scale = 1.0f;     // Gemma: embeddings are multiplied by sqrt(embedding_dim)
+    float final_softcap = 0.0f;       // logits = c * tanh(logits / c) when non-zero
+    bool gelu = false;                // GELU (tanh approximation) gating instead of SiLU
+
+    bool layer_slides(std::size_t layer) const { return sliding_window != 0 && layer % 6 != 5; }
 };
 
 // A weight matrix stored row by row: `rows` outputs, each over `cols` inputs.
@@ -74,6 +86,8 @@ public:
         std::span<const float> key_bias;
         std::span<const float> value_bias;
         std::span<const float> attention_sub_norm;  // BitNet: norm of the attention result before the output projection
+        std::span<const float> attention_post_norm;  // Gemma: norm of the projected attention before the residual add
+        std::span<const float> feed_forward_post_norm;  // Gemma: the same after the down projection
         Matrix attention_output;
         std::span<const float> feed_forward_norm;
         Matrix gate;
@@ -174,7 +188,8 @@ private:
     std::vector<float> gate_;
     std::vector<float> up_;
     std::vector<float> scores_;
-    std::vector<float> rope_;  // cos, sin pairs per position in the batch
+    std::vector<float> rope_;        // cos, sin pairs per position in the batch
+    std::vector<float> rope_local_;  // the same with the sliding-window layers' base (Gemma)
     std::vector<float> logits_;
     std::vector<BlockQ8_0> q8_0_;  // activations quantised for the 32-block formats
     std::vector<BlockQ8_K> q8_k_;  // and for the K-quants

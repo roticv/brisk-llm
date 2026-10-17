@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <limits>
+#include <queue>
 #include <stdexcept>
 
 #include "unicode.h"
@@ -15,6 +16,7 @@ constexpr std::int32_t kTypeNormal = 1;
 constexpr std::int32_t kTypeUnknown = 2;
 constexpr std::int32_t kTypeControl = 3;
 constexpr std::int32_t kTypeUserDefined = 4;
+constexpr std::int32_t kTypeByte = 6;
 
 [[noreturn]] void fail(const std::string& what) { throw std::runtime_error("tokenizer: " + what); }
 
@@ -180,10 +182,18 @@ std::vector<std::string_view> pretokenize(std::string_view text, PreTokenizer pr
 Tokenizer::Tokenizer(const GgufFile& file) {
     const auto model = file.get<std::string_view>("tokenizer.ggml.model");
     const auto pre = file.get<std::string_view>("tokenizer.ggml.pre");
-    if (model != "gpt2") fail("unsupported tokenizer model '" + std::string(model.value_or("(none)")) + "'");
-    if (pre == "qwen2") pre_ = PreTokenizer::Qwen2;
-    else if (pre == "llama-bpe") pre_ = PreTokenizer::Llama3;
-    else fail("unsupported pre-tokenizer '" + std::string(pre.value_or("(none)")) + "'");
+    if (model == "llama") {
+        sentencepiece_ = true;
+        add_space_prefix_ = file.get<bool>("tokenizer.ggml.add_space_prefix").value_or(true);
+    } else if (model != "gpt2") {
+        fail("unsupported tokenizer model '" + std::string(model.value_or("(none)")) + "'");
+    } else if (pre == "qwen2") {
+        pre_ = PreTokenizer::Qwen2;
+    } else if (pre == "llama-bpe") {
+        pre_ = PreTokenizer::Llama3;
+    } else {
+        fail("unsupported pre-tokenizer '" + std::string(pre.value_or("(none)")) + "'");
+    }
 
     const auto tokens = file.get<GgufArray>("tokenizer.ggml.tokens");
     if (!tokens) fail("missing tokenizer.ggml.tokens");
@@ -200,13 +210,40 @@ Tokenizer::Tokenizer(const GgufFile& file) {
 
     const ByteDecoder decode_bytes;
     pieces_.reserve(mapped.size());
-    for (std::size_t id = 0; id < mapped.size(); ++id) {
-        // Special tokens are literal text; everything else is byte-mapped.
-        if (is_special_type(types_[id])) {
-            pieces_.emplace_back(mapped[id]);
-        } else {
-            pieces_.push_back(decode_bytes(mapped[id]));
-            symbol_ids_[pieces_.back()] = static_cast<std::uint32_t>(id);
+    if (sentencepiece_) {
+        // Pieces are text with U+2581 for spaces; byte tokens are "<0xNN>".
+        // pieces_ holds what a token decodes to, spm_pieces_ the raw form.
+        const auto scores = file.get<GgufArray>("tokenizer.ggml.scores");
+        if (!scores) fail("missing tokenizer.ggml.scores");
+        scores_ = scores->values<float>();
+        if (scores_.size() != mapped.size()) fail("scores length does not match the vocabulary");
+        for (Token& t : byte_tokens_) t = -1;
+        for (std::size_t id = 0; id < mapped.size(); ++id) {
+            const std::string_view raw = mapped[id];
+            if (types_[id] == kTypeByte && raw.size() == 6 && raw.starts_with("<0x") && raw.back() == '>') {
+                const int value = std::stoi(std::string(raw.substr(3, 2)), nullptr, 16);
+                pieces_.emplace_back(1, static_cast<char>(value));
+                byte_tokens_[value] = static_cast<Token>(id);
+                continue;
+            }
+            std::string text(raw);
+            if (!is_special_type(types_[id])) {
+                for (std::size_t at = text.find("\xe2\x96\x81"); at != std::string::npos; at = text.find("\xe2\x96\x81", at + 1)) {
+                    text.replace(at, 3, " ");
+                }
+                spm_pieces_.emplace(std::string(raw), static_cast<Token>(id));
+            }
+            pieces_.push_back(std::move(text));
+        }
+    } else {
+        for (std::size_t id = 0; id < mapped.size(); ++id) {
+            // Special tokens are literal text; everything else is byte-mapped.
+            if (is_special_type(types_[id])) {
+                pieces_.emplace_back(mapped[id]);
+            } else {
+                pieces_.push_back(decode_bytes(mapped[id]));
+                symbol_ids_[pieces_.back()] = static_cast<std::uint32_t>(id);
+            }
         }
     }
 
@@ -218,7 +255,9 @@ Tokenizer::Tokenizer(const GgufFile& file) {
     std::stable_sort(specials_.begin(), specials_.end(),
                      [](const Special& a, const Special& b) { return a.text.size() > b.text.size(); });
 
-    for (int b = 0; b < 0x100; ++b) byte_symbols_[b] = intern(std::string(1, static_cast<char>(b)));
+    if (!sentencepiece_) {
+        for (int b = 0; b < 0x100; ++b) byte_symbols_[b] = intern(std::string(1, static_cast<char>(b)));
+    }
 
     if (const auto merges = file.get<GgufArray>("tokenizer.ggml.merges")) {
         std::uint32_t rank = 0;
@@ -244,7 +283,7 @@ Tokenizer::Tokenizer(const GgufFile& file) {
     if (const auto eos = file.get<std::uint32_t>("tokenizer.ggml.eos_token_id")) add_end_token(static_cast<Token>(*eos));
     for (const Special& special : specials_) {
         if (special.text == "<|endoftext|>" || special.text == "<|im_end|>" || special.text == "<|eot_id|>" ||
-            special.text == "<|end_of_text|>") {
+            special.text == "<|end_of_text|>" || special.text == "<end_of_turn>") {
             add_end_token(special.id);
         }
     }
@@ -346,14 +385,101 @@ std::vector<Token> Tokenizer::encode(std::string_view text, bool parse_special) 
     }
 
     std::vector<Token> out;
+    bool prev_special = true;  // a word-initial space is implied at the start and after a special token
     for (const Fragment& fragment : fragments) {
         if (fragment.token >= 0) {
             out.push_back(fragment.token);
+            prev_special = true;
+            continue;
+        }
+        if (sentencepiece_) {
+            encode_sentencepiece(fragment.text, add_space_prefix_ && prev_special, out);
+            prev_special = false;
             continue;
         }
         for (const std::string_view word : pretokenize(fragment.text, pre_)) encode_word(word, out);
     }
     return out;
+}
+
+// SentencePiece encoding as llama.cpp does it: the text (spaces as U+2581)
+// is split into characters, then the adjacent pair whose concatenation is the
+// highest-scoring vocabulary piece is merged, repeatedly; what remains
+// outside the vocabulary falls back to byte tokens.
+void Tokenizer::encode_sentencepiece(std::string_view input, bool prefix_space, std::vector<Token>& out) const {
+    std::string text;
+    if (prefix_space) text = " ";
+    text += input;
+    std::string escaped;
+    for (const char c : text) {
+        if (c == ' ') escaped += "\xe2\x96\x81";
+        else escaped += c;
+    }
+
+    struct Symbol {
+        std::size_t start, length;  // in `escaped`; length 0 once merged away
+        int prev, next;
+    };
+    std::vector<Symbol> symbols;
+    for (std::size_t at = 0; at < escaped.size();) {
+        const auto lead = static_cast<unsigned char>(escaped[at]);
+        const std::size_t length = lead < 0x80 ? 1 : lead < 0xE0 ? 2 : lead < 0xF0 ? 3 : 4;
+        const std::size_t n = std::min(length, escaped.size() - at);
+        const int index = static_cast<int>(symbols.size());
+        symbols.push_back({at, n, index - 1, at + n < escaped.size() ? index + 1 : -1});
+        at += n;
+    }
+
+    struct Bigram {
+        int left, right;
+        float score;
+        std::size_t size;
+        bool operator<(const Bigram& o) const { return score < o.score || (score == o.score && left > o.left); }
+    };
+    std::priority_queue<Bigram> queue;
+    std::unordered_map<std::string, std::pair<int, int>> merged_from;
+    auto try_pair = [&](int left, int right) {
+        if (left < 0 || right < 0) return;
+        const std::string piece = escaped.substr(symbols[left].start, symbols[left].length + symbols[right].length);
+        const auto it = spm_pieces_.find(piece);
+        if (it == spm_pieces_.end()) return;
+        queue.push({left, right, scores_[static_cast<std::size_t>(it->second)], piece.size()});
+        merged_from[piece] = {left, right};
+    };
+    for (int i = 1; i < static_cast<int>(symbols.size()); ++i) try_pair(i - 1, i);
+    while (!queue.empty()) {
+        const Bigram bigram = queue.top();
+        queue.pop();
+        Symbol& left = symbols[bigram.left];
+        Symbol& right = symbols[bigram.right];
+        if (left.length == 0 || right.length == 0 || left.length + right.length != bigram.size) continue;
+        left.length += right.length;
+        right.length = 0;
+        left.next = right.next;
+        if (right.next >= 0) symbols[right.next].prev = bigram.left;
+        try_pair(left.prev, bigram.left);
+        try_pair(bigram.left, left.next);
+    }
+
+    // Emit the surviving symbols, re-splitting any that is not itself a piece.
+    auto emit = [&](auto& self, const Symbol& symbol) -> void {
+        const std::string piece = escaped.substr(symbol.start, symbol.length);
+        if (const auto it = spm_pieces_.find(piece); it != spm_pieces_.end()) {
+            out.push_back(it->second);
+            return;
+        }
+        if (const auto from = merged_from.find(piece); from != merged_from.end()) {
+            self(self, symbols[from->second.first]);
+            self(self, symbols[from->second.second]);
+            return;
+        }
+        for (const char c : piece) {
+            const Token byte = byte_tokens_[static_cast<unsigned char>(c)];
+            if (byte >= 0) out.push_back(byte);
+        }
+    };
+    if (symbols.empty()) return;
+    for (int i = 0; i >= 0; i = symbols[i].next) emit(emit, symbols[i]);
 }
 
 }  // namespace brisk
