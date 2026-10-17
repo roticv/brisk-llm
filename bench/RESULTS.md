@@ -104,6 +104,19 @@ Perplexity on the GPU matches the pin to 0.02% through the tile (batches) and 0.
 
 How the ternary gemv got from 42 to 90 GB/s, measured in isolation on the 6912x2560 gate matrix (`metal_gemv_tq2_0_seconds`): the first kernel (two rows per simdgroup, a quarter block per lane, integer shift-and-mask decode) read weights at 42 GB/s; swapping the decode for llama.cpp's float one (`floor(v / 4^l)` of the byte with telescoped activation coefficients) alone gave 50; copying llama.cpp's structure (four rows per simdgroup, two simdgroups per threadgroup, four blocks in flight with eight lanes each, coefficients shared across the rows) gave 77-82 and generation parity with llama.cpp; the same kernel with the decode removed reads at 121-131 GB/s, so the decode was the remaining cost; running the decode in half precision (exact for bytes and their floor divisions; coefficients scaled by 1/64 to stay in range, since the first attempt overflowed to inf on a long generation while the 64-token perplexity check passed) with eight rows per simdgroup reached 86-91 GB/s. Vectorising the float decode across the lane's four bytes changed nothing (the compiler had done it), and eight rows without the half decode was slower than four.
 
+#### Llama 3.2 and Qwen2.5 (Phase 6)
+
+bartowski's Q4_K_M files (Q4_K with Q6_K attention V and output), idle machine, 12-15 s pauses, two runs each shown; llama.cpp CPU at 4 threads and Metal from `llama-bench` alongside. Prompt = 497 tokens (llama-bench: 512), generation = 64 tokens from an almost empty context. Tokens/s.
+
+| | brisk CPU 4 threads | llama.cpp CPU 4 threads | brisk GPU | llama.cpp Metal |
+|---|---:|---:|---:|---:|
+| Llama-3.2-1B-Instruct, prompt | 352-396 | 321 | 1160 | 1370 |
+| Llama-3.2-1B-Instruct, generation | 82-84 | 86 | 94-101 | 104 |
+| Qwen2.5-1.5B-Instruct, prompt | 257-289 | 285 | 813-846 | 981 |
+| Qwen2.5-1.5B-Instruct, generation | 66 | 68 | 72-77 | 83 |
+
+On the CPU the new families land where Qwen3 did: generation within 3-5% of llama.cpp at 4 threads (both at the bandwidth ceiling), prompt processing level to 20% ahead. On the GPU the K-quant paths are newer and slower than the Q4_0 ones: 14-15% behind llama.cpp Metal on prompts, because the tile's K-quant staging dequantises a whole 32-value sub-block per thread in float and keeps half of it (Q4_0's path converts 16 nibbles straight to half), and 7-13% behind on generation. Those are the obvious next kernels to tune.
+
 #### Speculative decoding on the GPU
 
 Qwen3-1.7B pure Q4_0, `--gpu`, greedy, lookup (n-gram) drafting, output identical to plain decoding. The Speculator now backs off after a round with no accepted guess (plain single-token rounds, doubling up to 32, halved again on success), which is what keeps the fresh-answer penalty bounded.
