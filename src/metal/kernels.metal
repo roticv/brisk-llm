@@ -21,6 +21,7 @@ enum : uint {
     kResidual = 1,     // out = aux + acc (aux is the residual stream; out may alias it)
     kSiluMul = 2,      // out = silu(aux) * acc (aux is the gate projection)
     kReluSqrMul = 3,   // out = relu(aux)^2 * acc
+    kGeluMul = 4,      // out = gelu(aux) * acc (tanh approximation)
 };
 
 struct MatmulParams {
@@ -46,6 +47,7 @@ struct NormParams {
     uint dim;
     float eps;
     uint half_out;  // write the half buffer instead of the float one
+    uint residual;  // add the normalised row to the residual buffer instead (Gemma's post-norms)
 };
 
 inline float epilogue(uint mode, float acc, float aux) {
@@ -53,6 +55,11 @@ inline float epilogue(uint mode, float acc, float aux) {
         case kResidual: return aux + acc;
         case kSiluMul: return aux / (1.0f + exp(-aux)) * acc;
         case kReluSqrMul: { const float r = max(aux, 0.0f); return r * r * acc; }
+        case kGeluMul: {
+            // The argument is clamped: tanh is saturated by then, and the fast-math tanh overflows past it.
+            const float z = clamp(0.7978845608f * (aux + 0.044715f * aux * aux * aux), -20.0f, 20.0f);
+            return 0.5f * aux * (1.0f + tanh(z)) * acc;
+        }
         default: return acc;
     }
 }
@@ -66,6 +73,7 @@ struct RopeParams {
     uint max_context;
     float eps;
     float rope_base;
+    float rope_scale;   // multiplies the position (Gemma's global layers)
     uint has_qk_norm;   // Qwen3: RMS norm per head before RoPE
     uint neox;          // pair element i with i + head_dim/2 (else 2i with 2i + 1)
     uint has_bias;      // Qwen2: biases added to the projections first
@@ -84,6 +92,7 @@ struct AttentionParams {
     uint splits;      // position ranges per (token block, kv head); > 1 writes partials for attention_combine
     uint chunk;       // positions per split, a multiple of 8
     uint block_tokens;  // tokens per threadgroup of the batched kernel: kMaxQueries / group
+    uint window;        // a token sees only the last `window` positions (0: all)
 };
 
 // ---- embedding ---------------------------------------------------------------
@@ -93,11 +102,12 @@ kernel void embed_q4_0(device const uchar* table [[buffer(0)]],
                        device const int* tokens [[buffer(1)]],
                        device float* out [[buffer(2)]],
                        constant uint& dim [[buffer(3)]],
+                       constant float& scale [[buffer(4)]],
                        uint2 gid [[thread_position_in_grid]]) {
     const uint block = gid.x, t = gid.y;
     const uint blocks = dim / 32;
     device const Q4Block* b = (device const Q4Block*)(table + ((ulong)tokens[t] * blocks + block) * 18);
-    const float d = float(b->d);
+    const float d = float(b->d) * scale;
     device float* o = out + t * dim + block * 32;
     for (uint i = 0; i < 8; ++i) {
         const ushort w = b->qs[i];
@@ -116,6 +126,7 @@ kernel void rms_norm(device const float* x [[buffer(0)]],
                      device float* out [[buffer(2)]],
                      constant NormParams& p [[buffer(3)]],
                      device half* out_half [[buffer(4)]],
+                     device float* residual [[buffer(5)]],
                      uint row [[threadgroup_position_in_grid]],
                      uint tid [[thread_index_in_threadgroup]],
                      uint lane [[thread_index_in_simdgroup]],
@@ -130,7 +141,10 @@ kernel void rms_norm(device const float* x [[buffer(0)]],
     float total = 0.0f;
     for (uint i = 0; i < 8; ++i) total += partial[i];
     const float scale = rsqrt(total / float(p.dim) + p.eps);
-    if (p.half_out) {
+    if (p.residual) {
+        device float* r = residual + row * p.dim;
+        for (uint i = tid; i < p.dim; i += 256) r[i] += in[i] * scale * w[i];
+    } else if (p.half_out) {
         device half* o = out_half + row * p.dim;
         for (uint i = tid; i < p.dim; i += 256) o[i] = half(in[i] * scale * w[i]);
     } else {
@@ -351,13 +365,14 @@ kernel void embed_k(device const uchar* table [[buffer(0)]],
                     device const int* tokens [[buffer(1)]],
                     device float* out [[buffer(2)]],
                     constant uint& dim [[buffer(3)]],
+                    constant float& scale [[buffer(4)]],
                     uint2 gid [[thread_position_in_grid]]) {
     const uint sub = gid.x, t = gid.y;
     device const uchar* row = table + (ulong)tokens[t] * subblock_row_bytes(kEmbedFormat, dim);
     float4 v[8];
     subblock_dequant(kEmbedFormat, row, sub, v);
     device float4* o = (device float4*)(out + t * dim + sub * 32);
-    for (uint k = 0; k < 8; ++k) o[k] = v[k];
+    for (uint k = 0; k < 8; ++k) o[k] = v[k] * scale;
 }
 
 // Gemv for K-quant matrices, each matrix's format given at run time (so a
@@ -759,7 +774,7 @@ kernel void qk_norm_rope(device float* q [[buffer(0)]],
     }
     const uint half_dim = p.head_dim / 2;
     for (uint i = lane; i < half_dim; i += 32) {
-        float theta = float(position) * pow(p.rope_base, -2.0f * float(i) / float(p.head_dim));
+        float theta = float(position) * p.rope_scale * pow(p.rope_base, -2.0f * float(i) / float(p.head_dim));
         if (p.has_factors) theta /= factors[i];
         const float c = cos(theta), s = sin(theta);
         const uint a = p.neox ? i : 2 * i, b = p.neox ? i + half_dim : 2 * i + 1;
@@ -785,6 +800,9 @@ kernel void qk_norm_rope(device float* q [[buffer(0)]],
 // threadgroup memory, so each cached key and value row is read once for all
 // of them. Scores go to a scratch region of 16 rows per threadgroup.
 constant uint kMaxQueries = 16;  // tokens per block * query heads per key/value head (p.block_tokens * group)
+// Head-dimension capacity of the attention kernels: 128 or 256 (a function
+// constant, so models with small heads keep the smaller threadgroup memory).
+constant uint kAttnDim [[function_constant(5)]];
 
 kernel void attention(device const float* q [[buffer(0)]],
                       device const float* k_cache [[buffer(1)]],
@@ -797,7 +815,7 @@ kernel void attention(device const float* q [[buffer(0)]],
                       uint tid [[thread_index_in_threadgroup]],
                       uint lane [[thread_index_in_simdgroup]],
                       uint sg [[simdgroup_index_in_threadgroup]]) {
-    threadgroup float qs[kMaxQueries * 128];
+    threadgroup float qs[kMaxQueries * 256];  // only kAttnDim columns per row are used
     threadgroup float inv_sum[kMaxQueries];
     threadgroup float row_max[kMaxQueries];
     const uint kv_heads = p.kv_head_count;
@@ -817,8 +835,8 @@ kernel void attention(device const float* q [[buffer(0)]],
     device float* sc = scores + (ulong)tg * kMaxQueries * row_stride - pos0;
 
     // Query i is token t0 + i / group, head kv * group + i % group; unused rows are zero.
-    for (uint i = tid; i < kMaxQueries * 128; i += 128) {
-        const uint qi = i / 128, d = i % 128;
+    for (uint i = tid; i < kMaxQueries * kAttnDim; i += 128) {
+        const uint qi = i / kAttnDim, d = i % kAttnDim;
         const uint t = t0 + qi / group, h = kv * group + qi % group;
         qs[i] = (qi < queries && d < p.head_dim) ? q[(t * p.head_count + h) * p.head_dim + d] : 0.0f;
     }
@@ -833,8 +851,8 @@ kernel void attention(device const float* q [[buffer(0)]],
         for (uint d = 0; d < p.head_dim; d += 8) {
             simdgroup_float8x8 kb, q0, q1;
             simdgroup_load(kb, keys + pos * p.head_dim + d, p.head_dim, ulong2(0, 0), true);  // transposed: [d][pos]
-            simdgroup_load(q0, qs + d, 128);
-            simdgroup_load(q1, qs + 8 * 128 + d, 128);
+            simdgroup_load(q0, qs + d, kAttnDim);
+            simdgroup_load(q1, qs + 8 * kAttnDim + d, kAttnDim);
             simdgroup_multiply_accumulate(acc0, q0, kb, acc0);
             simdgroup_multiply_accumulate(acc1, q1, kb, acc1);
         }
@@ -848,14 +866,18 @@ kernel void attention(device const float* q [[buffer(0)]],
     // value pass can multiply whole 8-position blocks.
     const uint padded = (visible_last + 7) / 8 * 8;
     for (uint qi = sg; qi < kMaxQueries; qi += 4) {
-        const uint visible = qi < queries ? min(p.position0 + t0 + qi / group + 1, visible_last) : 0;
+        const uint own = p.position0 + t0 + qi / group + 1;  // positions the query's token has seen
+        const uint visible = qi < queries ? min(own, visible_last) : 0;
+        const uint start = (p.window != 0 && own > p.window) ? own - p.window : 0;  // sliding window
         device float* row = sc + qi * row_stride;
         float m = -INFINITY;
-        for (uint pos = pos0 + lane; pos < visible; pos += 32) m = max(m, row[pos]);
+        for (uint pos = pos0 + lane; pos < visible; pos += 32) {
+            if (pos >= start) m = max(m, row[pos]);
+        }
         m = simd_max(m) * p.scale;  // the row's maximum in scaled units (-inf when it sees nothing here)
         float sum = 0.0f;
         for (uint pos = pos0 + lane; pos < padded; pos += 32) {
-            const float e = pos < visible ? exp(row[pos] * p.scale - m) : 0.0f;
+            const float e = (pos < visible && pos >= start) ? exp(row[pos] * p.scale - m) : 0.0f;
             row[pos] = e;
             sum += e;
         }
@@ -869,10 +891,12 @@ kernel void attention(device const float* q [[buffer(0)]],
 
     // Weighted values on the matrix unit: P (16 queries x 8 positions) times
     // V (8 positions x 32 dimensions) per simdgroup, each simdgroup taking a
-    // 32-dimension slice; rows past `queries` and positions past
-    // `visible_last` carry zero weights.
-    {
-        const uint d0 = sg * 32;
+    // 32-dimension slice of a 128-dimension half (two halves for 256-wide
+    // heads); rows past `queries` and positions past `visible_last` carry
+    // zero weights.
+    threadgroup float stage[kMaxQueries * 128];
+    for (uint dbase = 0; dbase < p.head_dim; dbase += 128) {
+        const uint d0 = dbase + sg * 32;
         simdgroup_float8x8 acc[2][4];
         for (uint i = 0; i < 2; ++i) {
             for (uint j = 0; j < 4; ++j) acc[i][j] = simdgroup_float8x8(0.0f);
@@ -889,30 +913,31 @@ kernel void attention(device const float* q [[buffer(0)]],
             }
         }
         // Stage [query][dim slice] and write the queries that exist, normalised.
-        threadgroup float stage[kMaxQueries * 128];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
         for (uint i = 0; i < 2; ++i) {
-            for (uint j = 0; j < 4; ++j) simdgroup_store(acc[i][j], stage + (8 * i) * 128 + d0 + j * 8, 128);
+            for (uint j = 0; j < 4; ++j) simdgroup_store(acc[i][j], stage + (8 * i) * 128 + (sg * 32) + j * 8, 128);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
+        const uint dims = min(128u, p.head_dim - dbase);
         if (p.splits > 1) {
             // Partial result for attention_combine: unnormalised sums with the
             // row's maximum and denominator, at [token][head][split].
-            for (uint i = tid; i < queries * p.head_dim; i += 128) {
-                const uint qi = i / p.head_dim, d = i % p.head_dim;
+            for (uint i = tid; i < queries * dims; i += 128) {
+                const uint qi = i / dims, d = dbase + i % dims;
                 const uint t = t0 + qi / group, h = kv * group + qi % group;
                 const ulong slot = ((ulong)t * p.head_count + h) * p.splits + split;
-                out[slot * (p.head_dim + 2) + d] = stage[qi * 128 + d];
+                out[slot * (p.head_dim + 2) + d] = stage[qi * 128 + d - dbase];
                 if (d == 0) {
                     out[slot * (p.head_dim + 2) + p.head_dim] = row_max[qi];
                     out[slot * (p.head_dim + 2) + p.head_dim + 1] = inv_sum[qi] > 0.0f ? 1.0f / inv_sum[qi] : 0.0f;
                 }
             }
-            return;
+            continue;
         }
-        for (uint i = tid; i < queries * p.head_dim; i += 128) {
-            const uint qi = i / p.head_dim, d = i % p.head_dim;
+        for (uint i = tid; i < queries * dims; i += 128) {
+            const uint qi = i / dims, d = dbase + i % dims;
             const uint t = t0 + qi / group, h = kv * group + qi % group;
-            const float v = stage[qi * 128 + d] * inv_sum[qi];
+            const float v = stage[qi * 128 + d - dbase] * inv_sum[qi];
             out[(t * p.head_count + h) * p.head_dim + d] = v;
             if (p.write_half) out_half[(t * p.head_count + h) * p.head_dim + d] = half(v);
         }
@@ -925,7 +950,10 @@ kernel void attention(device const float* q [[buffer(0)]],
 // coalesced 512-byte read serving every query head of the group. Writes the
 // same partials as the batched kernel for attention_combine.
 constant uint kSmallChunk = 128;  // positions per split (the host dispatches ceil(visible / kSmallChunk) splits)
-constant uint kMaxGroup = 8;     // query heads per key/value head
+// Query heads per key/value head the small kernel handles: 8 with 128-wide
+// heads, 4 with 256-wide ones (the per-simdgroup sums must fit threadgroup memory).
+constant uint kD4 = kAttnDim / 128;            // float4s per lane
+constant uint kMaxGroup = kAttnDim == 256 ? 4 : 8;
 
 kernel void attention_small(device const float* q [[buffer(0)]],
                             device const float* k_cache [[buffer(1)]],
@@ -936,43 +964,53 @@ kernel void attention_small(device const float* q [[buffer(0)]],
                             uint tid [[thread_index_in_threadgroup]],
                             uint lane [[thread_index_in_simdgroup]],
                             uint sg [[simdgroup_index_in_threadgroup]]) {
-    threadgroup float sc[kMaxGroup * kSmallChunk];
-    threadgroup float4 part[4][kMaxGroup][32];  // per-simdgroup value sums, lanes' float4s (16 KB at kMaxGroup 8)
-    threadgroup float stats[kMaxGroup][2];      // max, sum per query
+    threadgroup float sc[8 * kSmallChunk];
+    // Per-simdgroup value sums: slot g * kD4 + j holds query g's float4 j of each lane (16 KB either way).
+    threadgroup float4 part[4][8][32];
+    threadgroup float stats[8][2];  // max, sum per query
     const uint group = p.head_count / p.kv_head_count;
     const uint split = tg % p.splits;
     const uint t = (tg / p.splits) / p.kv_head_count, kv = (tg / p.splits) % p.kv_head_count;
     const uint visible = p.position0 + t + 1;
+    const uint start = (p.window != 0 && visible > p.window) ? visible - p.window : 0;  // sliding window
     const uint pos0 = split * kSmallChunk, end = min(visible, pos0 + kSmallChunk);
+    const uint first = max(pos0, start);  // first position this split scores
     device const float* keys = k_cache + (ulong)kv * p.max_context * p.head_dim;
     device const float* values = v_cache + (ulong)kv * p.max_context * p.head_dim;
+    // Lane dimensions: 4 at lane * 4, and for 256-wide heads 4 more at 128 + lane * 4.
     const uint d4 = lane * 4;
     const bool has_dim = d4 < p.head_dim;
 
-    float4 qv[kMaxGroup];
+    float4 qv[8];  // slot g * kD4 + j
     for (uint g = 0; g < kMaxGroup; ++g) {
-        qv[g] = (g < group && has_dim) ? *(device const float4*)(q + (t * p.head_count + kv * group + g) * p.head_dim + d4)
-                                       : float4(0.0f);
+        for (uint j = 0; j < kD4; ++j) {
+            qv[g * kD4 + j] = (g < group && has_dim)
+                                  ? *(device const float4*)(q + (t * p.head_count + kv * group + g) * p.head_dim + d4 + 128 * j)
+                                  : float4(0.0f);
+        }
     }
 
-    // Scores: this simdgroup's positions are pos0 + sg, + 4, + 8, ...
-    for (uint pos = pos0 + sg; pos < end; pos += 4) {
-        const float4 k = has_dim ? *(device const float4*)(keys + pos * p.head_dim + d4) : float4(0.0f);
+    // Scores: this simdgroup's positions are first + sg, + 4, + 8, ...
+    for (uint pos = first + sg; pos < end; pos += 4) {
+        float4 k[2];
+        for (uint j = 0; j < kD4; ++j) k[j] = has_dim ? *(device const float4*)(keys + pos * p.head_dim + d4 + 128 * j) : float4(0.0f);
         for (uint g = 0; g < group; ++g) {
-            const float s = simd_sum(dot(qv[g], k)) * p.scale;
+            float dotp = 0.0f;
+            for (uint j = 0; j < kD4; ++j) dotp += dot(qv[g * kD4 + j], k[j]);
+            const float s = simd_sum(dotp) * p.scale;
             if (lane == 0) sc[g * kSmallChunk + pos - pos0] = s;
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Softmax statistics per query over the split (simdgroup g handles query g).
-    const uint count = end > pos0 ? end - pos0 : 0;
-    for (uint g = sg; g < group; g += 4) {  // simdgroup sg handles queries sg, sg + 4
+    // Softmax statistics per query over the split's scored positions (simdgroup sg handles queries sg, sg + 4).
+    const uint lo = first < end ? first - pos0 : 0, count = first < end ? end - pos0 : 0;
+    for (uint g = sg; g < group; g += 4) {
         float m = -INFINITY;
-        for (uint i = lane; i < count; i += 32) m = max(m, sc[g * kSmallChunk + i]);
+        for (uint i = lo + lane; i < count; i += 32) m = max(m, sc[g * kSmallChunk + i]);
         m = simd_max(m);
         float sum = 0.0f;
-        for (uint i = lane; i < count; i += 32) {
+        for (uint i = lo + lane; i < count; i += 32) {
             const float e = exp(sc[g * kSmallChunk + i] - m);
             sc[g * kSmallChunk + i] = e;
             sum += e;
@@ -986,20 +1024,29 @@ kernel void attention_small(device const float* q [[buffer(0)]],
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // Weighted values over the same positions, then the 4 simdgroups' sums are added.
-    float4 acc[kMaxGroup];
-    for (uint g = 0; g < kMaxGroup; ++g) acc[g] = float4(0.0f);
-    for (uint pos = pos0 + sg; pos < end; pos += 4) {
-        const float4 v = has_dim ? *(device const float4*)(values + pos * p.head_dim + d4) : float4(0.0f);
-        for (uint g = 0; g < group; ++g) acc[g] += sc[g * kSmallChunk + pos - pos0] * v;
+    float4 acc[8];  // slot g * kD4 + j
+    for (uint i = 0; i < 8; ++i) acc[i] = float4(0.0f);
+    for (uint pos = first + sg; pos < end; pos += 4) {
+        float4 v[2];
+        for (uint j = 0; j < kD4; ++j) v[j] = has_dim ? *(device const float4*)(values + pos * p.head_dim + d4 + 128 * j) : float4(0.0f);
+        for (uint g = 0; g < group; ++g) {
+            const float w = sc[g * kSmallChunk + pos - pos0];
+            for (uint j = 0; j < kD4; ++j) acc[g * kD4 + j] += w * v[j];
+        }
     }
-    for (uint g = 0; g < group; ++g) part[sg][g][lane] = acc[g];
+    for (uint g = 0; g < group; ++g) {
+        for (uint j = 0; j < kD4; ++j) part[sg][g * kD4 + j][lane] = acc[g * kD4 + j];
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint g = sg; g < group; g += 4) {
         if (!has_dim) break;
-        const float4 total = part[0][g][lane] + part[1][g][lane] + part[2][g][lane] + part[3][g][lane];
         const ulong slot = ((ulong)t * p.head_count + kv * group + g) * p.splits + split;
         device float* o = partial + slot * (p.head_dim + 2);
-        *(device float4*)(o + d4) = total;
+        for (uint j = 0; j < kD4; ++j) {
+            const uint e = g * kD4 + j;
+            const float4 total = part[0][e][lane] + part[1][e][lane] + part[2][e][lane] + part[3][e][lane];
+            *(device float4*)(o + d4 + 128 * j) = total;
+        }
         if (lane == 0) {
             o[p.head_dim] = stats[g][0];
             o[p.head_dim + 1] = stats[g][1];

@@ -27,7 +27,7 @@ const char* const kShaderSource =
 [[noreturn]] void fail(const std::string& what) { throw std::runtime_error("metal: " + what); }
 
 // Mirrors of the parameter structs in kernels.metal.
-enum Mode : uint32_t { kStore = 0, kResidual = 1, kSiluMul = 2, kReluSqrMul = 3 };
+enum Mode : uint32_t { kStore = 0, kResidual = 1, kSiluMul = 2, kReluSqrMul = 3, kGeluMul = 4 };
 struct MatmulParams {
     uint32_t rows, cols, n, mode, write_half;
 };
@@ -39,17 +39,17 @@ struct GemvParams {
 struct NormParams {
     uint32_t dim;
     float eps;
-    uint32_t half_out;
+    uint32_t half_out, residual;
 };
 struct RopeParams {
     uint32_t n, position0, head_count, kv_head_count, head_dim, max_context;
-    float eps, rope_base;
+    float eps, rope_base, rope_scale;
     uint32_t has_qk_norm, neox, has_bias, has_factors;
 };
 struct AttentionParams {
     uint32_t n, position0, head_count, kv_head_count, head_dim, max_context;
     float scale;
-    uint32_t write_half, splits, chunk, block_tokens;
+    uint32_t write_half, splits, chunk, block_tokens, window;
 };
 constexpr std::size_t kSmallChunk = 128;  // positions per split of a small batch's attention (as in the kernel)
 constexpr std::size_t kSmallBatch = 8;    // rows that take the gemv and the split attention
@@ -121,7 +121,8 @@ struct MetalSession::Impl {
     std::vector<id<MTLBuffer>> owned;  // tensors that had to be copied (widened norms)
 
     struct Layer {
-        Buf attn_norm, q, k, v, q_norm, k_norm, q_bias, k_bias, v_bias, attn_sub_norm, o, ffn_norm, gate, up, ffn_sub_norm, down;
+        Buf attn_norm, q, k, v, q_norm, k_norm, q_bias, k_bias, v_bias, attn_sub_norm, attn_post_norm, o, ffn_norm, gate, up,
+            ffn_sub_norm, ffn_post_norm, down;
     };
     std::vector<Layer> layers;
     Buf token_embd, output, output_norm, rope_factors;
@@ -130,7 +131,7 @@ struct MetalSession::Impl {
     // Half copies of the activations the tiled matmul reads, written by their producers.
     id<MTLBuffer> normed_h = nil, attended_h = nil, gate_h = nil;
     id<MTLBuffer> tokens = nil, x = nil, normed = nil, q = nil, k_stage = nil, v_stage = nil, attended = nil,
-                  gate = nil, scores = nil, partial = nil, logits = nil, k_cache = nil, v_cache = nil;
+                  gate = nil, proj = nil, scores = nil, partial = nil, logits = nil, k_cache = nil, v_cache = nil;
     std::vector<float> logits_out;
 
     Impl(const Model& m, std::span<const std::byte> f, std::size_t max_ctx) : model(m), file(f) {
@@ -183,8 +184,9 @@ struct MetalSession::Impl {
         matmul_mm_q41 = tile_pipeline(device, library, 4);
         embed_q41 = specialised_pipeline(device, library, "embed_k", 3, 4);
         rope = pipeline("qk_norm_rope");
-        attention = pipeline("attention");
-        attention_small = pipeline("attention_small");
+        const uint32_t attn_dim = model.config().head_dim > 128 ? 256 : 128;
+        attention = specialised_pipeline(device, library, "attention", 5, attn_dim);
+        attention_small = specialised_pipeline(device, library, "attention_small", 5, attn_dim);
         attention_combine = pipeline("attention_combine");
     }
 
@@ -218,6 +220,8 @@ struct MetalSession::Impl {
                 g.v_bias = floats(l.value_bias);
             }
             if (!l.attention_sub_norm.empty()) g.attn_sub_norm = floats(l.attention_sub_norm);
+            if (!l.attention_post_norm.empty()) g.attn_post_norm = floats(l.attention_post_norm);
+            if (!l.feed_forward_post_norm.empty()) g.ffn_post_norm = floats(l.feed_forward_post_norm);
             g.o = matrix(l.attention_output, "attn_output");
             g.ffn_norm = floats(l.feed_forward_norm);
             g.gate = matrix(l.gate, "ffn_gate");
@@ -273,12 +277,14 @@ struct MetalSession::Impl {
         v_stage = make(kMaxBatch * kvdim * 4);
         attended = make(kMaxBatch * qdim * 4);
         gate = make(kMaxBatch * ff * 4);
+        proj = make(kMaxBatch * embd * 4);  // projections that a post-norm reads before the residual add (Gemma)
         normed_h = make(kMaxBatch * embd * 2);
         attended_h = make(kMaxBatch * qdim * 2);
         gate_h = make(kMaxBatch * ff * 2);
         tiles_fit = embd % 64 == 0 && qdim % 64 == 0 && kvdim % 64 == 0 && ff % 64 == 0 && c.vocab_size % 64 == 0;
-        if (c.head_count / c.kv_head_count > 8 || c.head_dim > 128 || c.head_dim % 8 != 0) {
-            fail("attention kernel supports at most 8 query heads per key/value head and head_dim <= 128, a multiple of 8");
+        const std::size_t max_group = c.head_dim > 128 ? 4 : 8;
+        if (c.head_count / c.kv_head_count > max_group || c.head_dim > 256 || c.head_dim % 8 != 0) {
+            fail("attention kernel supports head_dim <= 256 (a multiple of 8) with at most 8 query heads per key/value head (4 above 128)");
         }
         block_tokens = std::max<std::size_t>(1, 16 / (c.head_count / c.kv_head_count));  // at most 16 query rows per threadgroup
         // 16 score rows per attention threadgroup: (batch / block_tokens) x kv heads threadgroups.
@@ -345,9 +351,24 @@ struct MetalSession::Impl {
         [enc setBuffer:in offset:in_offset atIndex:0];
         set(enc, w, 1);
         [enc setBuffer:out.f offset:out_offset atIndex:2];
-        const NormParams p{static_cast<uint32_t>(dim), model.config().rms_epsilon, tiled(rows) ? 1u : 0u};
+        const NormParams p{static_cast<uint32_t>(dim), model.config().rms_epsilon, tiled(rows) ? 1u : 0u, 0};
         bytes(enc, p, 3);
         [enc setBuffer:out.h offset:out_offset / 2 atIndex:4];
+        [enc setBuffer:out.f offset:0 atIndex:5];
+        groups(enc, rows, 256);
+    }
+
+    // residual += rms_norm(in) * w (Gemma's post-norms).
+    void encode_norm_add(id<MTLComputeCommandEncoder> enc, id<MTLBuffer> in, const Buf& w, id<MTLBuffer> residual,
+                         std::size_t rows, std::size_t dim) {
+        [enc setComputePipelineState:rms_norm];
+        set(enc, in, 0);
+        set(enc, w, 1);
+        set(enc, in, 2);
+        const NormParams p{static_cast<uint32_t>(dim), model.config().rms_epsilon, 0, 1};
+        bytes(enc, p, 3);
+        set(enc, in, 4);
+        set(enc, residual, 5);
         groups(enc, rows, 256);
     }
 
@@ -483,10 +504,16 @@ struct MetalSession::Impl {
             set(enc, x, 2);
             const uint32_t embd32 = static_cast<uint32_t>(embd);
             bytes(enc, embd32, 3);
+            bytes(enc, c.embedding_scale, 4);
             [enc dispatchThreads:MTLSizeMake(embd / 32, n, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
 
             checkpoint("embed");
-            for (std::size_t l = 0; l < layers.size(); ++l) {
+            // BRISK_GPU_LAYERS caps the layers evaluated (debugging: the logits are then meaningless).
+            static const std::size_t layer_cap = [] {
+                const char* env = std::getenv("BRISK_GPU_LAYERS");
+                return env != nullptr ? static_cast<std::size_t>(std::atoi(env)) : std::size_t(-1);
+            }();
+            for (std::size_t l = 0; l < std::min(layers.size(), layer_cap); ++l) {
                 const Layer& g = layers[l];
                 const std::size_t cache_layer = l * c.kv_head_count * max_context * c.head_dim * 4;
 
@@ -504,8 +531,10 @@ struct MetalSession::Impl {
                 set(enc, g.k_norm.buffer != nil ? g.k_norm : g.attn_norm, 4);
                 [enc setBuffer:k_cache offset:cache_layer atIndex:5];
                 [enc setBuffer:v_cache offset:cache_layer atIndex:6];
+                const bool slides = c.layer_slides(l);
                 const RopeParams rp{static_cast<uint32_t>(n), static_cast<uint32_t>(position), c.head_count, c.kv_head_count,
-                                    c.head_dim, static_cast<uint32_t>(max_context), c.rms_epsilon, c.rope_base,
+                                    c.head_dim, static_cast<uint32_t>(max_context), c.rms_epsilon,
+                                    slides ? c.rope_base_local : c.rope_base, slides ? 1.0f : c.rope_scale,
                                     g.q_norm.buffer != nil ? 1u : 0u, c.rope_neox ? 1u : 0u,
                                     g.q_bias.buffer != nil ? 1u : 0u, rope_factors.buffer != nil ? 1u : 0u};
                 bytes(enc, rp, 7);
@@ -531,7 +560,8 @@ struct MetalSession::Impl {
                 const AttentionParams ap{static_cast<uint32_t>(n), static_cast<uint32_t>(position), c.head_count,
                                          c.kv_head_count, c.head_dim, static_cast<uint32_t>(max_context),
                                          1.0f / std::sqrt(static_cast<float>(c.head_dim)),
-                                         tiled(n) && !bitnet ? 1u : 0u, splits, chunk, static_cast<uint32_t>(block_tokens)};
+                                         tiled(n) && !bitnet ? 1u : 0u, splits, chunk, static_cast<uint32_t>(block_tokens),
+                                         slides ? c.sliding_window : 0u};
                 if (small) {
                     [enc setComputePipelineState:attention_small];
                     set(enc, q, 0);
@@ -563,18 +593,29 @@ struct MetalSession::Impl {
 
                 if (bitnet) encode_norm(enc, attended, g.attn_sub_norm, attended_a, n, qdim);
                 checkpoint("norm");
-                encode_matmul(enc, {Target{&g.o, embd, x_a}}, qdim, attended_a, n, kResidual, x);
+                if (g.attn_post_norm.buffer != nil) {
+                    // Gemma: x += post_norm(o(attended)).
+                    encode_matmul(enc, {Target{&g.o, embd, Act{proj, nil}}}, qdim, attended_a, n);
+                    encode_norm_add(enc, proj, g.attn_post_norm, x, n, embd);
+                } else {
+                    encode_matmul(enc, {Target{&g.o, embd, x_a}}, qdim, attended_a, n, kResidual, x);
+                }
                 checkpoint("matmul");
 
                 encode_norm(enc, x, g.ffn_norm, normed_a, n, embd);
                 checkpoint("norm");
                 // gate, then up with the activation applied against it; BitNet
                 // normalises the product afterwards (that norm writes the half copy).
-                encode_gated(enc, g.gate, g.up, ff, embd, normed_a, n, bitnet ? kReluSqrMul : kSiluMul,
+                encode_gated(enc, g.gate, g.up, ff, embd, normed_a, n, bitnet ? kReluSqrMul : c.gelu ? kGeluMul : kSiluMul,
                              bitnet ? Act{gate, nil} : gate_a);
                 if (bitnet) encode_norm(enc, gate, g.ffn_sub_norm, gate_a, n, ff);
                 checkpoint("matmul");
-                encode_matmul(enc, {Target{&g.down, embd, x_a}}, ff, gate_a, n, kResidual, x);
+                if (g.ffn_post_norm.buffer != nil) {
+                    encode_matmul(enc, {Target{&g.down, embd, Act{proj, nil}}}, ff, gate_a, n);
+                    encode_norm_add(enc, proj, g.ffn_post_norm, x, n, embd);
+                } else {
+                    encode_matmul(enc, {Target{&g.down, embd, x_a}}, ff, gate_a, n, kResidual, x);
+                }
                 checkpoint("matmul");
             }
 
@@ -604,9 +645,31 @@ struct MetalSession::Impl {
             std::fprintf(stderr, "%s\n", line.c_str());
         }
 
+        if (std::getenv("BRISK_GPU_DEBUG") != nullptr) {
+            auto report = [&](const char* name, id<MTLBuffer> b, std::size_t count) {
+                const float* v = static_cast<const float*>(b.contents);
+                float worst = 0.0f;
+                std::size_t nans = 0;
+                for (std::size_t i = 0; i < count; ++i) {
+                    if (std::isnan(v[i]) || std::isinf(v[i])) ++nans;
+                    else worst = std::max(worst, std::fabs(v[i]));
+                }
+                std::fprintf(stderr, "  %-9s max %12.4f  non-finite %zu / %zu\n", name, worst, nans, count);
+            };
+            report("x", x, n * embd);
+            report("normed", normed, n * embd);
+            report("q", q, n * qdim);
+            report("k_stage", k_stage, n * kvdim);
+            report("attended", attended, n * qdim);
+            report("proj", proj, n * embd);
+            report("gate", gate, n * ff);
+        }
         const std::size_t count = (all_logits ? n : 1) * c.vocab_size;
         logits_out.resize(count);
         std::memcpy(logits_out.data(), logits.contents, count * sizeof(float));
+        if (c.final_softcap != 0.0f) {
+            for (float& v : logits_out) v = c.final_softcap * std::tanh(v / c.final_softcap);
+        }
         position += n;
     }
 };

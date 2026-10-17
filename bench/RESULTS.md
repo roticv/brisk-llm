@@ -119,6 +119,19 @@ On the CPU the new families land where Qwen3 did: generation within 3-5% of llam
 
 The GPU numbers above were the first K-quant kernels, 14-15% behind llama.cpp Metal on prompts and 7-13% on generation. Two changes since: the tile's K-quant staging now produces exactly the thread's 16 values in half (it dequantised a whole 32-value sub-block in float and kept half), which took the Q4_K tile from 2523 to 3013 GFLOPS in isolation (Q4_0: 3030) and Q6_K from 2141 to 2792; and the Q4_K gemv applies the sub-block's scale and minimum once per sub-block (sum of q x and sum of x) instead of per value, since it was ALU-bound (slower per byte than Q6_K). After them, paced: Llama-3.2-1B prompt 1331 (llama.cpp Metal 1370), generation 99-101 (104); Qwen2.5-1.5B prompt 900-985 (981), generation 76.5 (83). Qwen2.5's remaining gap is in its small projections (q/k/v and o at 1536 columns, where the gemv reaches only 40-85 GB/s against 90+ on the large ones; a 256-row V matrix is 32 threadgroups) and would need a different split of the work for small matrices.
 
+#### Gemma 3 1B (Phase 6)
+
+gemma-3-1b-it, pure Q4_0 made from bartowski's bf16 with `llama-quantize --pure` (the Q4_K_M downloads use Q5_0 and Q8_0, because the 1152-wide embedding is not a multiple of 256, and brisk has neither). Same conditions as the table above. Tokens/s.
+
+| | brisk CPU 4 threads | llama.cpp CPU 4 threads | brisk GPU | llama.cpp Metal |
+|---|---:|---:|---:|---:|
+| prompt | 483-562 | 684 | 1700 | 1924 |
+| generation | 104 | 117 | 102-106 | 127 |
+
+Correct (tokenizer identical on 2,160 strings; perplexity within 0.8% of llama.cpp on the CPU and 0.3% of that on the GPU; greedy output identical to llama.cpp on every test prompt with the F32 file) but 10-20% behind llama.cpp in every cell, where the other families are level. Gemma's shapes are what the kernels were not tuned for: 4 query heads of 256 dimensions over one key/value head (the attention kernels and the CPU attention tiles were sized for 128), two extra norm passes per layer, and a 262k-vocabulary output matrix that is a third of the bytes per token. Not yet measured: which of those costs the most.
+
+One GPU bug found on the way: Metal's fast-math `tanh` returns NaN for large arguments (its exp overflows), so the GELU epilogue clamps the argument; the CPU's std::tanh had hidden it.
+
 #### Speculative decoding on the GPU
 
 Qwen3-1.7B pure Q4_0, `--gpu`, greedy, lookup (n-gram) drafting, output identical to plain decoding. The Speculator now backs off after a round with no accepted guess (plain single-token rounds, doubling up to 32, halved again on success), which is what keeps the fresh-answer penalty bounded.
