@@ -51,5 +51,8 @@ double metal_gemv_tq2_0_seconds(std::size_t rows, std::size_t cols, int iteratio
 // For benchmarks: GPU seconds per multiply of a rows x cols Q4_0 matrix by n
 // activation rows, over `iterations` back-to-back dispatches of one command buffer.
 double metal_matmul_q4_0_seconds(std::size_t rows, std::size_t cols, std::size_t n, bool tiled, int iterations);
+// The same for any format the standalone matmul takes (Q4_0, Q4_1, Q4_K, Q6_K).
+double metal_matmul_seconds(WeightFormat format, std::size_t rows, std::size_t cols, std::size_t n, bool tiled,
+                            int iterations);
 
 }  // namespace brisk

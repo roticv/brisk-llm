@@ -38,7 +38,8 @@ struct GemvParams {
     uint cols;
     uint n;
     uint mode;
-    uint paired;  // rows of w0 and w1 are paired (gate/up) and combined by the epilogue
+    uint paired;      // rows of w0 and w1 are paired (gate/up) and combined by the epilogue
+    uint formats[3];  // matmul_k: each matrix's format (2 = Q4_K, 3 = Q6_K, 4 = Q4_1)
 };
 
 struct NormParams {
@@ -289,6 +290,49 @@ inline void q4_1_subblock(device const uchar* row, uint sub, thread float4 (&v)[
     }
 }
 
+// The 16 values [16 high, 16 high + 16) of sub-block `sub` of a Q4_K / Q6_K /
+// Q4_1 row as four half4s: what one thread of the tile stages per step.
+inline void q4k_half16(device const uchar* row, uint sub, uint high, thread half4 (&v)[4]) {
+    device const uchar* blk = row + (sub / 8) * 144;
+    const uint j = sub % 8;
+    uint scale, min;
+    q4k_scale_min(blk + 4, j, scale, min);
+    const half ds = half(float(*(device const half*)blk) * float(scale));
+    const half dm = half(float(*(device const half*)(blk + 2)) * float(min));
+    device const uint* q = (device const uint*)(blk + 16 + (j / 2) * 32) + high * 4;
+    const uint shift = (j % 2) * 4;
+    for (uint k = 0; k < 4; ++k) v[k] = half4(uint4(q[k]) >> (uint4(0, 8, 16, 24) + shift) & 0xF) * ds - dm;
+}
+
+inline void q6k_half16(device const uchar* row, uint sub, uint high, thread half4 (&v)[4]) {
+    device const uchar* blk = row + (sub / 8) * 210;
+    const uint j = sub % 8, half_ = j / 4, m = j % 4;
+    const half scale = half(float(*(device const half*)(blk + 208)) * float(int(as_type<char>(blk[192 + 2 * j + high]))));
+    device const ushort* ql = (device const ushort*)(blk + half_ * 64 + (m % 2) * 32) + high * 8;
+    device const ushort* qh = (device const ushort*)(blk + 128 + half_ * 32) + high * 8;
+    const uint lshift = (m / 2) * 4, hshift = 2 * m;
+    for (uint k = 0; k < 4; ++k) {
+        const uint lo = uint(ql[2 * k]) | (uint(ql[2 * k + 1]) << 16);
+        const uint hi = uint(qh[2 * k]) | (uint(qh[2 * k + 1]) << 16);
+        const uint4 q = (uint4(lo) >> (uint4(0, 8, 16, 24) + lshift) & 0xF) | ((uint4(hi) >> (uint4(0, 8, 16, 24) + hshift) & 3) << 4);
+        v[k] = (half4(q) - 32.0h) * scale;
+    }
+}
+
+inline void q41_half16(device const uchar* row, uint sub, uint high, thread half4 (&v)[4]) {
+    device const uchar* blk = row + sub * 20;
+    const half d = *(device const half*)blk, m = *(device const half*)(blk + 2);
+    device const uint* q = (device const uint*)(blk + 4);
+    const uint shift = high * 4;
+    for (uint k = 0; k < 4; ++k) v[k] = half4(uint4(q[k]) >> (uint4(0, 8, 16, 24) + shift) & 0xF) * d + m;
+}
+
+inline void subblock_half16(uint format, device const uchar* row, uint sub, uint high, thread half4 (&v)[4]) {
+    if (format == 2) q4k_half16(row, sub, high, v);
+    else if (format == 3) q6k_half16(row, sub, high, v);
+    else q41_half16(row, sub, high, v);
+}
+
 // Row stride in bytes of a format with 32-value sub-blocks: 2 = Q4_K, 3 = Q6_K, 4 = Q4_1.
 inline ulong subblock_row_bytes(uint format, uint cols) {
     return format == 2 ? (ulong)(cols / 256) * 144 : format == 3 ? (ulong)(cols / 256) * 210 : (ulong)(cols / 32) * 20;
@@ -316,11 +360,11 @@ kernel void embed_k(device const uchar* table [[buffer(0)]],
     for (uint k = 0; k < 8; ++k) o[k] = v[k];
 }
 
-// Gemv for K-quant matrices (a function constant picks the format), with
-// the dispatch shape of matmul_q4_0: one simdgroup per two rows and one
-// activation row, 4 simdgroups per threadgroup over consecutive row pairs,
-// the lanes taking 32-value sub-blocks in turn.
-constant uint kGemvFormat [[function_constant(2)]];  // 2 = Q4_K, 3 = Q6_K, 4 = Q4_1
+// Gemv for K-quant matrices, each matrix's format given at run time (so a
+// Q4_K q/k and a Q6_K v share one dispatch), with the dispatch shape of
+// matmul_q4_0: one simdgroup per two rows and one activation row, 4
+// simdgroups per threadgroup over consecutive row pairs, the lanes taking
+// 32-value sub-blocks in turn.
 
 kernel void matmul_k(device const uchar* w0 [[buffer(0)]],
                      device const uchar* w1 [[buffer(1)]],
@@ -343,15 +387,15 @@ kernel void matmul_k(device const uchar* w0 [[buffer(0)]],
     const uint t = item % p.n;
     device const uchar* w;
     device float* out;
-    uint rows;
+    uint rows, format;
     if (pair < pairs0) {
-        w = w0; out = out0; rows = p.rows[0];
+        w = w0; out = out0; rows = p.rows[0]; format = p.formats[0];
     } else if (pair < pairs0 + pairs1) {
-        pair -= pairs0; w = w1; out = out1; rows = p.rows[1];
+        pair -= pairs0; w = w1; out = out1; rows = p.rows[1]; format = p.formats[1];
     } else {
-        pair -= pairs0 + pairs1; w = w2; out = out2; rows = p.rows[2];
+        pair -= pairs0 + pairs1; w = w2; out = out2; rows = p.rows[2]; format = p.formats[2];
     }
-    const ulong row_bytes = subblock_row_bytes(kGemvFormat, p.cols);
+    const ulong row_bytes = subblock_row_bytes(format, p.cols);
     const uint row0 = paired ? pair : pair * 2;
     const bool two = paired || row0 + 1 < rows;
     device const uchar* wrow0 = w + row0 * row_bytes;
@@ -361,9 +405,34 @@ kernel void matmul_k(device const uchar* w0 [[buffer(0)]],
 
     float acc0 = 0.0f, acc1 = 0.0f;
     for (uint sub = lane; sub < subs; sub += 32) {
+        if (format == 2) {
+            // Q4_K: sum(q x) and sum(x) per sub-block, scaled once: value = d scale q - dmin min.
+            const uint j = sub % 8;
+            device const uchar* blk0 = wrow0 + (sub / 8) * 144;
+            device const uchar* blk1 = wrow1 + (sub / 8) * 144;
+            uint sc0, mn0, sc1, mn1;
+            q4k_scale_min(blk0 + 4, j, sc0, mn0);
+            q4k_scale_min(blk1 + 4, j, sc1, mn1);
+            device const uint* q0 = (device const uint*)(blk0 + 16 + (j / 2) * 32);
+            device const uint* q1 = (device const uint*)(blk1 + 16 + (j / 2) * 32);
+            const uint shift = (j % 2) * 4;
+            float4 s0 = 0.0f, s1 = 0.0f, xs = 0.0f;
+            for (uint k = 0; k < 8; ++k) {
+                const float4 xv = xrow[sub * 8 + k];
+                xs += xv;
+                s0 = fma(float4(uint4(q0[k]) >> (uint4(0, 8, 16, 24) + shift) & 0xF), xv, s0);
+                s1 = fma(float4(uint4(q1[k]) >> (uint4(0, 8, 16, 24) + shift) & 0xF), xv, s1);
+            }
+            const float xsum = (xs.x + xs.y) + (xs.z + xs.w);
+            const float d0 = float(*(device const half*)blk0), dm0 = float(*(device const half*)(blk0 + 2));
+            const float d1 = float(*(device const half*)blk1), dm1 = float(*(device const half*)(blk1 + 2));
+            acc0 += d0 * float(sc0) * ((s0.x + s0.y) + (s0.z + s0.w)) - dm0 * float(mn0) * xsum;
+            acc1 += d1 * float(sc1) * ((s1.x + s1.y) + (s1.z + s1.w)) - dm1 * float(mn1) * xsum;
+            continue;
+        }
         float4 va[8], vb[8];
-        subblock_dequant(kGemvFormat, wrow0, sub, va);
-        subblock_dequant(kGemvFormat, wrow1, sub, vb);
+        subblock_dequant(format, wrow0, sub, va);
+        subblock_dequant(format, wrow1, sub, vb);
         float4 s0 = 0.0f, s1 = 0.0f;
         for (uint i = 0; i < 8; ++i) {
             const float4 xv = xrow[sub * 8 + i];
@@ -561,10 +630,10 @@ kernel void matmul_q4_0_mm(device const uchar* w [[buffer(0)]],
     ushort wq[8];
     half4 xv[4];
     uint tl = 0;  // ternary: the bit pair of this step's 32 columns
-    float4 kv[8];  // K-quants: the step's sub-block, dequantised at load
+    half4 kv[4];  // K-quants: this thread's 16 values of the step's sub-block, dequantised at load
     auto load = [&](uint b) {
         if (kquant) {
-            subblock_dequant(kTileFormat, wrow, b, kv);
+            subblock_half16(kTileFormat, wrow, b, high, kv);
         } else if (ternary) {
             // Columns [32 b, + 32) are bit pair l of bytes j .. j + 31 of block 32 b / 256;
             // this thread's 16 columns are bytes j + 16 high .. + 15: 4 words.
@@ -585,7 +654,7 @@ kernel void matmul_q4_0_mm(device const uchar* w [[buffer(0)]],
     auto store = [&]() {
         for (uint k = 0; k < 4; ++k) {
             const uint wv = uint(wq[2 * k]) | (uint(wq[2 * k + 1]) << 16);
-            const half4 v = kquant ? half4(kv[high * 4 + k])
+            const half4 v = kquant ? kv[k]
                             : ternary ? (half4(extract_bits(uint4(wv) >> uint4(0, 8, 16, 24), 2 * tl, 2)) - 1.0h) * wd
                                       : (half4(uint4(wv) >> (uint4(0, 8, 16, 24) + shift) & 0xF) - 8.0h) * wd;
             // Elements 4k .. 4k+3 of this half: k index 4k + j; block 4k/8, row within block 4k%8 + j.

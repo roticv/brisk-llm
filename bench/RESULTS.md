@@ -115,7 +115,9 @@ bartowski's Q4_K_M files (Q4_K with Q6_K attention V and output), idle machine, 
 | Qwen2.5-1.5B-Instruct, prompt | 257-289 | 285 | 813-846 | 981 |
 | Qwen2.5-1.5B-Instruct, generation | 66 | 68 | 72-77 | 83 |
 
-On the CPU the new families land where Qwen3 did: generation within 3-5% of llama.cpp at 4 threads (both at the bandwidth ceiling), prompt processing level to 20% ahead. On the GPU the K-quant paths are newer and slower than the Q4_0 ones: 14-15% behind llama.cpp Metal on prompts, because the tile's K-quant staging dequantises a whole 32-value sub-block per thread in float and keeps half of it (Q4_0's path converts 16 nibbles straight to half), and 7-13% behind on generation. Those are the obvious next kernels to tune.
+On the CPU the new families land where Qwen3 did: generation within 3-5% of llama.cpp at 4 threads (both at the bandwidth ceiling), prompt processing level to 20% ahead.
+
+The GPU numbers above were the first K-quant kernels, 14-15% behind llama.cpp Metal on prompts and 7-13% on generation. Two changes since: the tile's K-quant staging now produces exactly the thread's 16 values in half (it dequantised a whole 32-value sub-block in float and kept half), which took the Q4_K tile from 2523 to 3013 GFLOPS in isolation (Q4_0: 3030) and Q6_K from 2141 to 2792; and the Q4_K gemv applies the sub-block's scale and minimum once per sub-block (sum of q x and sum of x) instead of per value, since it was ALU-bound (slower per byte than Q6_K). After them, paced: Llama-3.2-1B prompt 1331 (llama.cpp Metal 1370), generation 99-101 (104); Qwen2.5-1.5B prompt 900-985 (981), generation 76.5 (83). Qwen2.5's remaining gap is in its small projections (q/k/v and o at 1536 columns, where the gemv reaches only 40-85 GB/s against 90+ on the large ones; a 256-row V matrix is 32 threadgroups) and would need a different split of the work for small matrices.
 
 #### Speculative decoding on the GPU
 

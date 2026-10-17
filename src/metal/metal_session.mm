@@ -34,6 +34,7 @@ struct MatmulParams {
 struct GemvParams {
     uint32_t rows[3];
     uint32_t cols, n, mode, paired;
+    uint32_t formats[3];
 };
 struct NormParams {
     uint32_t dim;
@@ -79,16 +80,14 @@ id<MTLComputePipelineState> specialised_pipeline(id<MTLDevice> device, id<MTLLib
     return pso;
 }
 
-// The K-quant gemv specialised for a format (2 = Q4_K, 3 = Q6_K).
-id<MTLComputePipelineState> kquant_gemv_pipeline(id<MTLDevice> device, id<MTLLibrary> library, uint32_t format) {
-    MTLFunctionConstantValues* constants = [MTLFunctionConstantValues new];
-    [constants setConstantValue:&format type:MTLDataTypeUInt atIndex:2];
-    NSError* error = nil;
-    id<MTLFunction> fn = [library newFunctionWithName:@"matmul_k" constantValues:constants error:&error];
-    if (fn == nil) fail(std::string("K-quant gemv specialisation: ") + error.localizedDescription.UTF8String);
-    id<MTLComputePipelineState> pso = [device newComputePipelineStateWithFunction:fn error:&error];
-    if (pso == nil) fail(std::string("K-quant gemv pipeline: ") + error.localizedDescription.UTF8String);
-    return pso;
+// The format id the K-quant kernels take at run time (0 for the formats with their own kernels).
+uint32_t kquant_format_id(WeightFormat f) {
+    switch (f) {
+        case WeightFormat::Q4_K: return 2;
+        case WeightFormat::Q6_K: return 3;
+        case WeightFormat::Q4_1: return 4;
+        default: return 0;
+    }
 }
 
 // A tensor on the GPU: a buffer and a byte offset into it.
@@ -110,7 +109,7 @@ struct MetalSession::Impl {
 
     id<MTLDevice> device = nil;
     id<MTLCommandQueue> queue = nil;
-    id<MTLComputePipelineState> embed = nil, embed_q4k = nil, embed_q6k = nil, embed_q41 = nil, rms_norm = nil, matmul = nil, matmul_tq2 = nil, matmul_q4k = nil,
+    id<MTLComputePipelineState> embed = nil, embed_q4k = nil, embed_q6k = nil, embed_q41 = nil, rms_norm = nil, matmul_kq = nil, matmul = nil, matmul_tq2 = nil, matmul_q4k = nil,
                                 matmul_q6k = nil, matmul_q41 = nil, matmul_mm = nil, matmul_mm_tq2 = nil,
                                 matmul_mm_q4k = nil, matmul_mm_q6k = nil, matmul_mm_q41 = nil, rope = nil,
                                 attention = nil,
@@ -180,9 +179,7 @@ struct MetalSession::Impl {
         matmul_mm_q6k = tile_pipeline(device, library, 3);
         embed_q4k = specialised_pipeline(device, library, "embed_k", 3, 2);
         embed_q6k = specialised_pipeline(device, library, "embed_k", 3, 3);
-        matmul_q4k = kquant_gemv_pipeline(device, library, 2);
-        matmul_q6k = kquant_gemv_pipeline(device, library, 3);
-        matmul_q41 = kquant_gemv_pipeline(device, library, 4);
+        matmul_kq = pipeline("matmul_k");
         matmul_mm_q41 = tile_pipeline(device, library, 4);
         embed_q41 = specialised_pipeline(device, library, "embed_k", 3, 4);
         rope = pipeline("qk_norm_rope");
@@ -335,9 +332,9 @@ struct MetalSession::Impl {
     id<MTLComputePipelineState> gemv_for(WeightFormat f) const {
         switch (f) {
             case WeightFormat::TQ2_0: return matmul_tq2;
-            case WeightFormat::Q4_K: return matmul_q4k;
-            case WeightFormat::Q6_K: return matmul_q6k;
-            case WeightFormat::Q4_1: return matmul_q41;
+            case WeightFormat::Q4_K:
+            case WeightFormat::Q6_K:
+            case WeightFormat::Q4_1: return matmul_kq;
             default: return matmul;
         }
     }
@@ -382,7 +379,9 @@ struct MetalSession::Impl {
         set(enc, up_w, 2);
         set(enc, in.f, 3);
         for (NSUInteger i = 4; i < 7; ++i) set(enc, out.f, i);
-        const GemvParams p{{static_cast<uint32_t>(rows), 0, 0}, static_cast<uint32_t>(cols), static_cast<uint32_t>(n), mode, 1};
+        const uint32_t fid = kquant_format_id(gate_w.format);
+        const GemvParams p{{static_cast<uint32_t>(rows), 0, 0}, static_cast<uint32_t>(cols), static_cast<uint32_t>(n), mode, 1,
+                           {fid, fid, fid}};
         bytes(enc, p, 7);
         set(enc, in.f, 8);
         // Ternary: groups of kTernaryRows / 2 rows (of both matrices), 2 simdgroups per threadgroup.
@@ -408,22 +407,24 @@ struct MetalSession::Impl {
             }
             return;
         }
-        // One dispatch per weight format (a Q4_K_M file mixes Q4_K and Q6_K in a layer).
+        // One dispatch per kernel: the K-quant kernel takes a format per matrix
+        // (a Q4_K_M file mixes Q4_K and Q6_K in a layer), the others one format.
         const WeightFormat format = targets.begin()->w->format;
         bool mixed = false;
-        for (const Target& t : targets) mixed |= t.w->format != format;
+        for (const Target& t : targets) mixed |= gemv_for(t.w->format) != gemv_for(format);
         if (mixed) {
             for (const Target& t : targets) encode_matmul(enc, {t}, cols, in, n, mode, aux);
             return;
         }
         const bool ternary = format == WeightFormat::TQ2_0;
         [enc setComputePipelineState:gemv_for(format)];
-        GemvParams p{{0, 0, 0}, static_cast<uint32_t>(cols), static_cast<uint32_t>(n), mode, 0};
+        GemvParams p{{0, 0, 0}, static_cast<uint32_t>(cols), static_cast<uint32_t>(n), mode, 0, {0, 0, 0}};
         std::size_t pairs = 0, i = 0;  // row groups: pairs, or kTernaryRows for TQ2_0
         for (const Target& t : targets) {
             set(enc, *t.w, i);
             set(enc, t.out.f, 4 + i);
             p.rows[i] = static_cast<uint32_t>(t.rows);
+            p.formats[i] = kquant_format_id(t.w->format);
             pairs += ternary ? (t.rows + kTernaryRows - 1) / kTernaryRows : (t.rows + 1) / 2;
             ++i;
         }
@@ -459,6 +460,7 @@ struct MetalSession::Impl {
         const Act x_a{x, nil}, q_a{q, nil}, k_a{k_stage, nil}, v_a{v_stage, nil}, logits_a{logits, nil};
 
         @autoreleasepool {
+            const auto encode_start = std::chrono::steady_clock::now();
             id<MTLCommandBuffer> cb = [queue commandBuffer];
             id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
             // In profile mode, ends the current command buffer, waits, and charges its time to `name`.
@@ -591,7 +593,9 @@ struct MetalSession::Impl {
             if (cb.error != nil) fail(std::string("command buffer failed: ") + cb.error.localizedDescription.UTF8String);
             if (timing) {
                 const double wall = std::chrono::duration<double>(std::chrono::steady_clock::now() - commit_time).count();
-                std::fprintf(stderr, "gpu batch of %zu: gpu %.4f s, commit-to-done %.4f s\n", n, cb.GPUEndTime - cb.GPUStartTime, wall);
+                const double encode = std::chrono::duration<double>(commit_time - encode_start).count();
+                std::fprintf(stderr, "gpu batch of %zu: encode %.4f s, gpu %.4f s, commit-to-done %.4f s\n", n, encode,
+                             cb.GPUEndTime - cb.GPUStartTime, wall);
             }
         }
         if (profiling) {
@@ -652,6 +656,7 @@ struct StandaloneMatmul {
     id<MTLCommandQueue> queue = nil;
     id<MTLLibrary> library = nil;
     id<MTLComputePipelineState> gemv = nil, mm = nil;
+    uint32_t format = 0;  // the K-quant format id, when selected
 
     StandaloneMatmul() {
         device = MTLCreateSystemDefaultDevice();
@@ -682,11 +687,14 @@ struct StandaloneMatmul {
             default: return 0;
         }
     }
-    void select(WeightFormat format) {
-        if (format == WeightFormat::Q4_0) return;
-        const uint32_t id = format_id(format);
+    void select(WeightFormat f) {
+        if (f == WeightFormat::Q4_0) return;
+        const uint32_t id = format_id(f);
         if (id == 0) fail("the standalone matmul takes Q4_0, Q4_1, Q4_K or Q6_K");
-        gemv = kquant_gemv_pipeline(device, library, id);
+        NSError* error = nil;
+        gemv = [device newComputePipelineStateWithFunction:[library newFunctionWithName:@"matmul_k"] error:&error];
+        if (gemv == nil) fail("K-quant gemv pipeline");
+        format = id;
         mm = tile_pipeline(device, library, id);
     }
 
@@ -709,7 +717,8 @@ struct StandaloneMatmul {
                 [enc setBuffer:out offset:0 atIndex:4 + i];
             }
             [enc setBuffer:in offset:0 atIndex:3];
-            const GemvParams p{{static_cast<uint32_t>(rows), 0, 0}, static_cast<uint32_t>(cols), static_cast<uint32_t>(n), kStore, 0};
+            const GemvParams p{{static_cast<uint32_t>(rows), 0, 0}, static_cast<uint32_t>(cols), static_cast<uint32_t>(n), kStore, 0,
+                               {format, format, format}};
             [enc setBytes:&p length:sizeof(p) atIndex:7];
             [enc setBuffer:in offset:0 atIndex:8];
             [enc dispatchThreadgroups:MTLSizeMake(((rows + 1) / 2 * n + 3) / 4, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
@@ -743,9 +752,16 @@ std::vector<float> metal_matmul(WeightFormat format, std::span<const std::byte> 
 }
 
 double metal_matmul_q4_0_seconds(std::size_t rows, std::size_t cols, std::size_t n, bool tiled, int iterations) {
+    return metal_matmul_seconds(WeightFormat::Q4_0, rows, cols, n, tiled, iterations);
+}
+
+double metal_matmul_seconds(WeightFormat format, std::size_t rows, std::size_t cols, std::size_t n, bool tiled,
+                            int iterations) {
     @autoreleasepool {
         StandaloneMatmul m;
-        id<MTLBuffer> w = [m.device newBufferWithLength:rows * cols / 32 * 18 options:MTLResourceStorageModeShared];
+        m.select(format);
+        id<MTLBuffer> w = [m.device newBufferWithLength:rows * cols / block_elements(format) * block_bytes(format)
+                                                options:MTLResourceStorageModeShared];
         id<MTLBuffer> in = [m.device newBufferWithLength:n * cols * 4 options:MTLResourceStorageModeShared];
         id<MTLBuffer> half_in = [m.device newBufferWithLength:n * cols * 2 options:MTLResourceStorageModeShared];
         id<MTLBuffer> out = [m.device newBufferWithLength:rows * n * 4 options:MTLResourceStorageModeShared];
@@ -786,7 +802,7 @@ double metal_gemv_tq2_0_seconds(std::size_t rows, std::size_t cols, int iteratio
         }
         [enc setBuffer:in offset:0 atIndex:3];
         [enc setBuffer:in offset:0 atIndex:8];
-        const GemvParams p{{static_cast<uint32_t>(rows), 0, 0}, static_cast<uint32_t>(cols), 1, kStore, 0};
+        const GemvParams p{{static_cast<uint32_t>(rows), 0, 0}, static_cast<uint32_t>(cols), 1, kStore, 0, {0, 0, 0}};
         [enc setBytes:&p length:sizeof(p) atIndex:7];
         const std::size_t groups = (rows + kTernaryRows - 1) / kTernaryRows;
         for (int i = 0; i < iterations; ++i) {
