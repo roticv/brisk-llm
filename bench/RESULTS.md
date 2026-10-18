@@ -145,14 +145,16 @@ One GPU bug found on the way: Metal's fast-math `tanh` returns NaN for large arg
 
 #### Gemma 4 E2B (Phase 6)
 
-ggml-org's gemma-4-E2B-it Q4_0 (4.6B parameters in the file, 2.3B effective: half is the per-layer embedding table, of which a token reads one row). CPU only so far. Same conditions as the tables above.
+ggml-org's gemma-4-E2B-it Q4_0 (4.6B parameters in the file, 2.3B effective: half is the per-layer embedding table, of which a token reads one row). Same conditions as the tables above; the GPU prompt figure is with `--warmup` (the first pass over this model pages in 2.9 GB of mmap, 0.25 s on top of a 0.75 s batch).
 
-| | brisk CPU 4 threads | llama.cpp CPU 4 threads |
-|---|---:|---:|
-| prompt | 168-219 | 182 |
-| generation | 42.5 | 41.8 |
+| | brisk CPU 4 threads | llama.cpp CPU 4 threads | brisk GPU | llama.cpp Metal |
+|---|---:|---:|---:|---:|
+| prompt | 168-219 | 182 | 609-629 | 719 |
+| generation | 42.5 | 41.8 | 50-55 | 54.5 |
 
-Tokenizer identical to llama.cpp on 2,178 strings; perplexity 128.85 against llama.cpp's 127.78 on the 1,650-token text (0.8%) and 5.094 against 5.075 on the 512-token one, which between them exercise the 512-token windows, the K/V-sharing layers and the 512-wide global heads. The GPU path refuses the model: its attention kernels take heads up to 256 wide, and it has neither the K/V sharing nor the per-layer embeddings.
+Tokenizer identical to llama.cpp on 2,178 strings; CPU perplexity 128.85 against llama.cpp's 127.78 on the 1,650-token text (0.8%) and 5.094 against 5.075 on the 512-token one, which between them exercise the 512-token windows, the K/V-sharing layers and the 512-wide global heads; GPU 130.3 and 5.088 (float activations, as with the other models).
+
+Where the GPU's 18.3 ms per token goes (profiled per kernel class): gate/up 6.4, output 4.2 (the tied Q8_0 embedding, 430 MB at 102 GB/s), down 3.4, q/kv 1.3, o 1.3, attention 0.55, per-layer embeddings 0.5, rope 0.35. The 1536-row matrices (down, o) stream at 87-94 GB/s against 104-114 for the taller ones: 1536 rows is 384 simdgroups at 4 rows each, too few to hide latency, and halving the rows per simdgroup made it worse rather than better. The softcap moved from the CPU (262,144 `tanh` calls between batches, about 1 ms) to a kernel. The bandwidth floor at 110 GB/s would be ~15 ms (65 tokens/s); both engines sit at ~18.
 
 #### Speculative decoding on the GPU
 
