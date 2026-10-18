@@ -22,6 +22,7 @@ enum class Architecture {
     Qwen2,   // Qwen2/2.5 and the DeepSeek-R1 distils of them: Q/K/V biases, no Q/K norms
     Llama,   // Llama 3.x, Mistral, SmolLM2 and other Llama-shaped models: adjacent-pair RoPE
     Gemma3,  // Q/K norms, norms after attention and the feed-forward, GELU gating, sliding-window layers
+    Gemma4,  // Gemma 3 plus per-layer embeddings, K/V sharing, wider global heads, no attention scaling
     BitNet,  // ternary weights, extra norms before the output projections, squared-ReLU feed-forward
 };
 
@@ -53,7 +54,31 @@ struct ModelConfig {
     float final_softcap = 0.0f;       // logits = c * tanh(logits / c) when non-zero
     bool gelu = false;                // GELU (tanh approximation) gating instead of SiLU
 
-    bool layer_slides(std::size_t layer) const { return sliding_window != 0 && layer % 6 != 5; }
+    // Gemma 4: which layers slide comes from the file; the local layers' head
+    // size may differ from the global ones' (head_dim); the last layers share
+    // the K/V cache of the last layer of their kind before kv_from_start;
+    // the feed-forward width varies per layer; per-layer embeddings of
+    // ple_dim modulate the residual after each layer.
+    std::vector<std::uint8_t> sliding_pattern;  // 1 = sliding, per layer (empty: every layer but each sixth)
+    std::uint32_t head_dim_local = 0;           // 0: same as head_dim
+    std::uint32_t kv_from_start = 0;            // 0: every layer has its own K/V
+    std::vector<std::uint32_t> ff_dims;         // empty: feed_forward_dim for all
+    std::uint32_t ple_dim = 0;
+    float attention_scale = 0.0f;               // 0: 1 / sqrt(head size)
+    bool value_norm = false;                    // Gemma 4: V is RMS-normalised (no weight) before the cache
+
+    bool layer_slides(std::size_t layer) const {
+        if (!sliding_pattern.empty()) return sliding_pattern[layer] != 0;
+        return sliding_window != 0 && layer % 6 != 5;
+    }
+    std::uint32_t head_dim_of(std::size_t layer) const {
+        return head_dim_local != 0 && layer_slides(layer) ? head_dim_local : head_dim;
+    }
+    std::size_t kv_layer_of(std::size_t layer) const {
+        if (kv_from_start == 0 || layer < kv_from_start) return layer;
+        return kv_from_start - (layer_slides(layer) ? 2 : 1);
+    }
+    std::uint32_t ff_dim_of(std::size_t layer) const { return ff_dims.empty() ? feed_forward_dim : ff_dims[layer]; }
 };
 
 // A weight matrix stored row by row: `rows` outputs, each over `cols` inputs.
@@ -94,6 +119,12 @@ public:
         Matrix up;
         std::span<const float> feed_forward_sub_norm;  // BitNet: norm of gate*up before the down projection
         Matrix down;
+        // Gemma 4: per-layer embedding gate (ple_dim x embd), projection (embd x
+        // ple_dim) and the norm of its result; the layer output's scalar.
+        Matrix ple_gate;
+        Matrix ple_proj;
+        std::span<const float> ple_post_norm;
+        float out_scale = 1.0f;
     };
 
     // The buffer `file` was parsed from must outlive the model. Throws
@@ -108,6 +139,11 @@ public:
     const ModelConfig& config() const { return config_; }
     const Matrix& token_embedding() const { return token_embedding_; }
     const Matrix& output_projection() const { return output_projection_; }
+    // Gemma 4's per-layer embeddings: the table (vocab x ple_dim * layers), the
+    // projection of the input embedding (ple_dim * layers x embd) and its norm (ple_dim).
+    const Matrix& ple_token_embedding() const { return ple_token_embedding_; }
+    const Matrix& ple_model_proj() const { return ple_model_proj_; }
+    std::span<const float> ple_proj_norm() const { return ple_proj_norm_; }
     std::span<const float> output_norm() const { return output_norm_; }
     const std::vector<Layer>& layers() const { return layers_; }
 
@@ -118,6 +154,9 @@ private:
     ModelConfig config_;
     Matrix token_embedding_;
     Matrix output_projection_;
+    Matrix ple_token_embedding_;
+    Matrix ple_model_proj_;
+    std::span<const float> ple_proj_norm_;
     std::span<const float> output_norm_;
     std::vector<Layer> layers_;
     bool repack_ = true;
@@ -190,6 +229,8 @@ private:
     std::vector<float> scores_;
     std::vector<float> rope_;        // cos, sin pairs per position in the batch
     std::vector<float> rope_local_;  // the same with the sliding-window layers' base (Gemma)
+    std::vector<float> ple_;         // Gemma 4: per-layer embedding inputs, [token][layer][ple_dim]
+    std::vector<float> ple_gate_;    // and the gated values of one layer, [token][ple_dim]
     std::vector<float> logits_;
     std::vector<BlockQ8_0> q8_0_;  // activations quantised for the 32-block formats
     std::vector<BlockQ8_K> q8_k_;  // and for the K-quants

@@ -47,6 +47,11 @@
   {
     "model": "gemma-3-1b-it-Q4_K_M.gguf",
     "text": "tests/perplexity_text.txt",
-    "perplexity": 40.4216
+    "perplexity": 40.565
+  },
+  {
+    "model": "gemma-4-E2B-it-Q4_0.gguf",
+    "text": "tests/perplexity_text.txt",
+    "perplexity": 103.0144
   }
 ]

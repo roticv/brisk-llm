@@ -83,6 +83,10 @@ void rms_norm(std::span<const float> x, std::span<const float> weight, float eps
     for (const float v : x) sum += static_cast<double>(v * v);  // squared in float, as llama.cpp does
     const float mean = static_cast<float>(sum / static_cast<double>(x.size()));
     const float scale = 1.0f / std::sqrt(mean + epsilon);
+    if (weight.empty()) {  // no weight: plain normalisation (Gemma 4's V)
+        for (std::size_t i = 0; i < x.size(); ++i) out[i] = x[i] * scale;
+        return;
+    }
     for (std::size_t i = 0; i < x.size(); ++i) out[i] = x[i] * scale * weight[i];
 }
 
@@ -128,27 +132,66 @@ Model::Model(const GgufFile& file, bool repack) : repack_(repack) {
     else if (architecture == "qwen2") config_.architecture = Architecture::Qwen2;
     else if (architecture == "llama") config_.architecture = Architecture::Llama;
     else if (architecture == "gemma3") config_.architecture = Architecture::Gemma3;
+    else if (architecture == "gemma4") config_.architecture = Architecture::Gemma4;
     else if (architecture == "bitnet" || architecture == "bitnet-b1.58") config_.architecture = Architecture::BitNet;
     else {
         fail("unsupported architecture '" + std::string(architecture.value_or("(none)")) +
-             "'; qwen3, qwen2, llama, gemma3 and bitnet are supported");
+             "'; qwen3, qwen2, llama, gemma3, gemma4 and bitnet are supported");
     }
     const std::string prefix = std::string(*architecture) + ".";
     const bool bitnet = config_.architecture == Architecture::BitNet;
     config_.rope_neox = config_.architecture != Architecture::Llama;
-    if (config_.architecture == Architecture::Gemma3) {
+    const bool gemma = config_.architecture == Architecture::Gemma3 || config_.architecture == Architecture::Gemma4;
+    if (gemma) {
         config_.sliding_window = file.get<std::uint32_t>(prefix + "attention.sliding_window").value_or(0);
         config_.rope_base_local = file.get<float>(prefix + "rope.freq_base_swa").value_or(10000.0f);
         config_.rope_scale = 1.0f / file.get<float>(prefix + "rope.scaling.factor").value_or(1.0f);
         config_.final_softcap = file.get<float>(prefix + "final_logit_softcapping").value_or(0.0f);
         config_.gelu = true;
     }
+    if (config_.architecture == Architecture::Gemma4) {
+        if (const auto pattern = file.get<GgufArray>(prefix + "attention.sliding_window_pattern")) {
+            // A bool array: one byte per entry.
+            if (pattern->elem_type != GgufType::Bool) fail("sliding_window_pattern is not a bool array");
+            for (const std::byte b : pattern->data.subspan(0, static_cast<std::size_t>(pattern->count))) {
+                config_.sliding_pattern.push_back(b != std::byte{0} ? 1 : 0);
+            }
+        }
+        config_.head_dim_local = file.get<std::uint32_t>(prefix + "attention.key_length_swa").value_or(0);
+        const std::uint32_t shared = file.get<std::uint32_t>(prefix + "attention.shared_kv_layers").value_or(0);
+        config_.ple_dim = file.get<std::uint32_t>(prefix + "embedding_length_per_layer_input").value_or(0);
+        config_.attention_scale = 1.0f;
+        config_.value_norm = true;
+        if (const auto ff = file.get<GgufArray>(prefix + "feed_forward_length")) {
+            const auto widths = ff->elem_type == GgufType::I32 ? ff->values<std::int32_t>()
+                                                                : std::vector<std::int32_t>();
+            if (widths.empty()) {
+                for (const std::uint32_t w : ff->values<std::uint32_t>()) config_.ff_dims.push_back(w);
+            } else {
+                for (const std::int32_t w : widths) {
+                    if (w <= 0) fail("non-positive feed-forward width");
+                    config_.ff_dims.push_back(static_cast<std::uint32_t>(w));
+                }
+            }
+        }
+        if (shared != 0) config_.kv_from_start = config_.layer_count - shared;  // set below once layer_count is known
+    }
 
     config_.embedding_dim = require_u32(file, prefix + "embedding_length");
     config_.layer_count = require_u32(file, prefix + "block_count");
+    if (config_.architecture == Architecture::Gemma4) {
+        const std::uint32_t shared = file.get<std::uint32_t>(prefix + "attention.shared_kv_layers").value_or(0);
+        if (shared != 0) {
+            if (shared + 2 > config_.layer_count) fail("more shared K/V layers than layers");
+            config_.kv_from_start = config_.layer_count - shared;
+        }
+        if (!config_.sliding_pattern.empty() && config_.sliding_pattern.size() != config_.layer_count) fail("sliding window pattern length");
+        if (!config_.ff_dims.empty() && config_.ff_dims.size() != config_.layer_count) fail("feed_forward_length array length");
+    }
     config_.head_count = require_u32(file, prefix + "attention.head_count");
     config_.kv_head_count = require_u32(file, prefix + "attention.head_count_kv");
-    config_.feed_forward_dim = require_u32(file, prefix + "feed_forward_length");
+    config_.feed_forward_dim = config_.ff_dims.empty() ? require_u32(file, prefix + "feed_forward_length")
+                                                       : *std::max_element(config_.ff_dims.begin(), config_.ff_dims.end());
     config_.context_length = require_u32(file, prefix + "context_length");
     config_.rope_base = require_f32(file, prefix + "rope.freq_base");
     config_.rms_epsilon = require_f32(file, prefix + "attention.layer_norm_rms_epsilon");
@@ -164,7 +207,10 @@ Model::Model(const GgufFile& file, bool repack) : repack_(repack) {
     config_.head_dim = file.get<std::uint32_t>(prefix + "attention.key_length")
                            .value_or(config_.embedding_dim / config_.head_count);
     if (config_.head_dim == 0 || config_.head_dim % 32 != 0) fail("head size must be a non-zero multiple of 32");
-    if (config_.architecture == Architecture::Gemma3) config_.embedding_scale = std::sqrt(static_cast<float>(config_.embedding_dim));
+    if (gemma) config_.embedding_scale = std::sqrt(static_cast<float>(config_.embedding_dim));
+    if (config_.head_dim_local != 0 && (config_.head_dim_local % 32 != 0 || config_.head_dim_local > config_.head_dim)) {
+        fail("the sliding layers' head size must be a multiple of 32 no larger than the global one");
+    }
     if (file.get<std::uint32_t>(prefix + "attention.value_length").value_or(config_.head_dim) != config_.head_dim) {
         fail("key and value head sizes differ");
     }
@@ -181,10 +227,16 @@ Model::Model(const GgufFile& file, bool repack) : repack_(repack) {
     const std::size_t kv_dim = static_cast<std::size_t>(config_.kv_head_count) * config_.head_dim;
     const std::size_t ff = config_.feed_forward_dim;
 
-    // Llama 3's rope scaling ships as per-frequency factors.
+    // Llama 3's rope scaling and Gemma 4's proportional RoPE ship as per-frequency factors.
     if (file.tensor("rope_freqs.weight") != nullptr) {
         const std::span<const float> factors = load(file, "rope_freqs.weight", config_.head_dim / 2);
         config_.rope_factors.assign(factors.begin(), factors.end());
+    }
+    if (config_.ple_dim != 0) {
+        const std::size_t ple_all = static_cast<std::size_t>(config_.ple_dim) * config_.layer_count;
+        ple_token_embedding_ = load_matrix(file, "per_layer_token_embd.weight", config_.vocab_size, ple_all);
+        ple_model_proj_ = load_matrix(file, "per_layer_model_proj.weight", ple_all, config_.embedding_dim);
+        ple_proj_norm_ = load(file, "per_layer_proj_norm.weight", config_.ple_dim);
     }
 
     token_embedding_ = load_matrix(file, "token_embd.weight", config_.vocab_size, embd);
@@ -198,20 +250,37 @@ Model::Model(const GgufFile& file, bool repack) : repack_(repack) {
     for (std::size_t i = 0; i < layers_.size(); ++i) {
         const std::string block = "blk." + std::to_string(i) + ".";
         Layer& layer = layers_[i];
+        const std::size_t head_dim_l = config_.head_dim_of(i);
+        const std::size_t query_dim_l = static_cast<std::size_t>(config_.head_count) * head_dim_l;
+        const std::size_t kv_dim_l = static_cast<std::size_t>(config_.kv_head_count) * head_dim_l;
+        const std::size_t ff_l = config_.ff_dim_of(i);
+        const bool own_kv = config_.kv_layer_of(i) == i;
         layer.attention_norm = load(file, block + "attn_norm.weight", embd);
-        layer.query = load_matrix(file, block + "attn_q.weight", query_dim, embd);
-        layer.key = load_matrix(file, block + "attn_k.weight", kv_dim, embd);
-        layer.value = load_matrix(file, block + "attn_v.weight", kv_dim, embd);
+        layer.query = load_matrix(file, block + "attn_q.weight", query_dim_l, embd);
+        if (own_kv) {
+            layer.key = load_matrix(file, block + "attn_k.weight", kv_dim_l, embd);
+            // Gemma 4 global layers may have no V projection: K serves as V.
+            layer.value = file.tensor(block + "attn_v.weight") != nullptr ? load_matrix(file, block + "attn_v.weight", kv_dim_l, embd)
+                                                                           : layer.key;
+        }
         if (bitnet) {
             layer.attention_sub_norm = load(file, block + "attn_sub_norm.weight", embd);
             layer.feed_forward_sub_norm = load(file, block + "ffn_sub_norm.weight", ff);
-        } else if (config_.architecture == Architecture::Qwen3 || config_.architecture == Architecture::Gemma3) {
-            layer.query_norm = load(file, block + "attn_q_norm.weight", config_.head_dim);
-            layer.key_norm = load(file, block + "attn_k_norm.weight", config_.head_dim);
+        } else if (config_.architecture == Architecture::Qwen3 || gemma) {
+            layer.query_norm = load(file, block + "attn_q_norm.weight", head_dim_l);
+            if (own_kv) layer.key_norm = load(file, block + "attn_k_norm.weight", head_dim_l);
         }
-        if (config_.architecture == Architecture::Gemma3) {
+        if (gemma) {
             layer.attention_post_norm = load(file, block + "post_attention_norm.weight", embd);
             layer.feed_forward_post_norm = load(file, block + "post_ffw_norm.weight", embd);
+        }
+        if (config_.ple_dim != 0) {
+            layer.ple_gate = load_matrix(file, block + "inp_gate.weight", config_.ple_dim, embd);
+            layer.ple_proj = load_matrix(file, block + "proj.weight", embd, config_.ple_dim);
+            layer.ple_post_norm = load(file, block + "post_norm.weight", embd);
+        }
+        if (file.tensor(block + "layer_output_scale.weight") != nullptr) {
+            layer.out_scale = load(file, block + "layer_output_scale.weight", 1)[0];
         }
         // Projection biases (Qwen2 has them; some Llama-shaped models too). All or none.
         if (file.tensor(block + "attn_q.bias") != nullptr) {
@@ -219,11 +288,11 @@ Model::Model(const GgufFile& file, bool repack) : repack_(repack) {
             layer.key_bias = load(file, block + "attn_k.bias", kv_dim);
             layer.value_bias = load(file, block + "attn_v.bias", kv_dim);
         }
-        layer.attention_output = load_matrix(file, block + "attn_output.weight", embd, query_dim);
+        layer.attention_output = load_matrix(file, block + "attn_output.weight", embd, query_dim_l);
         layer.feed_forward_norm = load(file, block + "ffn_norm.weight", embd);
-        layer.gate = load_matrix(file, block + "ffn_gate.weight", ff, embd);
-        layer.up = load_matrix(file, block + "ffn_up.weight", ff, embd);
-        layer.down = load_matrix(file, block + "ffn_down.weight", embd, ff);
+        layer.gate = load_matrix(file, block + "ffn_gate.weight", ff_l, embd);
+        layer.up = load_matrix(file, block + "ffn_up.weight", ff_l, embd);
+        layer.down = load_matrix(file, block + "ffn_down.weight", embd, ff_l);
     }
 }
 
@@ -452,6 +521,10 @@ Session::Session(const Model& model, std::size_t threads, std::size_t max_contex
     up_.resize(kMaxBatch * c.feed_forward_dim);
     rope_.resize(kMaxBatch * c.head_dim);
     rope_local_.resize(kMaxBatch * c.head_dim);
+    if (c.ple_dim != 0) {
+        ple_.resize(kMaxBatch * static_cast<std::size_t>(c.ple_dim) * c.layer_count);
+        ple_gate_.resize(kMaxBatch * c.ple_dim);
+    }
     logits_.resize(c.vocab_size);
 }
 
@@ -489,30 +562,30 @@ void Session::eval_batch(std::span<const Token> tokens, bool all_logits) {
     const ModelConfig& c = model_.config();
     const std::size_t n = tokens.size();
     const std::size_t embd = c.embedding_dim;
-    const std::size_t head_dim = c.head_dim;
-    const std::size_t query_dim = static_cast<std::size_t>(c.head_count) * head_dim;
-    const std::size_t kv_dim = static_cast<std::size_t>(c.kv_head_count) * head_dim;
     const std::size_t heads_per_kv = c.head_count / c.kv_head_count;
     const std::size_t length = position_ + n;  // positions visible to the last token of the batch
-    const float attention_scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+    // Gemma 4's sliding layers have smaller heads than its global ones; the
+    // buffers are sized for the larger (c.head_dim), the tables per kind.
+    const std::size_t head_dim_local = c.head_dim_local != 0 ? c.head_dim_local : c.head_dim;
 
     // Angles are built by repeated multiplication, as llama.cpp does, so the
-    // rounding matches.
-    auto build_rope = [&](std::vector<float>& table, float base, float scale) {
-        const float theta_scale = std::pow(base, -2.0f / static_cast<float>(head_dim));
+    // rounding matches. The per-frequency factors (Llama 3's scaling, Gemma
+    // 4's proportional RoPE) apply to the global layers only.
+    auto build_rope = [&](std::vector<float>& table, std::size_t dim, float base, float scale, bool factors) {
+        const float theta_scale = std::pow(base, -2.0f / static_cast<float>(dim));
         for (std::size_t t = 0; t < n; ++t) {
             float theta = static_cast<float>(position_ + t) * scale;
-            float* rope = table.data() + t * head_dim;
-            for (std::size_t i = 0; i < head_dim / 2; ++i) {
-                const float angle = c.rope_factors.empty() ? theta : theta / c.rope_factors[i];
+            float* rope = table.data() + t * dim;
+            for (std::size_t i = 0; i < dim / 2; ++i) {
+                const float angle = factors && !c.rope_factors.empty() ? theta / c.rope_factors[i] : theta;
                 rope[2 * i] = std::cos(angle);
                 rope[2 * i + 1] = std::sin(angle);
                 theta *= theta_scale;
             }
         }
     };
-    build_rope(rope_, c.rope_base, c.rope_scale);
-    if (c.sliding_window != 0) build_rope(rope_local_, c.rope_base_local, 1.0f);
+    build_rope(rope_, c.head_dim, c.rope_base, c.rope_scale, true);
+    if (c.sliding_window != 0) build_rope(rope_local_, head_dim_local, c.rope_base_local, 1.0f, false);
 
     for (std::size_t t = 0; t < n; ++t) {
         const std::span<float> h(hidden_.data() + t * embd, embd);
@@ -523,14 +596,43 @@ void Session::eval_batch(std::span<const Token> tokens, bool all_logits) {
     }
     scores_.resize(n * c.head_count * length);
 
+    // Gemma 4's per-layer embedding inputs: for each layer, the projected
+    // (and normalised) input embedding plus the token's row of the per-layer
+    // table, both scaled, averaged with 1/sqrt(2).
+    const std::size_t ple_dim = c.ple_dim, ple_all = ple_dim * c.layer_count;
+    if (ple_dim != 0) {
+        multiply(model_.ple_model_proj(), hidden_.data(), n, ple_.data());
+        const float proj_scale = 1.0f / std::sqrt(static_cast<float>(embd));
+        const float table_scale = std::sqrt(static_cast<float>(ple_dim));
+        pool_.run(n, [&](std::size_t t) {
+            std::vector<float> row(ple_all);
+            embedding_row(model_.ple_token_embedding(), static_cast<std::size_t>(tokens[t]), row);
+            for (std::size_t l = 0; l < c.layer_count; ++l) {
+                const std::span<float> slice(ple_.data() + t * ple_all + l * ple_dim, ple_dim);
+                for (float& v : slice) v *= proj_scale;
+                rms_norm(slice, model_.ple_proj_norm(), c.rms_epsilon, slice);
+                for (std::size_t i = 0; i < ple_dim; ++i) {
+                    slice[i] = (slice[i] + row[l * ple_dim + i] * table_scale) * 0.70710678f;
+                }
+            }
+        });
+    }
+
     auto rows = [](std::vector<float>& v, std::size_t t, std::size_t width) {
         return std::span<float>(v.data() + t * width, width);
     };
 
     for (std::size_t l = 0; l < model_.layers().size(); ++l) {
         const Model::Layer& layer = model_.layers()[l];
-        std::vector<float>& keys = key_cache_[l];
-        std::vector<float>& values = value_cache_[l];
+        const std::size_t head_dim = c.head_dim_of(l);
+        const std::size_t query_dim = static_cast<std::size_t>(c.head_count) * head_dim;
+        const std::size_t kv_dim = static_cast<std::size_t>(c.kv_head_count) * head_dim;
+        const float attention_scale = c.attention_scale != 0.0f ? c.attention_scale : 1.0f / std::sqrt(static_cast<float>(head_dim));
+        // A layer without its own K/V reads the cache of an earlier layer of its kind (Gemma 4).
+        const std::size_t kv_layer = c.kv_layer_of(l);
+        const bool own_kv = kv_layer == l;
+        std::vector<float>& keys = key_cache_[kv_layer];
+        std::vector<float>& values = value_cache_[kv_layer];
         if (keys.empty()) {
             keys.resize(static_cast<std::size_t>(c.kv_head_count) * max_context_ * head_dim);
             values.resize(keys.size());
@@ -549,9 +651,11 @@ void Session::eval_batch(std::span<const Token> tokens, bool all_logits) {
                 rms_norm(rows(hidden_, t, embd), layer.attention_norm, c.rms_epsilon, rows(normed_, t, embd));
             });
         }
-        {
+        if (own_kv) {
             const Target qkv[3] = {{&layer.query, query_.data()}, {&layer.key, new_keys}, {&layer.value, new_values}};
             multiply(qkv, normed_.data(), n);
+        } else {
+            multiply(layer.query, normed_.data(), n, query_.data());
         }
 
         Timed* phase = new Timed(profile_.norm_rope);
@@ -568,12 +672,15 @@ void Session::eval_batch(std::span<const Token> tokens, bool all_logits) {
                 if (!layer.query_norm.empty()) rms_norm(q, layer.query_norm, c.rms_epsilon, q);
                 apply_rope(q, rope, c.rope_neox);
             }
+            if (!own_kv) return;
             for (std::size_t h = 0; h < c.kv_head_count; ++h) {
                 const std::span<float> k(new_keys + t * kv_dim + h * head_dim, head_dim);
+                const std::span<float> v(new_values + t * kv_dim + h * head_dim, head_dim);
                 if (!layer.key_norm.empty()) rms_norm(k, layer.key_norm, c.rms_epsilon, k);
+                if (c.value_norm) rms_norm(v, {}, c.rms_epsilon, v);  // Gemma 4: V normalised, no weight
                 apply_rope(k, rope, c.rope_neox);
                 std::copy_n(k.data(), head_dim, cache_row(keys, h, position_ + t));
-                std::copy_n(new_values + t * kv_dim + h * head_dim, head_dim, cache_row(values, h, position_ + t));
+                std::copy_n(v.data(), head_dim, cache_row(values, h, position_ + t));
             }
         });
 
@@ -652,20 +759,21 @@ void Session::eval_batch(std::span<const Token> tokens, bool all_logits) {
         {
             const Timed timed(profile_.activation);
             pool_.run(n, [&](std::size_t t) {
-                float* g = gate_.data() + t * c.feed_forward_dim;
-                const float* u = up_.data() + t * c.feed_forward_dim;
+                const std::size_t ff_l = c.ff_dim_of(l);
+                float* g = gate_.data() + t * ff_l;
+                const float* u = up_.data() + t * ff_l;
                 if (c.architecture == Architecture::BitNet) {
-                    for (std::size_t i = 0; i < c.feed_forward_dim; ++i) {
+                    for (std::size_t i = 0; i < ff_l; ++i) {
                         const float r = std::max(g[i], 0.0f);
                         g[i] = r * r * u[i];
                     }
                 } else if (c.gelu) {
-                    kernels::gelu_mul_f32(g, u, c.feed_forward_dim);
+                    kernels::gelu_mul_f32(g, u, ff_l);
                 } else {
-                    kernels::silu_mul_f32(g, u, c.feed_forward_dim);
+                    kernels::silu_mul_f32(g, u, ff_l);
                 }
                 if (!layer.feed_forward_sub_norm.empty()) {
-                    const std::span<float> gs(g, c.feed_forward_dim);
+                    const std::span<float> gs(g, ff_l);
                     rms_norm(gs, layer.feed_forward_sub_norm, c.rms_epsilon, gs);
                 }
             });
@@ -681,6 +789,26 @@ void Session::eval_batch(std::span<const Token> tokens, bool all_logits) {
                     rms_norm(ps, layer.feed_forward_post_norm, c.rms_epsilon, ps);
                 }
                 for (std::size_t i = 0; i < embd; ++i) h[i] += p[i];
+            });
+        }
+        if (ple_dim != 0) {
+            // Per-layer embedding: x += norm(proj(gelu(gate x) * ple_input[l])), then the layer's scalar.
+            multiply(layer.ple_gate, hidden_.data(), n, ple_gate_.data());
+            pool_.run(n, [&](std::size_t t) {
+                float* g = ple_gate_.data() + t * ple_dim;
+                const float* in = ple_.data() + t * ple_all + l * ple_dim;
+                kernels::gelu_mul_f32(g, in, ple_dim);
+            });
+            multiply(layer.ple_proj, ple_gate_.data(), n, projected_.data());
+            pool_.run(n, [&](std::size_t t) {
+                float* h = hidden_.data() + t * embd;
+                const std::span<float> ps(projected_.data() + t * embd, embd);
+                rms_norm(ps, layer.ple_post_norm, c.rms_epsilon, ps);
+                for (std::size_t i = 0; i < embd; ++i) h[i] = (h[i] + ps[i]) * layer.out_scale;
+            });
+        } else if (layer.out_scale != 1.0f) {
+            pool_.run(n, [&](std::size_t t) {
+                for (float& v : rows(hidden_, t, embd)) v *= layer.out_scale;
             });
         }
     }

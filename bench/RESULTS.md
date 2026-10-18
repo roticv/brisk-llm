@@ -143,6 +143,17 @@ The stock Q4_K_M download (bartowski; 117 Q5_0 and 14 Q8_0 tensors among the Q4_
 
 One GPU bug found on the way: Metal's fast-math `tanh` returns NaN for large arguments (its exp overflows), so the GELU epilogue clamps the argument; the CPU's std::tanh had hidden it.
 
+#### Gemma 4 E2B (Phase 6)
+
+ggml-org's gemma-4-E2B-it Q4_0 (4.6B parameters in the file, 2.3B effective: half is the per-layer embedding table, of which a token reads one row). CPU only so far. Same conditions as the tables above.
+
+| | brisk CPU 4 threads | llama.cpp CPU 4 threads |
+|---|---:|---:|
+| prompt | 168-219 | 182 |
+| generation | 42.5 | 41.8 |
+
+Tokenizer identical to llama.cpp on 2,178 strings; perplexity 128.85 against llama.cpp's 127.78 on the 1,650-token text (0.8%) and 5.094 against 5.075 on the 512-token one, which between them exercise the 512-token windows, the K/V-sharing layers and the 512-wide global heads. The GPU path refuses the model: its attention kernels take heads up to 256 wide, and it has neither the K/V sharing nor the per-layer embeddings.
+
 #### Speculative decoding on the GPU
 
 Qwen3-1.7B pure Q4_0, `--gpu`, greedy, lookup (n-gram) drafting, output identical to plain decoding. The Speculator now backs off after a round with no accepted guess (plain single-token rounds, doubling up to 32, halved again on success), which is what keeps the fresh-answer penalty bounded.
