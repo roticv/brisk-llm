@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <type_traits>
 
 // Quantised block formats, laid out exactly as in GGUF/ggml so weights can be
 // used straight from the file.
@@ -12,7 +13,7 @@ constexpr std::size_t kBlockSize = 32;  // weights per block for Q4_0 and Q8_0
 
 // Storage formats of weight matrices that the engine can multiply by.
 // Q4_0x4 is Q4_0 repacked at load time (see BlockQ4_0x4); it never appears in files.
-enum class WeightFormat { F32, Q4_0, Q4_1, Q4_K, Q6_K, Q4_0x4, TQ2_0, TQ2_0x4, Q4_Kx4, Q6_Kx4 };
+enum class WeightFormat { F32, Q4_0, Q4_1, Q5_0, Q8_0, Q4_K, Q6_K, Q4_0x4, TQ2_0, TQ2_0x4, Q4_Kx4, Q6_Kx4 };
 
 // Weights per block and bytes per block of a quantised format.
 std::size_t block_elements(WeightFormat format);
@@ -59,6 +60,15 @@ struct BlockQ4_1 {
     std::uint8_t qs[kBlockSize / 2];
 };
 static_assert(sizeof(BlockQ4_1) == 20);
+
+// 32 weights as 5-bit values: the low 4 bits as in Q4_0, the fifth bit of
+// weight i at bit i of qh (as a little-endian 32-bit word): weight = (q - 16) * d.
+struct BlockQ5_0 {
+    std::uint16_t d;
+    std::uint8_t qh[4];
+    std::uint8_t qs[kBlockSize / 2];
+};
+static_assert(sizeof(BlockQ5_0) == 22);
 
 constexpr std::size_t kSuperBlockSize = 256;  // weights per block for the K-quants
 
@@ -157,13 +167,16 @@ void quantize_q8_0(const float* x, BlockQ8_0* out, std::size_t count);
 void quantize_q8_k(const float* x, BlockQ8_K* out, std::size_t count);
 void dequantize_q4_0(const BlockQ4_0* blocks, float* out, std::size_t count);
 void dequantize_q4_1(const BlockQ4_1* blocks, float* out, std::size_t count);
+void dequantize_q5_0(const BlockQ5_0* blocks, float* out, std::size_t count);
+void dequantize_q8_0(const BlockQ8_0* blocks, float* out, std::size_t count);
 void dequantize_q4_k(const BlockQ4_K* blocks, float* out, std::size_t count);
 void dequantize_q6_k(const BlockQ6_K* blocks, float* out, std::size_t count);
 void dequantize_tq2_0(const BlockTQ2_0* blocks, float* out, std::size_t count);
 
 template <typename Block>
 constexpr std::size_t block_elements_of() {
-    return sizeof(Block) == sizeof(BlockQ4_0) || sizeof(Block) == sizeof(BlockQ4_1) || sizeof(Block) == sizeof(BlockQ4_0x4)
+    return std::is_same_v<Block, BlockQ4_0> || std::is_same_v<Block, BlockQ4_1> || std::is_same_v<Block, BlockQ5_0> ||
+                   std::is_same_v<Block, BlockQ8_0> || std::is_same_v<Block, BlockQ4_0x4>
                ? kBlockSize
                : kSuperBlockSize;  // Q4_K, Q6_K, TQ2_0 and the grouped K-quant layouts
 }
@@ -176,6 +189,8 @@ float dot_q4_0_q8_0(const BlockQ4_0* w, const BlockQ8_0* x, std::size_t blocks);
 // All four rows of a packed group at once: out[0..3].
 void dot_q4_0x4_q8_0(const BlockQ4_0x4* w, const BlockQ8_0* x, std::size_t blocks, float out[4]);
 float dot_q4_1_q8_0(const BlockQ4_1* w, const BlockQ8_0* x, std::size_t blocks);
+float dot_q5_0_q8_0(const BlockQ5_0* w, const BlockQ8_0* x, std::size_t blocks);
+float dot_q8_0_q8_0(const BlockQ8_0* w, const BlockQ8_0* x, std::size_t blocks);
 float dot_q4_k_q8_k(const BlockQ4_K* w, const BlockQ8_K* x, std::size_t blocks);
 float dot_q6_k_q8_k(const BlockQ6_K* w, const BlockQ8_K* x, std::size_t blocks);
 float dot_tq2_0_q8_k(const BlockTQ2_0* w, const BlockQ8_K* x, std::size_t blocks);

@@ -16,6 +16,8 @@ std::size_t block_elements(WeightFormat format) {
         case WeightFormat::Q4_0:
         case WeightFormat::Q4_0x4:
         case WeightFormat::Q4_1: return kBlockSize;
+        case WeightFormat::Q5_0: return kBlockSize;
+        case WeightFormat::Q8_0: return kBlockSize;
         case WeightFormat::Q4_K:
         case WeightFormat::Q6_K:
         case WeightFormat::TQ2_0:
@@ -32,6 +34,8 @@ std::size_t block_bytes(WeightFormat format) {
         case WeightFormat::Q4_0: return sizeof(BlockQ4_0);
         case WeightFormat::Q4_0x4: return sizeof(BlockQ4_0x4) / 4;  // per row
         case WeightFormat::Q4_1: return sizeof(BlockQ4_1);
+        case WeightFormat::Q5_0: return sizeof(BlockQ5_0);
+        case WeightFormat::Q8_0: return sizeof(BlockQ8_0);
         case WeightFormat::Q4_K: return sizeof(BlockQ4_K);
         case WeightFormat::Q6_K: return sizeof(BlockQ6_K);
         case WeightFormat::TQ2_0: return sizeof(BlockTQ2_0);
@@ -202,6 +206,28 @@ void dequantize_q4_1(const BlockQ4_1* blocks, float* out, std::size_t count) {
     }
 }
 
+void dequantize_q5_0(const BlockQ5_0* blocks, float* out, std::size_t count) {
+    for (std::size_t b = 0; b < count / kBlockSize; ++b) {
+        const float d = half_to_float(blocks[b].d);
+        std::uint32_t qh;
+        std::memcpy(&qh, blocks[b].qh, 4);
+        float* y = out + b * kBlockSize;
+        for (std::size_t i = 0; i < kBlockSize / 2; ++i) {
+            const int lo = (blocks[b].qs[i] & 0x0F) | static_cast<int>(((qh >> i) & 1) << 4);
+            const int hi = (blocks[b].qs[i] >> 4) | static_cast<int>(((qh >> (i + 16)) & 1) << 4);
+            y[i] = static_cast<float>(lo - 16) * d;
+            y[i + kBlockSize / 2] = static_cast<float>(hi - 16) * d;
+        }
+    }
+}
+
+void dequantize_q8_0(const BlockQ8_0* blocks, float* out, std::size_t count) {
+    for (std::size_t b = 0; b < count / kBlockSize; ++b) {
+        const float d = half_to_float(blocks[b].d);
+        for (std::size_t i = 0; i < kBlockSize; ++i) out[b * kBlockSize + i] = static_cast<float>(blocks[b].qs[i]) * d;
+    }
+}
+
 void dequantize_q4_k(const BlockQ4_K* blocks, float* out, std::size_t count) {
     for (std::size_t b = 0; b < count / kSuperBlockSize; ++b) {
         const BlockQ4_K& block = blocks[b];
@@ -320,6 +346,32 @@ float dot_q4_0_q8_0(const BlockQ4_0* w, const BlockQ8_0* x, std::size_t blocks) 
             acc += ((w[b].qs[i] & 0x0F) - 8) * x[b].qs[i];
             acc += ((w[b].qs[i] >> 4) - 8) * x[b].qs[i + kBlockSize / 2];
         }
+        sum += static_cast<float>(acc) * half_to_float(w[b].d) * half_to_float(x[b].d);
+    }
+    return sum;
+}
+
+float dot_q5_0_q8_0(const BlockQ5_0* w, const BlockQ8_0* x, std::size_t blocks) {
+    float sum = 0.0f;
+    for (std::size_t b = 0; b < blocks; ++b) {
+        std::uint32_t qh;
+        std::memcpy(&qh, w[b].qh, 4);
+        std::int32_t acc = 0;
+        for (std::size_t i = 0; i < kBlockSize / 2; ++i) {
+            const int lo = ((w[b].qs[i] & 0x0F) | static_cast<int>(((qh >> i) & 1) << 4)) - 16;
+            const int hi = ((w[b].qs[i] >> 4) | static_cast<int>(((qh >> (i + 16)) & 1) << 4)) - 16;
+            acc += lo * x[b].qs[i] + hi * x[b].qs[i + kBlockSize / 2];
+        }
+        sum += static_cast<float>(acc) * half_to_float(w[b].d) * half_to_float(x[b].d);
+    }
+    return sum;
+}
+
+float dot_q8_0_q8_0(const BlockQ8_0* w, const BlockQ8_0* x, std::size_t blocks) {
+    float sum = 0.0f;
+    for (std::size_t b = 0; b < blocks; ++b) {
+        std::int32_t acc = 0;
+        for (std::size_t i = 0; i < kBlockSize; ++i) acc += w[b].qs[i] * x[b].qs[i];
         sum += static_cast<float>(acc) * half_to_float(w[b].d) * half_to_float(x[b].d);
     }
     return sum;

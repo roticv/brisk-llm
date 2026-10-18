@@ -2,27 +2,27 @@
   {
     "model": "Qwen3-0.6B-Q4_0.gguf",
     "text": "bench/prompt512.txt",
-    "perplexity": 2.2779
+    "perplexity": 2.2751
   },
   {
     "model": "Qwen3-0.6B-Q4_0.gguf",
     "text": "tests/perplexity_text.txt",
-    "perplexity": 28.1942
+    "perplexity": 28.0989
   },
   {
     "model": "Qwen3-0.6B-pure-Q4_0.gguf",
     "text": "tests/perplexity_text.txt",
-    "perplexity": 29.0084
+    "perplexity": 28.9312
   },
   {
     "model": "Qwen3-1.7B-pure-Q4_0.gguf",
     "text": "tests/perplexity_text.txt",
-    "perplexity": 20.0747
+    "perplexity": 20.1209
   },
   {
     "model": "Qwen3-1.7B-Q4_K_M.gguf",
     "text": "tests/perplexity_text.txt",
-    "perplexity": 18.7796
+    "perplexity": 18.7894
   },
   {
     "model": "bitnet-2B4T-TQ2_0-e4.gguf",
@@ -32,16 +32,21 @@
   {
     "model": "Llama-3.2-1B-Instruct-Q4_K_M.gguf",
     "text": "tests/perplexity_text.txt",
-    "perplexity": 27.7986
+    "perplexity": 27.8187
   },
   {
     "model": "Qwen2.5-1.5B-Instruct-Q4_K_M.gguf",
     "text": "tests/perplexity_text.txt",
-    "perplexity": 15.0395
+    "perplexity": 15.0289
   },
   {
     "model": "gemma-3-1b-it-pure-Q4_0.gguf",
     "text": "tests/perplexity_text.txt",
-    "perplexity": 46.0316
+    "perplexity": 46.0915
+  },
+  {
+    "model": "gemma-3-1b-it-Q4_K_M.gguf",
+    "text": "tests/perplexity_text.txt",
+    "perplexity": 40.4216
   }
 ]

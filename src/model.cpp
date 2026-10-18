@@ -40,6 +40,8 @@ void embedding_row(const Matrix& m, std::size_t r, std::span<float> out) {
                                   r % 4, out.data(), m.cols);
             break;
         case WeightFormat::Q4_1: dequantize_q4_1(reinterpret_cast<const BlockQ4_1*>(row), out.data(), m.cols); break;
+        case WeightFormat::Q5_0: dequantize_q5_0(reinterpret_cast<const BlockQ5_0*>(row), out.data(), m.cols); break;
+        case WeightFormat::Q8_0: dequantize_q8_0(reinterpret_cast<const BlockQ8_0*>(row), out.data(), m.cols); break;
         case WeightFormat::Q4_K: dequantize_q4_k(reinterpret_cast<const BlockQ4_K*>(row), out.data(), m.cols); break;
         case WeightFormat::Q6_K: dequantize_q6_k(reinterpret_cast<const BlockQ6_K*>(row), out.data(), m.cols); break;
         case WeightFormat::TQ2_0: dequantize_tq2_0(reinterpret_cast<const BlockTQ2_0*>(row), out.data(), m.cols); break;
@@ -62,6 +64,8 @@ std::optional<WeightFormat> weight_format(TensorType type) {
     switch (type) {
         case TensorType::Q4_0: return WeightFormat::Q4_0;
         case TensorType::Q4_1: return WeightFormat::Q4_1;
+        case TensorType::Q5_0: return WeightFormat::Q5_0;
+        case TensorType::Q8_0: return WeightFormat::Q8_0;
         case TensorType::Q4_K: return WeightFormat::Q4_K;
         case TensorType::Q6_K: return WeightFormat::Q6_K;
         case TensorType::TQ2_0: return WeightFormat::TQ2_0;

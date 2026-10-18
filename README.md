@@ -5,10 +5,10 @@ A small LLM inference engine in C++20, built for two machines: a MacBook Air M4 
 ## What it does
 
 - Reads GGUF files directly (bounds-checked parser, fuzzed), using quantised weights in place from the memory map.
-- Weight formats: F32, F16, BF16, Q4_0, Q4_1, Q4_K, Q6_K and the ternary TQ2_0; Q4_0 and TQ2_0 are repacked at load into a four-row interleaved layout on CPUs with `i8mm`.
+- Weight formats: F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q8_0, Q4_K, Q6_K and the ternary TQ2_0 (Q5_0 and Q8_0 without the batched prompt kernels yet); Q4_0 and TQ2_0 are repacked at load into a four-row interleaved layout on CPUs with `i8mm`.
 - NEON kernels in three variants (baseline for the Cortex-A72, `dotprod`, `i8mm`/`smmla`), chosen at startup; batched prompt processing; a thread pool that hands out work dynamically so efficiency cores help.
-- Metal backend (`--gpu`) for Q4_0, Q4_1, Q4_K, Q6_K and BitNet (TQ2_0) weights on Apple silicon: weights used in place from the memory map, K/V cache on the GPU, simdgroup-matrix kernels for prompts, one command buffer per batch; shaders compiled at startup, so no Metal toolchain is needed.
-- Models: Qwen3 (0.6B, 1.7B tested), Qwen2/2.5 (1.5B tested; also the DeepSeek-R1 distils of it), Llama 3.x (3.2-1B tested; Mistral- and SmolLM2-shaped files should load), Gemma 3 (1B tested, as a pure Q4_0 file) and BitNet b1.58 2B4T, with the Qwen and Llama 3 byte-level BPE tokenizers and Gemma's SentencePiece one. `--chat` applies each family's turn format. Gemma 4 is planned (roadmap Phase 6).
+- Metal backend (`--gpu`) for Q4_0, Q4_1, Q5_0, Q8_0, Q4_K, Q6_K and BitNet (TQ2_0) weights on Apple silicon: weights used in place from the memory map, K/V cache on the GPU, simdgroup-matrix kernels for prompts, one command buffer per batch; shaders compiled at startup, so no Metal toolchain is needed.
+- Models: Qwen3 (0.6B, 1.7B tested), Qwen2/2.5 (1.5B tested; also the DeepSeek-R1 distils of it), Llama 3.x (3.2-1B tested; Mistral- and SmolLM2-shaped files should load), Gemma 3 (1B tested, stock Q4_K_M and pure Q4_0 files) and BitNet b1.58 2B4T, with the Qwen and Llama 3 byte-level BPE tokenizers and Gemma's SentencePiece one. `--chat` applies each family's turn format. Gemma 4 is planned (roadmap Phase 6).
 - Greedy and temperature/top-k/top-p sampling; speculative decoding with lookup (n-gram) or model drafting, exact with respect to greedy decoding.
 
 ## Build
@@ -32,7 +32,7 @@ build-release/brisk perplexity models/Qwen3-1.7B-pure-Q4_0.gguf -f text.txt
 build-release/brisk generate models/Qwen3-1.7B-pure-Q4_0.gguf -f prompt.txt -n 200 --gpu
 ```
 
-`--gpu` runs the model on the Metal GPU (Apple silicon): Q4_0, Q4_1, Q4_K and Q6_K matrices, so the common Q4_0 and Q4_K_M downloads run, and the BitNet TQ2_0 file. The weights are used in place from the memory-mapped file, the K/V cache lives on the GPU, and each batch of tokens is one command buffer. The shaders are embedded as source and compiled when the program starts, so no Metal toolchain is needed. `--warmup` evaluates the prompt once untimed first, as llama-bench does, for comparable numbers.
+`--gpu` runs the model on the Metal GPU (Apple silicon): Q4_0, Q4_1, Q5_0, Q8_0, Q4_K and Q6_K matrices, so the common Q4_0 and Q4_K_M downloads run, and the BitNet TQ2_0 file. The weights are used in place from the memory-mapped file, the K/V cache lives on the GPU, and each batch of tokens is one command buffer. The shaders are embedded as source and compiled when the program starts, so no Metal toolchain is needed. `--warmup` evaluates the prompt once untimed first, as llama-bench does, for comparable numbers.
 
 `brisk generate` prints a timing line to stderr; `BRISK_EVAL_CHUNK=1` makes `perplexity` score one token at a time (the generation kernels rather than the batched ones); `BRISK_PROFILE=1` adds a per-phase breakdown on the CPU, `BRISK_GPU_PROFILE=1` per kernel class on the GPU (each class timed in its own command buffer, so small ones read high), `BRISK_GPU_TIME=1` the GPU time of each batch, and for debugging `BRISK_GPU_LAYERS=<n>` evaluates only the first n layers while `BRISK_GPU_DEBUG=1` prints each intermediate buffer's magnitude and non-finite count. Model files go in `models/` (ignored by git); the pure Q4_0 files used in the benchmarks are made with `llama-quantize --pure`.
 

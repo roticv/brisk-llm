@@ -139,6 +139,8 @@ After those, paced:
 
 Level with llama.cpp on three of the four cells and 4-6% behind on prompts. The faster gemv also moved Llama-3.2-1B's GPU generation to 103-104 (llama.cpp 104) and left Qwen3-1.7B's at 88-89.
 
+The stock Q4_K_M download (bartowski; 117 Q5_0 and 14 Q8_0 tensors among the Q4_K/Q6_K ones, including a Q8_0 embedding) runs since Q5_0 and Q8_0 weights were added: perplexity 44.63 against llama.cpp's 44.70 on a 1,650-token text (0.15%; the GPU 1.0% lower, its float activations again), pinned. Its speed is another matter: the GPU is close (prompt 1620-1673 vs llama.cpp Metal's 1763, generation 74-83 vs 97) but on the CPU the Q5_0 and Q8_0 kernels are the plain per-row ones with no row-band blocking and no i8mm tiles, so prompt processing is 106-118 tokens/s against llama.cpp's 596 at 4 threads (generation 64-66 vs 73). Batched Q5_0/Q8_0 kernels are the fix.
+
 One GPU bug found on the way: Metal's fast-math `tanh` returns NaN for large arguments (its exp overflows), so the GELU epilogue clamps the argument; the CPU's std::tanh had hidden it.
 
 #### Speculative decoding on the GPU

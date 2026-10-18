@@ -354,6 +354,56 @@ inline void q4_1_subblock(device const uchar* row, uint sub, thread float4 (&v)[
     }
 }
 
+// Block `sub` of a Q5_0 row (22-byte blocks: half d, 4 bytes holding bit 4 of
+// each value, 16 nibble bytes; value = (q - 16) d), as eight float4s.
+inline void q5_0_subblock(device const uchar* row, uint sub, thread float4 (&v)[8]) {
+    device const uchar* blk = row + sub * 22;
+    device const ushort* u = (device const ushort*)blk;  // 2-byte aligned
+    const float d = float(as_type<half>(u[0]));
+    const uint qh = uint(u[1]) | (uint(u[2]) << 16);
+    for (uint k = 0; k < 4; ++k) {
+        const uint w = uint(u[3 + 2 * k]) | (uint(u[4 + 2 * k]) << 16);  // nibble bytes 4k .. 4k+3
+        const uint4 lo = uint4(w) >> uint4(0, 8, 16, 24) & 0xF, hi = uint4(w) >> uint4(4, 12, 20, 28) & 0xF;
+        const uint4 blo = (uint4(qh) >> (uint4(0, 1, 2, 3) + 4 * k) & 1) << 4;        // bits 4k .. 4k+3
+        const uint4 bhi = (uint4(qh) >> (uint4(16, 17, 18, 19) + 4 * k) & 1) << 4;    // bits 16+4k ..
+        v[k] = (float4(lo | blo) - 16.0f) * d;
+        v[4 + k] = (float4(hi | bhi) - 16.0f) * d;
+    }
+}
+
+// Block `sub` of a Q8_0 row (34-byte blocks: half d, 32 signed bytes), as eight float4s.
+inline void q8_0_subblock(device const uchar* row, uint sub, thread float4 (&v)[8]) {
+    device const uchar* blk = row + sub * 34;
+    device const ushort* u = (device const ushort*)blk;
+    const float d = float(as_type<half>(u[0]));
+    for (uint k = 0; k < 8; ++k) {
+        const uint w = uint(u[1 + 2 * k]) | (uint(u[2 + 2 * k]) << 16);  // bytes 4k .. 4k+3
+        const int4 q = (int4(uint4(w) >> uint4(0, 8, 16, 24) & 0xFF) ^ 0x80) - 0x80;  // sign-extend
+        v[k] = float4(q) * d;
+    }
+}
+
+// Row stride in bytes of a format with 32-value sub-blocks: 2 = Q4_K, 3 = Q6_K, 4 = Q4_1, 5 = Q5_0, 6 = Q8_0.
+inline ulong subblock_row_bytes(uint format, uint cols) {
+    switch (format) {
+        case 2: return (ulong)(cols / 256) * 144;
+        case 3: return (ulong)(cols / 256) * 210;
+        case 4: return (ulong)(cols / 32) * 20;
+        case 5: return (ulong)(cols / 32) * 22;
+        default: return (ulong)(cols / 32) * 34;
+    }
+}
+
+inline void subblock_dequant(uint format, device const uchar* row, uint sub, thread float4 (&v)[8]) {
+    switch (format) {
+        case 2: q4k_subblock(row, sub, v); break;
+        case 3: q6k_subblock(row, sub, v); break;
+        case 4: q4_1_subblock(row, sub, v); break;
+        case 5: q5_0_subblock(row, sub, v); break;
+        default: q8_0_subblock(row, sub, v); break;
+    }
+}
+
 // The 16 values [16 high, 16 high + 16) of sub-block `sub` of a Q4_K / Q6_K /
 // Q4_1 row as four half4s: what one thread of the tile stages per step.
 inline void q4k_half16(device const uchar* row, uint sub, uint high, thread half4 (&v)[4]) {
@@ -394,22 +444,16 @@ inline void q41_half16(device const uchar* row, uint sub, uint high, thread half
 inline void subblock_half16(uint format, device const uchar* row, uint sub, uint high, thread half4 (&v)[4]) {
     if (format == 2) q4k_half16(row, sub, high, v);
     else if (format == 3) q6k_half16(row, sub, high, v);
-    else q41_half16(row, sub, high, v);
-}
-
-// Row stride in bytes of a format with 32-value sub-blocks: 2 = Q4_K, 3 = Q6_K, 4 = Q4_1.
-inline ulong subblock_row_bytes(uint format, uint cols) {
-    return format == 2 ? (ulong)(cols / 256) * 144 : format == 3 ? (ulong)(cols / 256) * 210 : (ulong)(cols / 32) * 20;
-}
-
-inline void subblock_dequant(uint format, device const uchar* row, uint sub, thread float4 (&v)[8]) {
-    if (format == 2) q4k_subblock(row, sub, v);
-    else if (format == 3) q6k_subblock(row, sub, v);
-    else q4_1_subblock(row, sub, v);
+    else if (format == 4) q41_half16(row, sub, high, v);
+    else {  // Q5_0 and Q8_0: through the float sub-block (the tile is not their hot path)
+        float4 full[8];
+        subblock_dequant(format, row, sub, full);
+        for (uint k = 0; k < 4; ++k) v[k] = half4(full[high * 4 + k]);
+    }
 }
 
 // Embedding rows of a K-quant table: one thread per (token, sub-block of 32).
-constant uint kEmbedFormat [[function_constant(3)]];  // 2 = Q4_K, 3 = Q6_K, 4 = Q4_1
+constant uint kEmbedFormat [[function_constant(3)]];  // 2 = Q4_K, 3 = Q6_K, 4 = Q4_1, 5 = Q5_0, 6 = Q8_0
 
 kernel void embed_k(device const uchar* table [[buffer(0)]],
                     device const int* tokens [[buffer(1)]],
@@ -651,7 +695,7 @@ kernel void matmul_tq2_0(device const uchar* w0 [[buffer(0)]],
 // matrix loads are contiguous; each simdgroup then accumulates a 32-token x
 // 32-row quarter with 8x8 matrix multiplies. Each step's loads are issued
 // before the previous step's multiplies so they overlap.
-// The tile's weight format: 0 = Q4_0, 1 = TQ2_0, 2 = Q4_K, 3 = Q6_K, 4 = Q4_1 (a function constant, so each is its own pipeline).
+// The tile's weight format: 0 = Q4_0, 1 = TQ2_0, 2 = Q4_K, 3 = Q6_K, 4 = Q4_1, 5 = Q5_0, 6 = Q8_0 (a function constant, so each is its own pipeline).
 constant uint kTileFormat [[function_constant(0)]];
 
 kernel void matmul_q4_0_mm(device const uchar* w [[buffer(0)]],

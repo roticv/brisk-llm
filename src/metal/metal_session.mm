@@ -87,6 +87,8 @@ uint32_t kquant_format_id(WeightFormat f) {
         case WeightFormat::Q4_K: return 2;
         case WeightFormat::Q6_K: return 3;
         case WeightFormat::Q4_1: return 4;
+        case WeightFormat::Q5_0: return 5;
+        case WeightFormat::Q8_0: return 6;
         default: return 0;
     }
 }
@@ -110,9 +112,11 @@ struct MetalSession::Impl {
 
     id<MTLDevice> device = nil;
     id<MTLCommandQueue> queue = nil;
-    id<MTLComputePipelineState> embed = nil, embed_q4k = nil, embed_q6k = nil, embed_q41 = nil, rms_norm = nil, matmul_kq = nil, matmul = nil, matmul_tq2 = nil, matmul_q4k = nil,
+    id<MTLComputePipelineState> embed = nil, embed_q4k = nil, embed_q6k = nil, embed_q41 = nil, embed_q50 = nil,
+                                embed_q80 = nil, rms_norm = nil, matmul_kq = nil, matmul = nil, matmul_tq2 = nil, matmul_q4k = nil,
                                 matmul_q6k = nil, matmul_q41 = nil, matmul_mm = nil, matmul_mm_tq2 = nil,
-                                matmul_mm_q4k = nil, matmul_mm_q6k = nil, matmul_mm_q41 = nil, rope = nil,
+                                matmul_mm_q4k = nil, matmul_mm_q6k = nil, matmul_mm_q41 = nil, matmul_mm_q50 = nil,
+                                matmul_mm_q80 = nil, rope = nil,
                                 attention = nil,
                                 attention_small = nil, attention_combine = nil;
     std::size_t block_tokens = 8;  // tokens per threadgroup of the batched attention
@@ -184,6 +188,10 @@ struct MetalSession::Impl {
         matmul_kq = pipeline("matmul_k");
         matmul_mm_q41 = tile_pipeline(device, library, 4);
         embed_q41 = specialised_pipeline(device, library, "embed_k", 3, 4);
+        matmul_mm_q50 = tile_pipeline(device, library, 5);
+        matmul_mm_q80 = tile_pipeline(device, library, 6);
+        embed_q50 = specialised_pipeline(device, library, "embed_k", 3, 5);
+        embed_q80 = specialised_pipeline(device, library, "embed_k", 3, 6);
         rope = pipeline("qk_norm_rope");
         const uint32_t attn_dim = model.config().head_dim > 128 ? 256 : 128;
         attention = specialised_pipeline(device, library, "attention", 5, attn_dim);
@@ -240,11 +248,12 @@ struct MetalSession::Impl {
 
     Buf matrix(const Matrix& m, const char* name) {
         const bool supported = m.format == WeightFormat::Q4_0 || m.format == WeightFormat::Q4_1 ||
+                               m.format == WeightFormat::Q5_0 || m.format == WeightFormat::Q8_0 ||
                                m.format == WeightFormat::TQ2_0 || m.format == WeightFormat::Q4_K ||
                                m.format == WeightFormat::Q6_K;
         if (!supported || !in_file(m.bytes.data(), m.bytes.size())) {
             fail(std::string("the Metal backend needs ") + name +
-                 " as Q4_0, Q4_1, Q4_K, Q6_K or TQ2_0 in the file (load the model without repacking)");
+                 " as Q4_0, Q4_1, Q5_0, Q8_0, Q4_K, Q6_K or TQ2_0 in the file (load the model without repacking)");
         }
         const bool super_blocks = m.format == WeightFormat::TQ2_0 || m.format == WeightFormat::Q4_K || m.format == WeightFormat::Q6_K;
         if (super_blocks && m.cols % 256 != 0) fail(std::string("columns not a multiple of 256: ") + name);
@@ -333,6 +342,8 @@ struct MetalSession::Impl {
             case WeightFormat::Q4_K: return matmul_mm_q4k;
             case WeightFormat::Q6_K: return matmul_mm_q6k;
             case WeightFormat::Q4_1: return matmul_mm_q41;
+            case WeightFormat::Q5_0: return matmul_mm_q50;
+            case WeightFormat::Q8_0: return matmul_mm_q80;
             default: return matmul_mm;
         }
     }
@@ -341,7 +352,9 @@ struct MetalSession::Impl {
             case WeightFormat::TQ2_0: return matmul_tq2;
             case WeightFormat::Q4_K:
             case WeightFormat::Q6_K:
-            case WeightFormat::Q4_1: return matmul_kq;
+            case WeightFormat::Q4_1:
+            case WeightFormat::Q5_0:
+            case WeightFormat::Q8_0: return matmul_kq;
             default: return matmul;
         }
     }
@@ -507,6 +520,8 @@ struct MetalSession::Impl {
             [enc setComputePipelineState:token_embd.format == WeightFormat::Q4_K   ? embed_q4k
                                         : token_embd.format == WeightFormat::Q6_K ? embed_q6k
                                         : token_embd.format == WeightFormat::Q4_1 ? embed_q41
+                                        : token_embd.format == WeightFormat::Q5_0 ? embed_q50
+                                        : token_embd.format == WeightFormat::Q8_0 ? embed_q80
                                                                                   : embed];
             set(enc, token_embd, 0);
             set(enc, tokens, 1);
@@ -760,13 +775,15 @@ struct StandaloneMatmul {
             case WeightFormat::Q4_K: return 2;
             case WeightFormat::Q6_K: return 3;
             case WeightFormat::Q4_1: return 4;
+            case WeightFormat::Q5_0: return 5;
+            case WeightFormat::Q8_0: return 6;
             default: return 0;
         }
     }
     void select(WeightFormat f) {
         if (f == WeightFormat::Q4_0) return;
         const uint32_t id = format_id(f);
-        if (id == 0) fail("the standalone matmul takes Q4_0, Q4_1, Q4_K or Q6_K");
+        if (id == 0) fail("the standalone matmul takes Q4_0, Q4_1, Q5_0, Q8_0, Q4_K or Q6_K");
         NSError* error = nil;
         gemv = [device newComputePipelineStateWithFunction:[library newFunctionWithName:@"matmul_k"] error:&error];
         if (gemv == nil) fail("K-quant gemv pipeline");

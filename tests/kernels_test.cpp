@@ -56,6 +56,8 @@ void dequantize_row(brisk::WeightFormat format, const std::uint8_t* w, std::size
     switch (format) {
         case brisk::WeightFormat::Q4_0: brisk::dequantize_q4_0(reinterpret_cast<const BlockQ4_0*>(row), out.data(), kCols); break;
         case brisk::WeightFormat::Q4_1: brisk::dequantize_q4_1(reinterpret_cast<const brisk::BlockQ4_1*>(row), out.data(), kCols); break;
+        case brisk::WeightFormat::Q5_0: brisk::dequantize_q5_0(reinterpret_cast<const brisk::BlockQ5_0*>(row), out.data(), kCols); break;
+        case brisk::WeightFormat::Q8_0: brisk::dequantize_q8_0(reinterpret_cast<const brisk::BlockQ8_0*>(row), out.data(), kCols); break;
         case brisk::WeightFormat::Q4_K: brisk::dequantize_q4_k(reinterpret_cast<const brisk::BlockQ4_K*>(row), out.data(), kCols); break;
         case brisk::WeightFormat::Q6_K: brisk::dequantize_q6_k(reinterpret_cast<const brisk::BlockQ6_K*>(row), out.data(), kCols); break;
         case brisk::WeightFormat::TQ2_0: brisk::dequantize_tq2_0(reinterpret_cast<const brisk::BlockTQ2_0*>(row), out.data(), kCols); break;
@@ -172,6 +174,7 @@ void test_kernels_match_dequantised_reference() {
     for (float& v : x) v = normal(rng);
 
     const brisk::WeightFormat formats[] = {brisk::WeightFormat::Q4_0, brisk::WeightFormat::Q4_1,
+                                           brisk::WeightFormat::Q5_0, brisk::WeightFormat::Q8_0,
                                            brisk::WeightFormat::Q4_K, brisk::WeightFormat::Q6_K,
                                            brisk::WeightFormat::TQ2_0};
     for (const brisk::WeightFormat format : formats) {
@@ -186,6 +189,8 @@ void test_kernels_match_dequantised_reference() {
             switch (format) {
                 case brisk::WeightFormat::Q4_0: std::memcpy(block, &d, 2); break;
                 case brisk::WeightFormat::Q4_1: std::memcpy(block, &d, 2); std::memcpy(block + 2, &d, 2); break;
+                case brisk::WeightFormat::Q5_0: std::memcpy(block, &d, 2); break;
+                case brisk::WeightFormat::Q8_0: std::memcpy(block, &d, 2); break;
                 case brisk::WeightFormat::Q4_K: std::memcpy(block, &d, 2); std::memcpy(block + 2, &d, 2); break;
                 case brisk::WeightFormat::Q6_K: std::memcpy(block + 208, &d, 2); break;
                 case brisk::WeightFormat::TQ2_0: std::memcpy(block + 64, &d, 2); break;

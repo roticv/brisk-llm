@@ -172,6 +172,48 @@ inline float dot_row_q4_1(const BlockQ4_1* w, const BlockQ8_0* x, std::size_t bl
     return total;
 }
 
+// ---- Q5_0 and Q8_0 --------------------------------------------------------
+//
+// Both unpack to the signed (low, high) halves that Q4_0's dot_block takes;
+// the scale is d_w d_x per block as for Q4_0.
+
+// The 16 fifth bits qh >> (16 half + lane), each moved to bit 4 of its lane.
+inline uint8x16_t q5_high_bits(const std::uint8_t* qh, int half) {
+    const int8x8_t shifts = {0, -1, -2, -3, -4, -5, -6, -7};  // right shifts by lane
+    const uint8x8_t lo = vand_u8(vshl_u8(vdup_n_u8(qh[2 * half]), shifts), vdup_n_u8(1));
+    const uint8x8_t hi = vand_u8(vshl_u8(vdup_n_u8(qh[2 * half + 1]), shifts), vdup_n_u8(1));
+    return vshlq_n_u8(vcombine_u8(lo, hi), 4);
+}
+
+inline void unpack_q5_0(const BlockQ5_0& block, int8x16_t& low, int8x16_t& high) {
+    const uint8x16_t packed = vld1q_u8(block.qs);
+    const uint8x16_t offset = vdupq_n_u8(16);
+    low = vreinterpretq_s8_u8(vsubq_u8(vorrq_u8(vandq_u8(packed, vdupq_n_u8(0x0F)), q5_high_bits(block.qh, 0)), offset));
+    high = vreinterpretq_s8_u8(vsubq_u8(vorrq_u8(vshrq_n_u8(packed, 4), q5_high_bits(block.qh, 1)), offset));
+}
+
+template <typename DotBlock>
+inline float dot_row_q5_0(const BlockQ5_0* w, const BlockQ8_0* x, std::size_t blocks, DotBlock dot_block) {
+    float total = 0.0f;
+    for (std::size_t b = 0; b < blocks; ++b) {
+        int8x16_t l, h;
+        unpack_q5_0(w[b], l, h);
+        total += static_cast<float>(vaddvq_s32(dot_block(l, h, x[b]))) * vgetq_lane_f32(half4_to_float(w[b].d), 0) *
+                 vgetq_lane_f32(half4_to_float(x[b].d), 0);
+    }
+    return total;
+}
+
+template <typename DotBlock>
+inline float dot_row_q8_0(const BlockQ8_0* w, const BlockQ8_0* x, std::size_t blocks, DotBlock dot_block) {
+    float total = 0.0f;
+    for (std::size_t b = 0; b < blocks; ++b) {
+        total += static_cast<float>(vaddvq_s32(dot_block(vld1q_s8(w[b].qs), vld1q_s8(w[b].qs + 16), x[b]))) *
+                 vgetq_lane_f32(half4_to_float(w[b].d), 0) * vgetq_lane_f32(half4_to_float(x[b].d), 0);
+    }
+    return total;
+}
+
 // Decodes a Q6_K block into 16 vectors of 16 signed values, offset removed,
 // in weight order (so vector g holds the elements scaled by scales[g]).
 inline void unpack_q6_k(const BlockQ6_K& block, int8x16_t q[16]) {
