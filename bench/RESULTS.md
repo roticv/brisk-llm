@@ -128,7 +128,16 @@ gemma-3-1b-it, pure Q4_0 made from bartowski's bf16 with `llama-quantize --pure`
 | prompt | 483-562 | 684 | 1700 | 1924 |
 | generation | 104 | 117 | 102-106 | 127 |
 
-Correct (tokenizer identical on 2,160 strings; perplexity within 0.8% of llama.cpp on the CPU and 0.3% of that on the GPU; greedy output identical to llama.cpp on every test prompt with the F32 file) but 10-20% behind llama.cpp in every cell, where the other families are level. Gemma's shapes are what the kernels were not tuned for: 4 query heads of 256 dimensions over one key/value head (the attention kernels and the CPU attention tiles were sized for 128), two extra norm passes per layer, and a 262k-vocabulary output matrix that is a third of the bytes per token. Not yet measured: which of those costs the most.
+Those were the first numbers: correct (tokenizer identical on 2,160 strings; perplexity within 0.8% of llama.cpp on the CPU and 0.3% of that on the GPU; greedy output identical to llama.cpp on every test prompt with the F32 file) but 10-20% behind llama.cpp in every cell. Profiling found two causes, neither the attention: on the CPU the GELU gate was a scalar `std::tanh` loop costing 1.2 ms of a 9.6 ms token, now a NEON loop on the polynomial exp (SiLU got the same); on the GPU the Q4_0 gemv reached only 70 GB/s on Gemma's 1152-column matrices, whose 36 blocks per row left most lanes idle on the second pass. The gemv is now structured after llama.cpp's `mul_vec_q_n_f32`: four rows per simdgroup, 16 blocks in flight with two lanes per block, and no nibble shifts (the packed 16-bit words are masked and multiplied by activations pre-divided by 1, 256, 16 and 4096, the -8 offset folded into their sum). In isolation it reads Gemma's matrices at 104-119 GB/s (from 92-94 on the large ones, 69 on q) and Qwen's at 108 (from 90). Gemma's post-norm residual add and the following pre-norm share one kernel pass (two dispatches fewer per layer; no measurable change on its own).
+
+After those, paced:
+
+| | brisk CPU 4 threads | llama.cpp CPU 4 threads | brisk GPU | llama.cpp Metal |
+|---|---:|---:|---:|---:|
+| prompt | 653-660 | 684 | 1811-1817 | 1924 |
+| generation | 118-130 | 117 | 121-134 | 127 |
+
+Level with llama.cpp on three of the four cells and 4-6% behind on prompts. The faster gemv also moved Llama-3.2-1B's GPU generation to 103-104 (llama.cpp 104) and left Qwen3-1.7B's at 88-89.
 
 One GPU bug found on the way: Metal's fast-math `tanh` returns NaN for large arguments (its exp overflows), so the GELU epilogue clamps the argument; the CPU's std::tanh had hidden it.
 

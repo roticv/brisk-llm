@@ -41,6 +41,7 @@ struct GemvParams {
     uint mode;
     uint paired;      // rows of w0 and w1 are paired (gate/up) and combined by the epilogue
     uint formats[3];  // matmul_k: each matrix's format (2 = Q4_K, 3 = Q6_K, 4 = Q4_1)
+    uint interleave;  // unused (kept for layout)
 };
 
 struct NormParams {
@@ -48,6 +49,7 @@ struct NormParams {
     float eps;
     uint half_out;  // write the half buffer instead of the float one
     uint residual;  // add the normalised row to the residual buffer instead (Gemma's post-norms)
+    uint then_norm; // with residual: also write norm(residual) * w2 to out / out_half (the next pre-norm)
 };
 
 inline float epilogue(uint mode, float acc, float aux) {
@@ -127,6 +129,7 @@ kernel void rms_norm(device const float* x [[buffer(0)]],
                      constant NormParams& p [[buffer(3)]],
                      device half* out_half [[buffer(4)]],
                      device float* residual [[buffer(5)]],
+                     device const float* w2 [[buffer(6)]],
                      uint row [[threadgroup_position_in_grid]],
                      uint tid [[thread_index_in_threadgroup]],
                      uint lane [[thread_index_in_simdgroup]],
@@ -143,7 +146,28 @@ kernel void rms_norm(device const float* x [[buffer(0)]],
     const float scale = rsqrt(total / float(p.dim) + p.eps);
     if (p.residual) {
         device float* r = residual + row * p.dim;
-        for (uint i = tid; i < p.dim; i += 256) r[i] += in[i] * scale * w[i];
+        float sum2 = 0.0f;
+        for (uint i = tid; i < p.dim; i += 256) {
+            const float v = r[i] + in[i] * scale * w[i];
+            r[i] = v;
+            sum2 += v * v;
+        }
+        if (!p.then_norm) return;
+        // The next sub-block's pre-norm of the updated residual, in the same pass.
+        sum2 = simd_sum(sum2);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (lane == 0) partial[sg] = sum2;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float total2 = 0.0f;
+        for (uint i = 0; i < 8; ++i) total2 += partial[i];
+        const float scale2 = rsqrt(total2 / float(p.dim) + p.eps);
+        if (p.half_out) {
+            device half* o = out_half + row * p.dim;
+            for (uint i = tid; i < p.dim; i += 256) o[i] = half(r[i] * scale2 * w2[i]);
+        } else {
+            device float* o = out + row * p.dim;
+            for (uint i = tid; i < p.dim; i += 256) o[i] = r[i] * scale2 * w2[i];
+        }
     } else if (p.half_out) {
         device half* o = out_half + row * p.dim;
         for (uint i = tid; i < p.dim; i += 256) o[i] = half(in[i] * scale * w[i]);
@@ -172,13 +196,17 @@ inline void q4_block_dequant(device const Q4Block* blk, thread float4 (&v)[8]) {
     }
 }
 
-// One simdgroup per two rows of one activation row: the lanes take blocks in
-// turn (both rows' blocks per lane, which keeps more loads in flight) and
-// the partial sums are reduced across the simdgroup.
-// The 4 simdgroups of a threadgroup take consecutive row pairs, numbered
-// across the three matrices in turn. With `paired`, the pair is instead row
-// r of w0 and row r of w1 (the gate and up projections) and the epilogue
-// combines them: out0[r] = f(gate) * up.
+// Q4_0 gemv structured after llama.cpp's mul_vec_q_n_f32: four row streams
+// per simdgroup (rows r .. r + 3 of one matrix, or rows r, r + 1 of both the
+// gate and up matrices when paired), two simdgroups per threadgroup, 16
+// blocks in flight per simdgroup with two lanes per block, each lane taking
+// half a block (8 bytes: elements il .. il + 7 and 16 + il .. 16 + il + 7).
+// The nibbles are never shifted: the packed 16-bit words are masked and
+// multiplied by activations pre-divided by 1, 256, 16 and 4096, and the -8
+// offset is applied once per half block through the activations' sum. Rows
+// past the end are clamped (read, not written).
+constant uint kQ4Rows = 4;
+
 kernel void matmul_q4_0(device const uchar* w0 [[buffer(0)]],
                         device const uchar* w1 [[buffer(1)]],
                         device const uchar* w2 [[buffer(2)]],
@@ -192,51 +220,73 @@ kernel void matmul_q4_0(device const uchar* w0 [[buffer(0)]],
                         uint sg [[simdgroup_index_in_threadgroup]],
                         uint lane [[thread_index_in_simdgroup]]) {
     const bool paired = p.paired != 0;
-    const uint pairs0 = paired ? p.rows[0] : (p.rows[0] + 1) / 2;
-    const uint pairs1 = paired ? 0 : (p.rows[1] + 1) / 2, pairs2 = paired ? 0 : (p.rows[2] + 1) / 2;
-    const uint item = tg * 4 + sg;
-    if (item >= (pairs0 + pairs1 + pairs2) * p.n) return;
-    uint pair = item / p.n;
+    constexpr uint R = kQ4Rows, RM = kQ4Rows / 2;
+    const uint groups0 = paired ? (p.rows[0] + RM - 1) / RM : (p.rows[0] + R - 1) / R;
+    const uint groups1 = paired ? 0 : (p.rows[1] + R - 1) / R, groups2 = paired ? 0 : (p.rows[2] + R - 1) / R;
+    const uint item = tg * 2 + sg;
+    if (item >= (groups0 + groups1 + groups2) * p.n) return;
+    uint group = item / p.n;
     const uint t = item % p.n;
     device const uchar* w;
     device float* out;
     uint rows;
-    if (pair < pairs0) {
+    if (group < groups0) {
         w = w0; out = out0; rows = p.rows[0];
-    } else if (pair < pairs0 + pairs1) {
-        pair -= pairs0; w = w1; out = out1; rows = p.rows[1];
+    } else if (group < groups0 + groups1) {
+        group -= groups0; w = w1; out = out1; rows = p.rows[1];
     } else {
-        pair -= pairs0 + pairs1; w = w2; out = out2; rows = p.rows[2];
+        group -= groups0 + groups1; w = w2; out = out2; rows = p.rows[2];
     }
     const uint blocks = p.cols / 32;
-    const uint row0 = paired ? pair : pair * 2;
-    const bool two = paired || row0 + 1 < rows;
-    device const uchar* wrow0 = w + (ulong)row0 * blocks * 18;
-    device const uchar* wrow1 = paired ? w1 + (ulong)row0 * blocks * 18 : wrow0 + (two ? blocks * 18 : 0);
-    device const float4* xrow = (device const float4*)(x + t * p.cols);
-
-    float acc0 = 0.0f, acc1 = 0.0f;
-    for (uint b = lane; b < blocks; b += 32) {
-        float4 va[8], vb[8];
-        q4_block_dequant((device const Q4Block*)(wrow0 + b * 18), va);
-        q4_block_dequant((device const Q4Block*)(wrow1 + b * 18), vb);
-        float4 s0 = 0.0f, s1 = 0.0f;
-        for (uint i = 0; i < 8; ++i) {
-            const float4 xv = xrow[b * 8 + i];
-            s0 += va[i] * xv;
-            s1 += vb[i] * xv;
-        }
-        acc0 += s0.x + s0.y + s0.z + s0.w;
-        acc1 += s1.x + s1.y + s1.z + s1.w;
+    const ulong row_bytes = (ulong)blocks * 18;
+    const uint row0 = paired ? group * RM : group * R;
+    device const uchar* stream[R];
+    for (uint s = 0; s < R; ++s) {
+        const uint r = paired ? row0 + s / 2 : row0 + s;
+        device const uchar* base = (paired && (s % 2 == 1)) ? w1 : w;
+        stream[s] = base + min(r, rows - 1) * row_bytes;
     }
-    acc0 = simd_sum(acc0);
-    acc1 = simd_sum(acc1);
+    const uint ix = lane / 2, il = (lane % 2) * 8;  // block in flight, half of it
+    device const float* yb = x + t * p.cols + ix * 32 + il;
+
+    float sumf[R];
+    for (uint s = 0; s < R; ++s) sumf[s] = 0.0f;
+    for (uint ib = ix; ib < blocks; ib += 16) {
+        float yl[16];
+        float sumy = 0.0f;
+        for (uint i = 0; i < 8; i += 2) {
+            sumy += (yb[i] + yb[i + 1]) + (yb[i + 16] + yb[i + 17]);
+            yl[i] = yb[i];
+            yl[i + 1] = yb[i + 1] / 256.0f;
+            yl[i + 8] = yb[i + 16] / 16.0f;
+            yl[i + 9] = yb[i + 17] / 4096.0f;
+        }
+        for (uint s = 0; s < R; ++s) {
+            device const Q4Block* blk = (device const Q4Block*)(stream[s] + ib * 18);
+            device const ushort* qs = blk->qs + il / 2;
+            float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+            for (uint i = 0; i < 8; i += 2) {
+                const uint q = qs[i / 2];
+                acc0 += yl[i] * float(q & 0x000F);
+                acc1 += yl[i + 1] * float(q & 0x0F00);
+                acc2 += yl[i + 8] * float(q & 0x00F0);
+                acc3 += yl[i + 9] * float(q & 0xF000);
+            }
+            sumf[s] += float(blk->d) * ((acc0 + acc1) + (acc2 + acc3) - 8.0f * sumy);
+        }
+        yb += 32 * 16;
+    }
+    float total[R];
+    for (uint s = 0; s < R; ++s) total[s] = simd_sum(sumf[s]);
     if (lane == 0) {
         if (paired) {
-            out[t * rows + row0] = epilogue(p.mode, acc1, acc0);  // acc0 is the gate, acc1 the up
+            for (uint i = 0; i < RM; ++i) {
+                if (row0 + i < rows) out[t * rows + row0 + i] = epilogue(p.mode, total[2 * i + 1], total[2 * i]);
+            }
         } else {
-            out[t * rows + row0] = epilogue(p.mode, acc0, aux[t * rows + row0]);
-            if (two) out[t * rows + row0 + 1] = epilogue(p.mode, acc1, aux[t * rows + row0 + 1]);
+            for (uint s = 0; s < R; ++s) {
+                if (row0 + s < rows) out[t * rows + row0 + s] = epilogue(p.mode, total[s], aux[t * rows + row0 + s]);
+            }
         }
     }
 }

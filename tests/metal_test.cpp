@@ -66,7 +66,7 @@ std::vector<std::byte> random_blocks(WeightFormat format, std::size_t rows, std:
     return bytes;
 }
 
-bool check(WeightFormat format, std::size_t rows, std::size_t cols, std::size_t n, bool tiled) {
+bool check(WeightFormat format, std::size_t rows, std::size_t cols, std::size_t n, bool tiled, bool paired = false) {
     std::mt19937 rng(static_cast<unsigned>(rows * 31 + cols * 7 + n + static_cast<unsigned>(format) * 101));
     std::normal_distribution<float> dist;
     std::vector<float> x(n * cols);
@@ -81,12 +81,13 @@ bool check(WeightFormat format, std::size_t rows, std::size_t cols, std::size_t 
         for (std::size_t t = 0; t < n; ++t) {
             double sum = 0.0;
             for (std::size_t c = 0; c < cols; ++c) sum += double(w[r * cols + c]) * x[t * cols + c];
+            if (paired) sum = 0.5 * sum * (1.0 + std::tanh(0.7978845608 * (sum + 0.044715 * sum * sum * sum))) * sum;  // gelu(gate) * up, gate = up
             expected[t * rows + r] = static_cast<float>(sum);
         }
         for (std::size_t c = 0; c < cols; ++c) scale += std::fabs(w[r * cols + c]);
     }
     scale /= double(rows * cols);
-    const std::vector<float> got = metal_matmul(format, bytes, rows, cols, x, n, tiled);
+    const std::vector<float> got = metal_matmul(format, bytes, rows, cols, x, n, tiled, paired);
 
     if (std::getenv("METAL_TEST_DUMP") != nullptr) {
         for (std::size_t i = 0; i < std::min<std::size_t>(8, expected.size()); ++i) {
@@ -96,10 +97,10 @@ bool check(WeightFormat format, std::size_t rows, std::size_t cols, std::size_t 
     double worst = 0.0;
     for (std::size_t i = 0; i < expected.size(); ++i) worst = std::max(worst, std::fabs(double(expected[i]) - got[i]));
     // Half activations in the tiled kernel: relative error ~1e-3 of a dot of `cols` terms of size `scale`.
-    const double tolerance = (tiled ? 4e-3 : 1e-4) * std::sqrt(double(cols)) * std::max(scale, 0.3);
+    const double tolerance = (tiled ? 4e-3 : 1e-4) * std::sqrt(double(cols)) * std::max(scale, 0.3) * (paired ? 50.0 : 1.0);
     const bool ok = worst <= tolerance;
     std::printf("%s %s rows %zu cols %zu n %zu: max abs error %.3g (tolerance %.3g) %s\n", name(format),
-                tiled ? "tiled" : "gemv ", rows, cols, n, worst, tolerance, ok ? "ok" : "FAILED");
+                paired ? "gated" : tiled ? "tiled" : "gemv ", rows, cols, n, worst, tolerance, ok ? "ok" : "FAILED");
     return ok;
 }
 
@@ -114,6 +115,11 @@ int main() {
     ok &= check(WeightFormat::Q4_0, 64, 64, 1, false);
     ok &= check(WeightFormat::Q4_0, 130, 2048, 3, false);
     ok &= check(WeightFormat::Q4_0, 1024, 2048, 7, false);
+    ok &= check(WeightFormat::Q4_0, 130, 1152, 2, false);  // 36 blocks per row
+    ok &= check(WeightFormat::Q4_0, 1152, 1024, 2, false);
+    ok &= check(WeightFormat::Q4_0, 262144 / 64, 1152, 1, false);
+    ok &= check(WeightFormat::Q4_0, 130, 1152, 2, false, true);  // the paired (gate/up) epilogue
+    ok &= check(WeightFormat::Q4_K, 130, 1280, 2, false, true);
     ok &= check(WeightFormat::Q4_0, 128, 64, 8, true);
     ok &= check(WeightFormat::Q4_0, 128, 2048, 64, true);
     ok &= check(WeightFormat::Q4_0, 256, 1024, 100, true);

@@ -40,8 +40,11 @@ private:
 // `format`: Q4_0, Q4_1, Q4_K or Q6_K) by n rows of activations on the GPU,
 // returning out[t][row]. `tiled` selects the 64x64 simdgroup-matrix kernel;
 // otherwise the gemv kernel is used.
+// With `paired` (gemv only), the matrix stands in for both gate and up and
+// the result is silu(w x) * (w x), exercising the paired epilogue.
 std::vector<float> metal_matmul(WeightFormat format, std::span<const std::byte> weights, std::size_t rows,
-                                std::size_t cols, std::span<const float> x, std::size_t n, bool tiled);
+                                std::size_t cols, std::span<const float> x, std::size_t n, bool tiled,
+                                bool paired = false);
 
 // For benchmarks: GPU seconds per gemv of a rows x cols TQ2_0 matrix by one
 // activation row, over `iterations` back-to-back dispatches. `variant` 0 is

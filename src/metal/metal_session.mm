@@ -35,11 +35,12 @@ struct GemvParams {
     uint32_t rows[3];
     uint32_t cols, n, mode, paired;
     uint32_t formats[3];
+    uint32_t interleave;
 };
 struct NormParams {
     uint32_t dim;
     float eps;
-    uint32_t half_out, residual;
+    uint32_t half_out, residual, then_norm;
 };
 struct RopeParams {
     uint32_t n, position0, head_count, kv_head_count, head_dim, max_context;
@@ -351,24 +352,29 @@ struct MetalSession::Impl {
         [enc setBuffer:in offset:in_offset atIndex:0];
         set(enc, w, 1);
         [enc setBuffer:out.f offset:out_offset atIndex:2];
-        const NormParams p{static_cast<uint32_t>(dim), model.config().rms_epsilon, tiled(rows) ? 1u : 0u, 0};
+        const NormParams p{static_cast<uint32_t>(dim), model.config().rms_epsilon, tiled(rows) ? 1u : 0u, 0, 0};
         bytes(enc, p, 3);
         [enc setBuffer:out.h offset:out_offset / 2 atIndex:4];
         [enc setBuffer:out.f offset:0 atIndex:5];
+        set(enc, w, 6);
         groups(enc, rows, 256);
     }
 
-    // residual += rms_norm(in) * w (Gemma's post-norms).
+    // residual += rms_norm(in) * w (Gemma's post-norms), and when `next` is
+    // given, out = rms_norm(residual) * next in the same pass (the following
+    // pre-norm).
     void encode_norm_add(id<MTLComputeCommandEncoder> enc, id<MTLBuffer> in, const Buf& w, id<MTLBuffer> residual,
-                         std::size_t rows, std::size_t dim) {
+                         std::size_t rows, std::size_t dim, const Buf* next = nullptr, Act out = Act{nil, nil}) {
         [enc setComputePipelineState:rms_norm];
         set(enc, in, 0);
         set(enc, w, 1);
-        set(enc, in, 2);
-        const NormParams p{static_cast<uint32_t>(dim), model.config().rms_epsilon, 0, 1};
+        set(enc, next != nullptr ? out.f : in, 2);
+        const NormParams p{static_cast<uint32_t>(dim), model.config().rms_epsilon, next != nullptr && tiled(rows) ? 1u : 0u, 1,
+                           next != nullptr ? 1u : 0u};
         bytes(enc, p, 3);
-        set(enc, in, 4);
+        set(enc, next != nullptr && out.h != nil ? out.h : in, 4);
         set(enc, residual, 5);
+        set(enc, next != nullptr ? *next : w, 6);
         groups(enc, rows, 256);
     }
 
@@ -402,11 +408,12 @@ struct MetalSession::Impl {
         for (NSUInteger i = 4; i < 7; ++i) set(enc, out.f, i);
         const uint32_t fid = kquant_format_id(gate_w.format);
         const GemvParams p{{static_cast<uint32_t>(rows), 0, 0}, static_cast<uint32_t>(cols), static_cast<uint32_t>(n), mode, 1,
-                           {fid, fid, fid}};
+                           {fid, fid, fid}, (cols / 32) % 32 != 0 ? 1u : 0u};
         bytes(enc, p, 7);
         set(enc, in.f, 8);
-        // Ternary: groups of kTernaryRows / 2 rows (of both matrices), 2 simdgroups per threadgroup.
+        // Ternary and Q4_0: groups of (rows per simdgroup / 2) rows of both matrices, 2 simdgroups per threadgroup.
         if (ternary) groups(enc, ((rows + kTernaryRows / 2 - 1) / (kTernaryRows / 2) * n + 1) / 2, 64);
+        else if (gate_w.format == WeightFormat::Q4_0) groups(enc, ((rows + 1) / 2 * n + 1) / 2, 64);
         else groups(enc, (rows * n + 3) / 4, 128);
     }
 
@@ -439,14 +446,16 @@ struct MetalSession::Impl {
         }
         const bool ternary = format == WeightFormat::TQ2_0;
         [enc setComputePipelineState:gemv_for(format)];
-        GemvParams p{{0, 0, 0}, static_cast<uint32_t>(cols), static_cast<uint32_t>(n), mode, 0, {0, 0, 0}};
-        std::size_t pairs = 0, i = 0;  // row groups: pairs, or kTernaryRows for TQ2_0
+        GemvParams p{{0, 0, 0}, static_cast<uint32_t>(cols), static_cast<uint32_t>(n), mode, 0, {0, 0, 0},
+                     (cols / 32) % 32 != 0 ? 1u : 0u};
+        const bool q4 = format == WeightFormat::Q4_0;
+        std::size_t pairs = 0, i = 0;  // row groups: kTernaryRows for TQ2_0, 4 for Q4_0, pairs for the K-quants
         for (const Target& t : targets) {
             set(enc, *t.w, i);
             set(enc, t.out.f, 4 + i);
             p.rows[i] = static_cast<uint32_t>(t.rows);
             p.formats[i] = kquant_format_id(t.w->format);
-            pairs += ternary ? (t.rows + kTernaryRows - 1) / kTernaryRows : (t.rows + 1) / 2;
+            pairs += ternary ? (t.rows + kTernaryRows - 1) / kTernaryRows : q4 ? (t.rows + 3) / 4 : (t.rows + 1) / 2;
             ++i;
         }
         for (; i < 3; ++i) {  // unused slots: bind something valid
@@ -456,7 +465,7 @@ struct MetalSession::Impl {
         set(enc, in.f, 3);
         bytes(enc, p, 7);
         set(enc, aux != nil ? aux : in.f, 8);
-        if (ternary) groups(enc, (pairs * n + 1) / 2, 64);
+        if (ternary || q4) groups(enc, (pairs * n + 1) / 2, 64);
         else groups(enc, (pairs * n + 3) / 4, 128);
     }
 
@@ -513,11 +522,13 @@ struct MetalSession::Impl {
                 const char* env = std::getenv("BRISK_GPU_LAYERS");
                 return env != nullptr ? static_cast<std::size_t>(std::atoi(env)) : std::size_t(-1);
             }();
+            bool next_prenormed = false;  // the previous layer's fused post-norm already wrote this layer's pre-norm
             for (std::size_t l = 0; l < std::min(layers.size(), layer_cap); ++l) {
                 const Layer& g = layers[l];
                 const std::size_t cache_layer = l * c.kv_head_count * max_context * c.head_dim * 4;
 
-                encode_norm(enc, x, g.attn_norm, normed_a, n, embd);
+                if (!next_prenormed) encode_norm(enc, x, g.attn_norm, normed_a, n, embd);
+                next_prenormed = false;
                 checkpoint("norm");
                 encode_matmul(enc, {Target{&g.q, qdim, q_a}, Target{&g.k, kvdim, k_a}, Target{&g.v, kvdim, v_a}}, embd,
                               normed_a, n);
@@ -594,16 +605,14 @@ struct MetalSession::Impl {
                 if (bitnet) encode_norm(enc, attended, g.attn_sub_norm, attended_a, n, qdim);
                 checkpoint("norm");
                 if (g.attn_post_norm.buffer != nil) {
-                    // Gemma: x += post_norm(o(attended)).
+                    // Gemma: x += post_norm(o(attended)), then the FFN's pre-norm in the same pass.
                     encode_matmul(enc, {Target{&g.o, embd, Act{proj, nil}}}, qdim, attended_a, n);
-                    encode_norm_add(enc, proj, g.attn_post_norm, x, n, embd);
+                    encode_norm_add(enc, proj, g.attn_post_norm, x, n, embd, &g.ffn_norm, normed_a);
                 } else {
                     encode_matmul(enc, {Target{&g.o, embd, x_a}}, qdim, attended_a, n, kResidual, x);
+                    encode_norm(enc, x, g.ffn_norm, normed_a, n, embd);
                 }
                 checkpoint("matmul");
-
-                encode_norm(enc, x, g.ffn_norm, normed_a, n, embd);
-                checkpoint("norm");
                 // gate, then up with the activation applied against it; BitNet
                 // normalises the product afterwards (that norm writes the half copy).
                 encode_gated(enc, g.gate, g.up, ff, embd, normed_a, n, bitnet ? kReluSqrMul : c.gelu ? kGeluMul : kSiluMul,
@@ -612,7 +621,10 @@ struct MetalSession::Impl {
                 checkpoint("matmul");
                 if (g.ffn_post_norm.buffer != nil) {
                     encode_matmul(enc, {Target{&g.down, embd, Act{proj, nil}}}, ff, gate_a, n);
-                    encode_norm_add(enc, proj, g.ffn_post_norm, x, n, embd);
+                    // ... and the next layer's attention pre-norm in the same pass.
+                    const bool last = l + 1 == layers.size();
+                    encode_norm_add(enc, proj, g.ffn_post_norm, x, n, embd, last ? nullptr : &layers[l + 1].attn_norm, normed_a);
+                    next_prenormed = !last;
                 } else {
                     encode_matmul(enc, {Target{&g.down, embd, x_a}}, ff, gate_a, n, kResidual, x);
                 }
@@ -663,6 +675,7 @@ struct MetalSession::Impl {
             report("attended", attended, n * qdim);
             report("proj", proj, n * embd);
             report("gate", gate, n * ff);
+
         }
         const std::size_t count = (all_logits ? n : 1) * c.vocab_size;
         logits_out.resize(count);
@@ -761,6 +774,7 @@ struct StandaloneMatmul {
         mm = tile_pipeline(device, library, id);
     }
 
+    bool paired = false;
     void encode(id<MTLComputeCommandEncoder> enc, id<MTLBuffer> w, id<MTLBuffer> in, id<MTLBuffer> half_in,
                 id<MTLBuffer> out, std::size_t rows, std::size_t cols, std::size_t n, bool tiled) {
         if (tiled) {
@@ -780,11 +794,20 @@ struct StandaloneMatmul {
                 [enc setBuffer:out offset:0 atIndex:4 + i];
             }
             [enc setBuffer:in offset:0 atIndex:3];
-            const GemvParams p{{static_cast<uint32_t>(rows), 0, 0}, static_cast<uint32_t>(cols), static_cast<uint32_t>(n), kStore, 0,
-                               {format, format, format}};
+            // paired: gate and up are the same matrix, out = silu(w x) * (w x).
+            const GemvParams p{{static_cast<uint32_t>(rows), 0, 0}, static_cast<uint32_t>(cols), static_cast<uint32_t>(n),
+                               paired ? kGeluMul : kStore, paired ? 1u : 0u, {format, format, format}, 0};
             [enc setBytes:&p length:sizeof(p) atIndex:7];
             [enc setBuffer:in offset:0 atIndex:8];
-            [enc dispatchThreadgroups:MTLSizeMake(((rows + 1) / 2 * n + 3) / 4, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+            if (format == 0 && paired) {
+                [enc dispatchThreadgroups:MTLSizeMake(((rows + 1) / 2 * n + 1) / 2, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+            } else if (format == 0) {  // Q4_0: groups of 4 rows, 2 simdgroups per threadgroup
+                [enc dispatchThreadgroups:MTLSizeMake(((rows + 3) / 4 * n + 1) / 2, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+            } else if (paired) {  // K-quants: one item per row (of both matrices)
+                [enc dispatchThreadgroups:MTLSizeMake((rows * n + 3) / 4, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+            } else {
+                [enc dispatchThreadgroups:MTLSizeMake(((rows + 1) / 2 * n + 3) / 4, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+            }
         }
     }
 };
@@ -792,10 +815,11 @@ struct StandaloneMatmul {
 }  // namespace
 
 std::vector<float> metal_matmul(WeightFormat format, std::span<const std::byte> weights, std::size_t rows,
-                                std::size_t cols, std::span<const float> x, std::size_t n, bool tiled) {
+                                std::size_t cols, std::span<const float> x, std::size_t n, bool tiled, bool paired) {
     @autoreleasepool {
         StandaloneMatmul m;
         m.select(format);
+        m.paired = paired;
         id<MTLBuffer> w = [m.device newBufferWithBytes:weights.data() length:weights.size() options:MTLResourceStorageModeShared];
         id<MTLBuffer> in = [m.device newBufferWithBytes:x.data() length:x.size_bytes() options:MTLResourceStorageModeShared];
         id<MTLBuffer> half_in = [m.device newBufferWithLength:x.size() * 2 options:MTLResourceStorageModeShared];
@@ -865,7 +889,7 @@ double metal_gemv_tq2_0_seconds(std::size_t rows, std::size_t cols, int iteratio
         }
         [enc setBuffer:in offset:0 atIndex:3];
         [enc setBuffer:in offset:0 atIndex:8];
-        const GemvParams p{{static_cast<uint32_t>(rows), 0, 0}, static_cast<uint32_t>(cols), 1, kStore, 0, {0, 0, 0}};
+        const GemvParams p{{static_cast<uint32_t>(rows), 0, 0}, static_cast<uint32_t>(cols), 1, kStore, 0, {0, 0, 0}, 0};
         [enc setBytes:&p length:sizeof(p) atIndex:7];
         const std::size_t groups = (rows + kTernaryRows - 1) / kTernaryRows;
         for (int i = 0; i < iterations; ++i) {

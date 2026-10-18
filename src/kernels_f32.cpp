@@ -175,6 +175,40 @@ void weighted_sum_f32(const float* values, std::size_t value_stride, std::size_t
     }
 }
 
+void silu_mul_f32(float* gate, const float* up, std::size_t n) {
+    std::size_t i = 0;
+    for (; i + 4 <= n; i += 4) {
+        const float32x4_t g = vld1q_f32(gate + i);
+        // g / (1 + exp(-g)), with the division by Newton-refined reciprocal estimate.
+        const float32x4_t denom = vaddq_f32(vdupq_n_f32(1.0f), exp_f32x4(vnegq_f32(g)));
+        float32x4_t inv = vrecpeq_f32(denom);
+        inv = vmulq_f32(inv, vrecpsq_f32(denom, inv));
+        inv = vmulq_f32(inv, vrecpsq_f32(denom, inv));
+        vst1q_f32(gate + i, vmulq_f32(vmulq_f32(g, inv), vld1q_f32(up + i)));
+    }
+    for (; i < n; ++i) gate[i] = gate[i] / (1.0f + std::exp(-gate[i])) * up[i];
+}
+
+void gelu_mul_f32(float* gate, const float* up, std::size_t n) {
+    // 0.5 x (1 + tanh(z)) with z = sqrt(2/pi) (x + 0.044715 x^3), and
+    // 1 + tanh(z) = 2 / (1 + exp(-2z)): gelu = x / (1 + exp(-2z)).
+    std::size_t i = 0;
+    for (; i + 4 <= n; i += 4) {
+        const float32x4_t x = vld1q_f32(gate + i);
+        const float32x4_t x3 = vmulq_f32(vmulq_f32(x, x), x);
+        const float32x4_t z = vmulq_n_f32(vmlaq_n_f32(x, x3, 0.044715f), 0.7978845608f);
+        const float32x4_t denom = vaddq_f32(vdupq_n_f32(1.0f), exp_f32x4(vmulq_n_f32(z, -2.0f)));
+        float32x4_t inv = vrecpeq_f32(denom);
+        inv = vmulq_f32(inv, vrecpsq_f32(denom, inv));
+        inv = vmulq_f32(inv, vrecpsq_f32(denom, inv));
+        vst1q_f32(gate + i, vmulq_f32(vmulq_f32(x, inv), vld1q_f32(up + i)));
+    }
+    for (; i < n; ++i) {
+        const float x = gate[i];
+        gate[i] = 0.5f * x * (1.0f + std::tanh(0.7978845608f * (x + 0.044715f * x * x * x))) * up[i];
+    }
+}
+
 #else
 
 float dot_f32(const float* a, const float* b, std::size_t n) {
@@ -219,6 +253,18 @@ void softmax_f32(std::span<float> x) {
     }
     const float scale = static_cast<float>(1.0 / sum);
     for (float& v : x) v *= scale;
+}
+
+
+void silu_mul_f32(float* gate, const float* up, std::size_t n) {
+    for (std::size_t i = 0; i < n; ++i) gate[i] = gate[i] / (1.0f + std::exp(-gate[i])) * up[i];
+}
+
+void gelu_mul_f32(float* gate, const float* up, std::size_t n) {
+    for (std::size_t i = 0; i < n; ++i) {
+        const float x = gate[i];
+        gate[i] = 0.5f * x * (1.0f + std::tanh(0.7978845608f * (x + 0.044715f * x * x * x))) * up[i];
+    }
 }
 
 #endif

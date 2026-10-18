@@ -14,6 +14,12 @@ void axpy_f32(float scale, const float* x, float* out, std::size_t n);
 // x[i] = exp(x[i] - max(x)) / sum, in place.
 void softmax_f32(std::span<float> x);
 
+// Gated activations, in place on `gate`: gate[i] = f(gate[i]) * up[i] with
+// f = SiLU or the tanh-approximation GELU. Vectorised on NEON (about 1e-6
+// absolute error from the polynomial exp).
+void silu_mul_f32(float* gate, const float* up, std::size_t n);
+void gelu_mul_f32(float* gate, const float* up, std::size_t n);
+
 // Attention's score step: scores[q][p] = scale * dot(queries[q], keys[p]) for
 // `nq` query vectors against `np` key rows (stride key_stride), all of `dim`
 // floats (a multiple of 4). Query q's row of scores is written to scores[q].

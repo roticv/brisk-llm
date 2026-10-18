@@ -98,8 +98,7 @@ void add_bias(std::span<float> x, std::span<const float> bias) {
     for (std::size_t i = 0; i < x.size(); ++i) x[i] += bias[i];
 }
 
-float silu(float x) { return x / (1.0f + std::exp(-x)); }
-float gelu(float x) { return 0.5f * x * (1.0f + std::tanh(0.7978845608f * (x + 0.044715f * x * x * x))); }
+
 
 std::uint32_t require_u32(const GgufFile& file, const std::string& key) {
     const auto value = file.get<std::uint32_t>(key);
@@ -646,9 +645,9 @@ void Session::eval_batch(std::span<const Token> tokens, bool all_logits) {
                         g[i] = r * r * u[i];
                     }
                 } else if (c.gelu) {
-                    for (std::size_t i = 0; i < c.feed_forward_dim; ++i) g[i] = gelu(g[i]) * u[i];
+                    kernels::gelu_mul_f32(g, u, c.feed_forward_dim);
                 } else {
-                    for (std::size_t i = 0; i < c.feed_forward_dim; ++i) g[i] = silu(g[i]) * u[i];
+                    kernels::silu_mul_f32(g, u, c.feed_forward_dim);
                 }
                 if (!layer.feed_forward_sub_norm.empty()) {
                     const std::span<float> gs(g, c.feed_forward_dim);
