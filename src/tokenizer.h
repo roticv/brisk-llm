@@ -71,6 +71,7 @@ private:
     std::uint32_t intern(const std::string& bytes);
     void encode_word(std::string_view word, std::vector<Token>& out) const;
     void encode_sentencepiece(std::string_view text, bool prefix_space, std::vector<Token>& out) const;
+    void encode_raw_bpe(std::string_view text, std::vector<Token>& out) const;
 
     std::vector<std::string> pieces_;  // raw bytes per token id
     std::vector<std::int32_t> types_;
@@ -83,6 +84,9 @@ private:
     // their scores, the byte-fallback tokens, and whether a word-initial space
     // is implied.
     bool sentencepiece_ = false;
+    // Gemma 4: BPE by merge rank over raw UTF-8 characters of the text with
+    // spaces as U+2581, split only at newline runs; byte fallback as SentencePiece.
+    bool raw_bpe_ = false;
     bool add_space_prefix_ = false;
     std::unordered_map<std::string, Token> spm_pieces_;
     std::vector<float> scores_;

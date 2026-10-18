@@ -185,6 +185,8 @@ Tokenizer::Tokenizer(const GgufFile& file) {
     if (model == "llama") {
         sentencepiece_ = true;
         add_space_prefix_ = file.get<bool>("tokenizer.ggml.add_space_prefix").value_or(true);
+    } else if (model == "gemma4") {
+        raw_bpe_ = true;
     } else if (model != "gpt2") {
         fail("unsupported tokenizer model '" + std::string(model.value_or("(none)")) + "'");
     } else if (pre == "qwen2") {
@@ -210,13 +212,16 @@ Tokenizer::Tokenizer(const GgufFile& file) {
 
     const ByteDecoder decode_bytes;
     pieces_.reserve(mapped.size());
-    if (sentencepiece_) {
+    if (sentencepiece_ || raw_bpe_) {
         // Pieces are text with U+2581 for spaces; byte tokens are "<0xNN>".
-        // pieces_ holds what a token decodes to, spm_pieces_ the raw form.
-        const auto scores = file.get<GgufArray>("tokenizer.ggml.scores");
-        if (!scores) fail("missing tokenizer.ggml.scores");
-        scores_ = scores->values<float>();
-        if (scores_.size() != mapped.size()) fail("scores length does not match the vocabulary");
+        // pieces_ holds what a token decodes to, spm_pieces_ the raw form
+        // (for the raw BPE, symbol_ids_ holds it too, as merge operands).
+        if (sentencepiece_) {
+            const auto scores = file.get<GgufArray>("tokenizer.ggml.scores");
+            if (!scores) fail("missing tokenizer.ggml.scores");
+            scores_ = scores->values<float>();
+            if (scores_.size() != mapped.size()) fail("scores length does not match the vocabulary");
+        }
         for (Token& t : byte_tokens_) t = -1;
         for (std::size_t id = 0; id < mapped.size(); ++id) {
             const std::string_view raw = mapped[id];
@@ -232,6 +237,7 @@ Tokenizer::Tokenizer(const GgufFile& file) {
                     text.replace(at, 3, " ");
                 }
                 spm_pieces_.emplace(std::string(raw), static_cast<Token>(id));
+                if (raw_bpe_) symbol_ids_[std::string(raw)] = static_cast<std::uint32_t>(id);
             }
             pieces_.push_back(std::move(text));
         }
@@ -259,13 +265,14 @@ Tokenizer::Tokenizer(const GgufFile& file) {
         for (int b = 0; b < 0x100; ++b) byte_symbols_[b] = intern(std::string(1, static_cast<char>(b)));
     }
 
-    if (const auto merges = file.get<GgufArray>("tokenizer.ggml.merges")) {
+    if (const auto merges = file.get<GgufArray>("tokenizer.ggml.merges"); merges && !sentencepiece_) {
         std::uint32_t rank = 0;
         for (const std::string_view line : merges->strings()) {
             const std::size_t space = line.find(' ', 1);
             if (space == std::string_view::npos) fail("malformed merge rule");
-            const std::string left = decode_bytes(line.substr(0, space));
-            const std::string right = decode_bytes(line.substr(space + 1));
+            // The raw BPE's merge operands are pieces as written; the byte-level one's are byte-mapped.
+            const std::string left = raw_bpe_ ? std::string(line.substr(0, space)) : decode_bytes(line.substr(0, space));
+            const std::string right = raw_bpe_ ? std::string(line.substr(space + 1)) : decode_bytes(line.substr(space + 1));
             const std::uint32_t left_id = intern(left);
             const std::uint32_t right_id = intern(right);
             const std::uint32_t result = intern(left + right);
@@ -287,8 +294,11 @@ Tokenizer::Tokenizer(const GgufFile& file) {
             add_end_token(special.id);
         }
     }
-    if (file.get<bool>("tokenizer.ggml.add_bos_token").value_or(false)) {
+    if (file.get<bool>("tokenizer.ggml.add_bos_token").value_or(raw_bpe_)) {  // Gemma 4 files omit the key; it adds BOS
         if (const auto bos = file.get<std::uint32_t>("tokenizer.ggml.bos_token_id")) bos_ = static_cast<Token>(*bos);
+    }
+    for (const Special& special : specials_) {
+        if (special.text == "<turn|>" || special.text == "<eos>") add_end_token(special.id);
     }
 }
 
@@ -397,9 +407,87 @@ std::vector<Token> Tokenizer::encode(std::string_view text, bool parse_special) 
             prev_special = false;
             continue;
         }
+        if (raw_bpe_) {
+            encode_raw_bpe(fragment.text, out);
+            continue;
+        }
         for (const std::string_view word : pretokenize(fragment.text, pre_)) encode_word(word, out);
     }
     return out;
+}
+
+// Gemma 4's BPE: spaces become U+2581, the text is cut only at newline
+// runs (a run that is itself a token is emitted whole), and each piece is
+// merged from its UTF-8 characters by merge rank; a symbol that is not a
+// token falls back to byte tokens.
+void Tokenizer::encode_raw_bpe(std::string_view input, std::vector<Token>& out) const {
+    std::string text;
+    for (const char c : input) {
+        if (c == ' ') text += "\xe2\x96\x81";
+        else text += c;
+    }
+    const auto vocab = static_cast<std::uint32_t>(pieces_.size());
+    auto emit = [&](std::uint32_t symbol) {
+        if (symbol < vocab) {
+            out.push_back(static_cast<Token>(symbol));
+            return;
+        }
+        for (const char c : extra_symbols_[symbol - vocab]) {
+            const Token byte = byte_tokens_[static_cast<unsigned char>(c)];
+            if (byte >= 0) out.push_back(byte);
+        }
+    };
+    constexpr std::uint32_t kNoSymbol = std::numeric_limits<std::uint32_t>::max();
+    for (std::size_t at = 0; at < text.size();) {
+        const bool newline = text[at] == '\n';
+        std::size_t end = at;
+        while (end < text.size() && (text[end] == '\n') == newline) ++end;
+        const std::string_view run(text.data() + at, end - at);
+        at = end;
+        if (newline) {
+            if (const auto it = symbol_ids_.find(std::string(run)); it != symbol_ids_.end() && it->second < vocab) {
+                out.push_back(static_cast<Token>(it->second));
+                continue;
+            }
+        }
+        // Characters as the initial symbols; a character outside the vocabulary gets byte fallback at once.
+        std::vector<std::uint32_t> symbols;
+        std::vector<std::string> unknown;  // text of the symbols that are not pieces, by position
+        for (std::size_t i = 0; i < run.size();) {
+            const auto lead = static_cast<unsigned char>(run[i]);
+            const std::size_t length = std::min<std::size_t>(lead < 0x80 ? 1 : lead < 0xE0 ? 2 : lead < 0xF0 ? 3 : 4, run.size() - i);
+            const std::string ch(run.substr(i, length));
+            i += length;
+            const auto it = symbol_ids_.find(ch);
+            if (it == symbol_ids_.end()) {
+                for (const char c : ch) {
+                    const Token byte = byte_tokens_[static_cast<unsigned char>(c)];
+                    symbols.push_back(byte >= 0 ? static_cast<std::uint32_t>(byte) : kNoSymbol);
+                }
+            } else {
+                symbols.push_back(it->second);
+            }
+        }
+        while (symbols.size() > 1) {
+            std::uint32_t best_rank = std::numeric_limits<std::uint32_t>::max(), best_result = 0;
+            std::size_t best_pos = 0;
+            for (std::size_t i = 0; i + 1 < symbols.size(); ++i) {
+                if (symbols[i] == kNoSymbol || symbols[i + 1] == kNoSymbol) continue;
+                const auto it = merges_.find(pair_key(symbols[i], symbols[i + 1]));
+                if (it != merges_.end() && it->second.rank < best_rank) {
+                    best_rank = it->second.rank;
+                    best_result = it->second.result;
+                    best_pos = i;
+                }
+            }
+            if (best_rank == std::numeric_limits<std::uint32_t>::max()) break;
+            symbols[best_pos] = best_result;
+            symbols.erase(symbols.begin() + static_cast<std::ptrdiff_t>(best_pos) + 1);
+        }
+        for (const std::uint32_t symbol : symbols) {
+            if (symbol != kNoSymbol) emit(symbol);
+        }
+    }
 }
 
 // SentencePiece encoding as llama.cpp does it: the text (spaces as U+2581)
