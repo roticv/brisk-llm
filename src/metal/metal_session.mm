@@ -141,12 +141,12 @@ struct MetalSession::Impl {
 
     Impl(const Model& m, std::span<const std::byte> f, std::size_t max_ctx) : model(m), file(f) {
         const ModelConfig& c = model.config();
-        max_context = max_ctx == 0 ? c.context_length : std::min<std::size_t>(max_ctx, c.context_length);
-        max_context = (max_context + 7) / 8 * 8;  // the attention kernel reads keys in blocks of 8 positions
-
         if (c.kv_from_start != 0 || c.ple_dim != 0 || c.head_dim_local != 0 || !c.ff_dims.empty()) {
             fail("Gemma 4 is not on the GPU yet (per-layer head sizes, K/V sharing and per-layer embeddings); run it on the CPU");
         }
+        max_context = max_ctx == 0 ? c.context_length : std::min<std::size_t>(max_ctx, c.context_length);
+        max_context = (max_context + 7) / 8 * 8;  // the attention kernel reads keys in blocks of 8 positions
+
         device = MTLCreateSystemDefaultDevice();
         if (device == nil) fail("no Metal device");
         queue = [device newCommandQueue];
@@ -753,9 +753,6 @@ struct StandaloneMatmul {
     uint32_t format = 0;  // the K-quant format id, when selected
 
     StandaloneMatmul() {
-        if (c.kv_from_start != 0 || c.ple_dim != 0 || c.head_dim_local != 0 || !c.ff_dims.empty()) {
-            fail("Gemma 4 is not on the GPU yet (per-layer head sizes, K/V sharing and per-layer embeddings); run it on the CPU");
-        }
         device = MTLCreateSystemDefaultDevice();
         if (device == nil) fail("no Metal device");
         queue = [device newCommandQueue];
