@@ -190,6 +190,14 @@ kernel void rms_norm(device const float* x [[buffer(0)]],
     }
 }
 
+// Gemma's final logit softcap: x = cap * tanh(x / cap).
+kernel void softcap(device float* x [[buffer(0)]],
+                    constant uint& count [[buffer(1)]],
+                    constant float& cap [[buffer(2)]],
+                    uint i [[thread_position_in_grid]]) {
+    if (i < count) x[i] = cap * precise::tanh(x[i] / cap);
+}
+
 kernel void to_half(device const float* in [[buffer(0)]],
                     device half* out [[buffer(1)]],
                     constant uint& count [[buffer(2)]],

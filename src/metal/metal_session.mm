@@ -119,7 +119,7 @@ struct MetalSession::Impl {
     id<MTLDevice> device = nil;
     id<MTLCommandQueue> queue = nil;
     id<MTLComputePipelineState> embed = nil, embed_q4k = nil, embed_q6k = nil, embed_q41 = nil, embed_q50 = nil,
-                                embed_q80 = nil, rms_norm = nil, matmul_kq = nil, ple_combine = nil, to_half = nil,
+                                embed_q80 = nil, rms_norm = nil, matmul_kq = nil, ple_combine = nil, to_half = nil, softcap = nil,
                                 attention_by_kind[2] = {nil, nil}, attention_small_by_kind[2] = {nil, nil}, matmul = nil, matmul_tq2 = nil, matmul_q4k = nil,
                                 matmul_q6k = nil, matmul_q41 = nil, matmul_mm = nil, matmul_mm_tq2 = nil,
                                 matmul_mm_q4k = nil, matmul_mm_q6k = nil, matmul_mm_q41 = nil, matmul_mm_q50 = nil,
@@ -218,6 +218,7 @@ struct MetalSession::Impl {
         }
         ple_combine = pipeline("ple_combine");
         to_half = pipeline("to_half");
+        softcap = pipeline("softcap");
         attention_combine = pipeline("attention_combine");
     }
 
@@ -765,21 +766,23 @@ struct MetalSession::Impl {
                     encode_matmul(enc, {Target{&g.o, embd, x_a}}, qdim, attended_a, n, kResidual, x);
                     encode_norm(enc, x, g.ffn_norm, normed_a, n, embd);
                 }
-                checkpoint("matmul");
+                checkpoint("matmul_o");
                 // gate, then up with the activation applied against it; BitNet
                 // normalises the product afterwards (that norm writes the half copy).
                 encode_gated(enc, g.gate, g.up, ff, embd, normed_a, n, bitnet ? kReluSqrMul : c.gelu ? kGeluMul : kSiluMul,
                              bitnet ? Act{gate, nil} : gate_a);
                 if (bitnet) encode_norm(enc, gate, g.ffn_sub_norm, gate_a, n, ff);
-                checkpoint("matmul");
+                checkpoint("matmul_gateup");
                 if (g.ple_gate.buffer != nil) {
                     // Gemma 4: x += post_ffn_norm(down(...)); then x += norm(proj(gelu(gate x) * ple[l])), scaled.
                     encode_matmul(enc, {Target{&g.down, embd, Act{proj, nil}}}, ff, gate_a, n);
                     // The gate reads x itself (its half copy, x_h, written here for the tile path).
                     encode_norm_add(enc, proj, g.ffn_post_norm, x, n, embd, nullptr, Act{nil, nil}, 1.0f, x_h);
+                    checkpoint("matmul_down");
                     encode_matmul(enc, {Target{&g.ple_gate, c.ple_dim, Act{ple_gate_out, ple_gate_h}}}, embd, Act{x, x_h}, n,
                                   kMulGelu, ple_in, l * n * c.ple_dim * 4);
                     encode_matmul(enc, {Target{&g.ple_proj, embd, Act{proj, nil}}}, c.ple_dim, Act{ple_gate_out, ple_gate_h}, n);
+                    checkpoint("matmul_ple");
                     const bool last = l + 1 == layers.size();
                     encode_norm_add(enc, proj, g.ple_post_norm, x, n, embd, last ? nullptr : &layers[l + 1].attn_norm, normed_a,
                                     g.out_scale);
@@ -802,6 +805,14 @@ struct MetalSession::Impl {
             } else {
                 encode_norm(enc, x, output_norm, normed_a, 1, embd, (n - 1) * embd * 4, 0);
                 encode_matmul(enc, {Target{&output, c.vocab_size, logits_a}}, embd, normed_a, 1);
+            }
+            if (c.final_softcap != 0.0f) {
+                [enc setComputePipelineState:softcap];
+                set(enc, logits, 0);
+                const uint32_t count = static_cast<uint32_t>((all_logits ? n : 1) * c.vocab_size);
+                bytes(enc, count, 1);
+                bytes(enc, c.final_softcap, 2);
+                [enc dispatchThreads:MTLSizeMake(count, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
             }
             checkpoint("output");
             [enc endEncoding];
@@ -847,9 +858,6 @@ struct MetalSession::Impl {
         const std::size_t count = (all_logits ? n : 1) * c.vocab_size;
         logits_out.resize(count);
         std::memcpy(logits_out.data(), logits.contents, count * sizeof(float));
-        if (c.final_softcap != 0.0f) {
-            for (float& v : logits_out) v = c.final_softcap * std::tanh(v / c.final_softcap);
-        }
         position += n;
     }
 };
