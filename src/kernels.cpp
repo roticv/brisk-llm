@@ -36,6 +36,25 @@ void matvec_q4_0x4_generic(const void* w, std::size_t rows, std::size_t cols, co
     for (std::size_t g = 0; g < rows / 4; ++g) dot_q4_0x4_q8_0(weights + g * blocks, activations, blocks, out + 4 * g);
 }
 
+void matvec_q5_0x4_generic(const void* w, std::size_t rows, std::size_t cols, const void* x, float* out) {
+    const auto* weights = static_cast<const BlockQ5_0x4*>(w);
+    const auto* activations = static_cast<const BlockQ8_0*>(x);
+    const std::size_t blocks = cols / kBlockSize;
+    for (std::size_t g = 0; g < rows / 4; ++g) dot_q5_0x4_q8_0(weights + g * blocks, activations, blocks, out + 4 * g);
+}
+
+void matmul_q5_0x4_generic(const void* w, std::size_t rows, std::size_t cols, const void* x, std::size_t n, float* out,
+                      std::size_t out_stride) {
+    const auto* weights = static_cast<const BlockQ5_0x4*>(w);
+    const auto* activations = static_cast<const BlockQ8_0*>(x);
+    const std::size_t blocks = cols / kBlockSize;
+    for (std::size_t g = 0; g < rows / 4; ++g) {
+        for (std::size_t t = 0; t < n; ++t) {
+            dot_q5_0x4_q8_0(weights + g * blocks, activations + t * blocks, blocks, out + t * out_stride + 4 * g);
+        }
+    }
+}
+
 void matvec_tq2_0x4_generic(const void* w, std::size_t rows, std::size_t cols, const void* x, float* out) {
     const auto* weights = static_cast<const BlockTQ2_0x4*>(w);
     const auto* activations = static_cast<const BlockQ8_K*>(x);
@@ -92,6 +111,8 @@ KernelSet generic_kernels(WeightFormat format) {
     switch (format) {
         case WeightFormat::Q4_0x4:
             return {matvec_q4_0x4_generic, matmul_q4_0x4_generic};
+        case WeightFormat::Q5_0x4:
+            return {matvec_q5_0x4_generic, matmul_q5_0x4_generic};
         case WeightFormat::TQ2_0x4:
             return {matvec_tq2_0x4_generic, matmul_tq2_0x4_generic};
         case WeightFormat::Q4_Kx4:
@@ -165,13 +186,21 @@ std::vector<NamedKernels> neon_kernels(WeightFormat format) {
             out.push_back({"neon", {matvec_q4_1_neon, matmul_q4_1_neon}});
             if (dotprod) out.push_back({"dotprod", {matvec_q4_1_dotprod, matmul_q4_1_dotprod}});
             break;
+        case WeightFormat::Q5_0x4:
+            if (dotprod && cpu_features().i8mm) {
+                out.push_back({"i8mm", {matvec_q5_0x4_dotprod, matmul_q5_0x4_i8mm, prepare_q4_0x4_i8mm,
+                                        prepared_bytes_q4_0x4_i8mm}});
+            }
+            break;
         case WeightFormat::Q5_0:
             out.push_back({"neon", {matvec_q5_0_neon, matmul_q5_0_neon}});
             if (dotprod) out.push_back({"dotprod", {matvec_q5_0_dotprod, matmul_q5_0_dotprod}});
+            if (dotprod && cpu_features().i8mm) out.push_back({"i8mm", {matvec_q5_0_dotprod, matmul_q5_0_i8mm}});
             break;
         case WeightFormat::Q8_0:
             out.push_back({"neon", {matvec_q8_0_neon, matmul_q8_0_neon}});
             if (dotprod) out.push_back({"dotprod", {matvec_q8_0_dotprod, matmul_q8_0_dotprod}});
+            if (dotprod && cpu_features().i8mm) out.push_back({"i8mm", {matvec_q8_0_dotprod, matmul_q8_0_i8mm}});
             break;
         case WeightFormat::F32:
             break;

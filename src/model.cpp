@@ -25,7 +25,7 @@ float bfloat_to_float(std::uint16_t b) {
 }
 
 void embedding_row(const Matrix& m, std::size_t r, std::span<float> out) {
-    const bool grouped = m.format == WeightFormat::Q4_0x4 || m.format == WeightFormat::TQ2_0x4 ||
+    const bool grouped = m.format == WeightFormat::Q4_0x4 || m.format == WeightFormat::Q5_0x4 || m.format == WeightFormat::TQ2_0x4 ||
                          m.format == WeightFormat::Q4_Kx4 || m.format == WeightFormat::Q6_Kx4;
     const std::byte* row = m.format == WeightFormat::F32 || grouped ? nullptr : m.row(r);
     switch (m.format) {
@@ -41,6 +41,10 @@ void embedding_row(const Matrix& m, std::size_t r, std::span<float> out) {
             break;
         case WeightFormat::Q4_1: dequantize_q4_1(reinterpret_cast<const BlockQ4_1*>(row), out.data(), m.cols); break;
         case WeightFormat::Q5_0: dequantize_q5_0(reinterpret_cast<const BlockQ5_0*>(row), out.data(), m.cols); break;
+        case WeightFormat::Q5_0x4:
+            dequantize_q5_0x4_row(reinterpret_cast<const BlockQ5_0x4*>(m.bytes.data() + (r / 4) * 4 * m.row_bytes()),
+                                  r % 4, out.data(), m.cols);
+            break;
         case WeightFormat::Q8_0: dequantize_q8_0(reinterpret_cast<const BlockQ8_0*>(row), out.data(), m.cols); break;
         case WeightFormat::Q4_K: dequantize_q4_k(reinterpret_cast<const BlockQ4_K*>(row), out.data(), m.cols); break;
         case WeightFormat::Q6_K: dequantize_q6_k(reinterpret_cast<const BlockQ6_K*>(row), out.data(), m.cols); break;
@@ -281,6 +285,13 @@ Matrix Model::load_matrix(const GgufFile& file, std::string_view name, std::size
             repack_q4_0x4(reinterpret_cast<const BlockQ4_0*>(info->data.data()), rows, blocks,
                           reinterpret_cast<BlockQ4_0x4*>(packed.data()));
             m.format = WeightFormat::Q4_0x4;
+            m.bytes = packed;
+        } else if (m.format == WeightFormat::Q5_0 && rows % 4 == 0 && repack_ && kernels::prefers_q4_0x4()) {
+            const std::size_t blocks = cols / kBlockSize;
+            std::vector<std::byte>& packed = packed_.emplace_back(rows / 4 * blocks * sizeof(BlockQ5_0x4));
+            repack_q5_0x4(reinterpret_cast<const BlockQ5_0*>(info->data.data()), rows, blocks,
+                          reinterpret_cast<BlockQ5_0x4*>(packed.data()));
+            m.format = WeightFormat::Q5_0x4;
             m.bytes = packed;
         } else if (m.format == WeightFormat::TQ2_0 && rows % 4 == 0 && repack_ && kernels::prefers_q4_0x4()) {
             const std::size_t blocks = cols / kSuperBlockSize;

@@ -17,6 +17,7 @@ std::size_t block_elements(WeightFormat format) {
         case WeightFormat::Q4_0x4:
         case WeightFormat::Q4_1: return kBlockSize;
         case WeightFormat::Q5_0: return kBlockSize;
+        case WeightFormat::Q5_0x4: return kBlockSize;
         case WeightFormat::Q8_0: return kBlockSize;
         case WeightFormat::Q4_K:
         case WeightFormat::Q6_K:
@@ -35,6 +36,7 @@ std::size_t block_bytes(WeightFormat format) {
         case WeightFormat::Q4_0x4: return sizeof(BlockQ4_0x4) / 4;  // per row
         case WeightFormat::Q4_1: return sizeof(BlockQ4_1);
         case WeightFormat::Q5_0: return sizeof(BlockQ5_0);
+        case WeightFormat::Q5_0x4: return sizeof(BlockQ5_0x4) / 4;  // per row
         case WeightFormat::Q8_0: return sizeof(BlockQ8_0);
         case WeightFormat::Q4_K: return sizeof(BlockQ4_K);
         case WeightFormat::Q6_K: return sizeof(BlockQ6_K);
@@ -317,6 +319,78 @@ void dequantize_q4_0x4_row(const BlockQ4_0x4* group, std::size_t row_in_group, f
             const int q = high ? (group[b].qs[byte] >> 4) : (group[b].qs[byte] & 0x0F);
             out[b * kBlockSize + e] = static_cast<float>(q - 8) * d;
         }
+    }
+}
+
+// Where the fifth bit of element e of row r lives in a Q5_0x4 block: byte of qh and bit.
+inline void q5_0x4_bit_position(std::size_t r, std::size_t e, std::size_t& byte, int& bit) {
+    std::size_t nibble_byte;
+    bool high;
+    q4_0x4_position(r, e, nibble_byte, high);
+    const std::size_t k = nibble_byte / 16, lane = nibble_byte % 16;
+    byte = 4 * k + (high ? 2 : 0) + lane / 8;
+    bit = static_cast<int>(lane % 8);
+}
+
+void repack_q5_0x4(const BlockQ5_0* in, std::size_t rows, std::size_t blocks, BlockQ5_0x4* out) {
+    for (std::size_t g = 0; g < rows / 4; ++g) {
+        for (std::size_t b = 0; b < blocks; ++b) {
+            BlockQ5_0x4& packed = out[g * blocks + b];
+            std::memset(packed.qs, 0, sizeof(packed.qs));
+            std::memset(packed.qh, 0, sizeof(packed.qh));
+            for (std::size_t r = 0; r < 4; ++r) {
+                const BlockQ5_0& block = in[(g * 4 + r) * blocks + b];
+                packed.d[r] = block.d;
+                std::uint32_t qh;
+                std::memcpy(&qh, block.qh, 4);
+                for (std::size_t e = 0; e < kBlockSize; ++e) {
+                    const std::uint8_t q = e < 16 ? (block.qs[e] & 0x0F) : (block.qs[e - 16] >> 4);
+                    std::size_t byte;
+                    bool high;
+                    q4_0x4_position(r, e, byte, high);
+                    packed.qs[byte] |= static_cast<std::uint8_t>(high ? q << 4 : q);
+                    std::size_t hbyte;
+                    int bit;
+                    q5_0x4_bit_position(r, e, hbyte, bit);
+                    packed.qh[hbyte] |= static_cast<std::uint8_t>(((qh >> e) & 1) << bit);
+                }
+            }
+        }
+    }
+}
+
+void dequantize_q5_0x4_row(const BlockQ5_0x4* group, std::size_t row_in_group, float* out, std::size_t count) {
+    for (std::size_t b = 0; b < count / kBlockSize; ++b) {
+        const float d = half_to_float(group[b].d[row_in_group]);
+        for (std::size_t e = 0; e < kBlockSize; ++e) {
+            std::size_t byte, hbyte;
+            bool high;
+            int bit;
+            q4_0x4_position(row_in_group, e, byte, high);
+            q5_0x4_bit_position(row_in_group, e, hbyte, bit);
+            const int q = (high ? (group[b].qs[byte] >> 4) : (group[b].qs[byte] & 0x0F)) | (((group[b].qh[hbyte] >> bit) & 1) << 4);
+            out[b * kBlockSize + e] = static_cast<float>(q - 16) * d;
+        }
+    }
+}
+
+void dot_q5_0x4_q8_0(const BlockQ5_0x4* w, const BlockQ8_0* x, std::size_t blocks, float out[4]) {
+    for (std::size_t r = 0; r < 4; ++r) {
+        float sum = 0.0f;
+        for (std::size_t b = 0; b < blocks; ++b) {
+            std::int32_t acc = 0;
+            for (std::size_t e = 0; e < kBlockSize; ++e) {
+                std::size_t byte, hbyte;
+                bool high;
+                int bit;
+                q4_0x4_position(r, e, byte, high);
+                q5_0x4_bit_position(r, e, hbyte, bit);
+                const int q = (high ? (w[b].qs[byte] >> 4) : (w[b].qs[byte] & 0x0F)) | (((w[b].qh[hbyte] >> bit) & 1) << 4);
+                acc += (q - 16) * x[b].qs[e];
+            }
+            sum += static_cast<float>(acc) * half_to_float(w[b].d[r]) * half_to_float(x[b].d);
+        }
+        out[r] = sum;
     }
 }
 

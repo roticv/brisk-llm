@@ -214,6 +214,31 @@ inline float dot_row_q8_0(const BlockQ8_0* w, const BlockQ8_0* x, std::size_t bl
     return total;
 }
 
+// ---- Q5_0x4 ---------------------------------------------------------------
+
+// The four 16-byte vectors of a Q5_0x4 block as unsigned 5-bit values
+// (0..31): for vector k, out[k][0] holds the low-nibble elements and
+// out[k][1] the high-nibble ones, each with its fifth bit in place. The
+// bits come from qh by a table lookup that spreads each byte over 8 lanes
+// and a bit test against the lane's mask.
+inline void unpack_q5_0x4_u8(const BlockQ5_0x4& block, uint8x16_t out[4][2]) {
+    const uint8x16_t low_mask = vdupq_n_u8(0x0F);
+    const uint8x16_t lane_bits = {1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128};
+    const uint8x16_t qh = vld1q_u8(block.qh);
+    for (int k = 0; k < 4; ++k) {
+        const uint8x16_t v = vld1q_u8(block.qs + 16 * k);
+        const auto b = static_cast<std::uint8_t>(4 * k);
+        const uint8x16_t idx_low = {b, b, b, b, b, b, b, b, static_cast<std::uint8_t>(b + 1), static_cast<std::uint8_t>(b + 1),
+                                    static_cast<std::uint8_t>(b + 1), static_cast<std::uint8_t>(b + 1), static_cast<std::uint8_t>(b + 1),
+                                    static_cast<std::uint8_t>(b + 1), static_cast<std::uint8_t>(b + 1), static_cast<std::uint8_t>(b + 1)};
+        const uint8x16_t idx_high = vaddq_u8(idx_low, vdupq_n_u8(2));
+        const uint8x16_t fifth_low = vandq_u8(vtstq_u8(vqtbl1q_u8(qh, idx_low), lane_bits), vdupq_n_u8(0x10));
+        const uint8x16_t fifth_high = vandq_u8(vtstq_u8(vqtbl1q_u8(qh, idx_high), lane_bits), vdupq_n_u8(0x10));
+        out[k][0] = vorrq_u8(vandq_u8(v, low_mask), fifth_low);
+        out[k][1] = vorrq_u8(vshrq_n_u8(v, 4), fifth_high);
+    }
+}
+
 // Decodes a Q6_K block into 16 vectors of 16 signed values, offset removed,
 // in weight order (so vector g holds the elements scaled by scales[g]).
 inline void unpack_q6_k(const BlockQ6_K& block, int8x16_t q[16]) {

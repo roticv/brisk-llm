@@ -10,6 +10,8 @@
 #include <cstring>
 
 #include "kernels.h"
+
+#include <type_traits>
 #include "kernels_neon_common.h"
 
 namespace brisk::kernels {
@@ -26,12 +28,28 @@ inline int32x4_t dot_block(int8x16_t w_low, int8x16_t w_high, const BlockQ8_0& x
     return vdotq_s32(acc, w_high, vld1q_s8(x.qs + 16));
 }
 
+// A block's 32 weights as signed low and high 16-element vectors, for the
+// 32-element formats the plain (non-repacked) tiles take.
+inline void unpack_block(const BlockQ4_0& b, int8x16_t& low, int8x16_t& high) { neon::unpack_q4_0(b, low, high); }
+inline void unpack_block(const BlockQ5_0& b, int8x16_t& low, int8x16_t& high) { neon::unpack_q5_0(b, low, high); }
+inline void unpack_block(const BlockQ8_0& b, int8x16_t& low, int8x16_t& high) {
+    low = vld1q_s8(b.qs);
+    high = vld1q_s8(b.qs + 16);
+}
+template <typename Block>
+inline float dot_row_any(const Block* w, const BlockQ8_0* x, std::size_t blocks) {
+    if constexpr (std::is_same_v<Block, BlockQ4_0>) return neon::dot_row(w, x, blocks, dot_block);
+    else if constexpr (std::is_same_v<Block, BlockQ5_0>) return neon::dot_row_q5_0(w, x, blocks, dot_block);
+    else return neon::dot_row_q8_0(w, x, blocks, dot_block);
+}
+
 // Rows r and r+1 of a block as four vectors, one per 8-element chunk, each
 // holding [row r chunk | row r+1 chunk], the layout smmla wants.
-inline void zip_rows(const BlockQ4_0& r0, const BlockQ4_0& r1, int8x16_t a[4]) {
+template <typename Block>
+inline void zip_rows(const Block& r0, const Block& r1, int8x16_t a[4]) {
     int8x16_t l0, h0, l1, h1;
-    neon::unpack_q4_0(r0, l0, h0);
-    neon::unpack_q4_0(r1, l1, h1);
+    unpack_block(r0, l0, h0);
+    unpack_block(r1, l1, h1);
     a[0] = vreinterpretq_s8_s64(vzip1q_s64(vreinterpretq_s64_s8(l0), vreinterpretq_s64_s8(l1)));
     a[1] = vreinterpretq_s8_s64(vzip2q_s64(vreinterpretq_s64_s8(l0), vreinterpretq_s64_s8(l1)));
     a[2] = vreinterpretq_s8_s64(vzip1q_s64(vreinterpretq_s64_s8(h0), vreinterpretq_s64_s8(h1)));
@@ -62,10 +80,11 @@ inline int32x4_t mmla4(const int8x16_t a[4], const int8x16_t b[4]) {
 }
 
 // 4 weight rows x 4 tokens over a whole row; out[(t + i) * rows + r + j].
-void tile_4x4(const BlockQ4_0* w, std::size_t blocks, const BlockQ8_0* x, std::size_t x_stride, float* out,
+template <typename Block>
+void tile_4x4(const Block* w, std::size_t blocks, const BlockQ8_0* x, std::size_t x_stride, float* out,
               std::size_t out_stride) {
     float32x4_t acc[2][2] = {{vdupq_n_f32(0.0f), vdupq_n_f32(0.0f)}, {vdupq_n_f32(0.0f), vdupq_n_f32(0.0f)}};
-    const BlockQ4_0* rows[4] = {w, w + blocks, w + 2 * blocks, w + 3 * blocks};
+    const Block* rows[4] = {w, w + blocks, w + 2 * blocks, w + 3 * blocks};
     const BlockQ8_0* tokens[4] = {x, x + x_stride, x + 2 * x_stride, x + 3 * x_stride};
     for (std::size_t blk = 0; blk < blocks; ++blk) {
         int8x16_t a[2][4], b[2][4];
@@ -94,33 +113,54 @@ void tile_4x4(const BlockQ4_0* w, std::size_t blocks, const BlockQ8_0* x, std::s
     }
 }
 
+// Batched multiply on plain 32-element blocks: 4x4 smmla tiles, with bands
+// of rows reused across the token tiles so the weights stay in L1.
+template <typename Block>
+void matmul_plain_i8mm(const void* w, std::size_t rows, std::size_t cols, const void* x, std::size_t n, float* out,
+                       std::size_t out_stride) {
+    const auto* weights = static_cast<const Block*>(w);
+    const auto* activations = static_cast<const BlockQ8_0*>(x);
+    const std::size_t blocks = cols / kBlockSize;
+    constexpr std::size_t kBand = 32;  // rows per band: 32 rows of a 1152-wide Q8_0 matrix are 39 KB
+
+    for (std::size_t r0 = 0; r0 < rows; r0 += kBand) {
+        const std::size_t r1 = std::min(rows, r0 + kBand);
+        std::size_t t = 0;
+        for (; t + 4 <= n; t += 4) {
+            std::size_t r = r0;
+            for (; r + 4 <= r1; r += 4) {
+                tile_4x4(weights + r * blocks, blocks, activations + t * blocks, blocks, out + t * out_stride + r, out_stride);
+            }
+            for (; r < r1; ++r) {
+                for (std::size_t i = 0; i < 4; ++i) {
+                    out[(t + i) * out_stride + r] = dot_row_any(weights + r * blocks, activations + (t + i) * blocks, blocks);
+                }
+            }
+        }
+        // Leftover tokens: one row at a time with the dot-product kernel.
+        for (; t < n; ++t) {
+            for (std::size_t r = r0; r < r1; ++r) {
+                out[t * out_stride + r] = dot_row_any(weights + r * blocks, activations + t * blocks, blocks);
+            }
+        }
+    }
+}
+
 }  // namespace
 
 void matmul_q4_0_i8mm(const void* w, std::size_t rows, std::size_t cols, const void* x, std::size_t n, float* out,
                       std::size_t out_stride) {
-    const auto* weights = static_cast<const BlockQ4_0*>(w);
-    const auto* activations = static_cast<const BlockQ8_0*>(x);
-    const std::size_t blocks = cols / kBlockSize;
+    matmul_plain_i8mm<BlockQ4_0>(w, rows, cols, x, n, out, out_stride);
+}
 
-    std::size_t r = 0;
-    for (; r + 4 <= rows; r += 4) {
-        std::size_t t = 0;
-        for (; t + 4 <= n; t += 4) {
-            tile_4x4(weights + r * blocks, blocks, activations + t * blocks, blocks, out + t * out_stride + r, out_stride);
-        }
-        // Leftover tokens: one row at a time with the dot-product kernel.
-        for (; t < n; ++t) {
-            for (std::size_t i = 0; i < 4; ++i) {
-                out[t * out_stride + r + i] = neon::dot_row(weights + (r + i) * blocks, activations + t * blocks, blocks, dot_block);
-            }
-        }
-    }
-    // Leftover rows.
-    for (; r < rows; ++r) {
-        for (std::size_t t = 0; t < n; ++t) {
-            out[t * out_stride + r] = neon::dot_row(weights + r * blocks, activations + t * blocks, blocks, dot_block);
-        }
-    }
+void matmul_q5_0_i8mm(const void* w, std::size_t rows, std::size_t cols, const void* x, std::size_t n, float* out,
+                      std::size_t out_stride) {
+    matmul_plain_i8mm<BlockQ5_0>(w, rows, cols, x, n, out, out_stride);
+}
+
+void matmul_q8_0_i8mm(const void* w, std::size_t rows, std::size_t cols, const void* x, std::size_t n, float* out,
+                      std::size_t out_stride) {
+    matmul_plain_i8mm<BlockQ8_0>(w, rows, cols, x, n, out, out_stride);
 }
 
 namespace {
@@ -183,27 +223,49 @@ inline int32x4_t usmmla4(const uint8x16_t a[4], const int8x16_t b[4]) {
     return vusmmlaq_s32(acc, a[3], b[3]);
 }
 
-// 4 packed rows x (2 * kPairs) tokens. Weights stay as unsigned nibbles (0..15);
-// the offset of 8 is removed afterwards: sum((q - 8) x) = sum(q x) - 8 sum(x).
-template <int kPairs>
-void tile_x4(const BlockQ4_0x4* group, std::size_t blocks, const TokenPairBlock* pair_blocks, float* out,
-             std::size_t out_stride) {
+// The unsigned chunk vectors of a four-row block for the usmmla tiles:
+// a[rp][c] holds chunk c of rows 2rp, 2rp+1 (Q4_0x4: nibbles 0..15, Q5_0x4:
+// 5-bit values 0..31), and the offset the activation sums must remove.
+inline void unpack_x4(const BlockQ4_0x4& wb, uint8x16_t a[2][4]) {
     const uint8x16_t low_mask = vdupq_n_u8(0x0F);
+    for (int rp = 0; rp < 2; ++rp) {
+        const uint8x16_t v0 = vld1q_u8(wb.qs + 32 * rp);
+        const uint8x16_t v1 = vld1q_u8(wb.qs + 32 * rp + 16);
+        a[rp][0] = vandq_u8(v0, low_mask);  // chunk 0
+        a[rp][1] = vandq_u8(v1, low_mask);  // chunk 1
+        a[rp][2] = vshrq_n_u8(v0, 4);       // chunk 2
+        a[rp][3] = vshrq_n_u8(v1, 4);       // chunk 3
+    }
+}
+inline void unpack_x4(const BlockQ5_0x4& wb, uint8x16_t a[2][4]) {
+    uint8x16_t u[4][2];
+    neon::unpack_q5_0x4_u8(wb, u);
+    for (int rp = 0; rp < 2; ++rp) {
+        a[rp][0] = u[2 * rp][0];
+        a[rp][1] = u[2 * rp + 1][0];
+        a[rp][2] = u[2 * rp][1];
+        a[rp][3] = u[2 * rp + 1][1];
+    }
+}
+template <typename Block> constexpr float offset_of();
+template <> constexpr float offset_of<BlockQ4_0x4>() { return 8.0f; }
+template <> constexpr float offset_of<BlockQ5_0x4>() { return 16.0f; }
+
+// 4 packed rows x (2 * kPairs) tokens. Weights stay unsigned; the offset is
+// removed afterwards: sum((q - o) x) = sum(q x) - o sum(x). pair.offset holds
+// 8 * scales * sum(x), so a format with offset o scales it by o / 8.
+template <int kPairs, typename Block>
+void tile_x4(const Block* group, std::size_t blocks, const TokenPairBlock* pair_blocks, float* out,
+             std::size_t out_stride) {
+    constexpr float offset_scale = offset_of<Block>() / 8.0f;
     float32x4_t acc[2][kPairs];
     for (int rp = 0; rp < 2; ++rp) {
         for (int tp = 0; tp < kPairs; ++tp) acc[rp][tp] = vdupq_n_f32(0.0f);
     }
     for (std::size_t blk = 0; blk < blocks; ++blk) {
-        const BlockQ4_0x4& wb = group[blk];
+        const Block& wb = group[blk];
         uint8x16_t a[2][4];
-        for (int rp = 0; rp < 2; ++rp) {
-            const uint8x16_t v0 = vld1q_u8(wb.qs + 32 * rp);
-            const uint8x16_t v1 = vld1q_u8(wb.qs + 32 * rp + 16);
-            a[rp][0] = vandq_u8(v0, low_mask);  // chunk 0
-            a[rp][1] = vandq_u8(v1, low_mask);  // chunk 1
-            a[rp][2] = vshrq_n_u8(v0, 4);       // chunk 2
-            a[rp][3] = vshrq_n_u8(v1, 4);       // chunk 3
-        }
+        unpack_x4(wb, a);
         const float32x4_t d = vcvt_f32_f16(vreinterpret_f16_u16(vld1_u16(wb.d)));
         const float32x4_t rs[2] = {vzip1q_f32(d, d), vzip2q_f32(d, d)};  // [d0 d0 d1 d1], [d2 d2 d3 d3]
         for (int tp = 0; tp < kPairs; ++tp) {
@@ -211,7 +273,7 @@ void tile_x4(const BlockQ4_0x4* group, std::size_t blocks, const TokenPairBlock*
             for (int rp = 0; rp < 2; ++rp) {
                 const float32x4_t scaled = vmulq_f32(rs[rp], pair.scales);
                 acc[rp][tp] = vmlaq_f32(acc[rp][tp], vcvtq_f32_s32(usmmla4(a[rp], pair.b)), scaled);
-                acc[rp][tp] = vmlsq_f32(acc[rp][tp], rs[rp], pair.offset);
+                acc[rp][tp] = vmlsq_f32(acc[rp][tp], vmulq_n_f32(rs[rp], offset_scale), pair.offset);
             }
         }
     }
@@ -228,9 +290,10 @@ void tile_x4(const BlockQ4_0x4* group, std::size_t blocks, const TokenPairBlock*
 
 }  // namespace
 
-void matmul_q4_0x4_i8mm(const void* w, std::size_t rows, std::size_t cols, const void* x, std::size_t n, float* out,
-                      std::size_t out_stride) {
-    const auto* weights = static_cast<const BlockQ4_0x4*>(w);
+template <typename Block, void (*Matvec)(const void*, std::size_t, std::size_t, const void*, float*)>
+void matmul_x4_i8mm(const void* w, std::size_t rows, std::size_t cols, const void* x, std::size_t n, float* out,
+                    std::size_t out_stride) {
+    const auto* weights = static_cast<const Block*>(w);
     const std::size_t blocks = cols / kBlockSize;
     const Prepared prepared = view_prepared(x, n, blocks);
     const TokenPairBlock* pairs = prepared.pairs;
@@ -243,20 +306,30 @@ void matmul_q4_0x4_i8mm(const void* w, std::size_t rows, std::size_t cols, const
         std::size_t t = 0;
         for (; t + 8 <= n; t += 8) {
             for (std::size_t g = g0; g < g1; ++g) {
-                tile_x4<4>(weights + g * blocks, blocks, pairs + (t / 2) * blocks, out + t * out_stride + 4 * g, out_stride);
+                tile_x4<4, Block>(weights + g * blocks, blocks, pairs + (t / 2) * blocks, out + t * out_stride + 4 * g, out_stride);
             }
         }
         for (; t + 4 <= n; t += 4) {
             for (std::size_t g = g0; g < g1; ++g) {
-                tile_x4<2>(weights + g * blocks, blocks, pairs + (t / 2) * blocks, out + t * out_stride + 4 * g, out_stride);
+                tile_x4<2, Block>(weights + g * blocks, blocks, pairs + (t / 2) * blocks, out + t * out_stride + 4 * g, out_stride);
             }
         }
         for (; t < n; ++t) {
             for (std::size_t g = g0; g < g1; ++g) {
-                matvec_q4_0x4_dotprod(weights + g * blocks, 4, cols, activations + t * blocks, out + t * out_stride + 4 * g);
+                Matvec(weights + g * blocks, 4, cols, activations + t * blocks, out + t * out_stride + 4 * g);
             }
         }
     }
+}
+
+void matmul_q4_0x4_i8mm(const void* w, std::size_t rows, std::size_t cols, const void* x, std::size_t n, float* out,
+                      std::size_t out_stride) {
+    matmul_x4_i8mm<BlockQ4_0x4, matvec_q4_0x4_dotprod>(w, rows, cols, x, n, out, out_stride);
+}
+
+void matmul_q5_0x4_i8mm(const void* w, std::size_t rows, std::size_t cols, const void* x, std::size_t n, float* out,
+                        std::size_t out_stride) {
+    matmul_x4_i8mm<BlockQ5_0x4, matvec_q5_0x4_dotprod>(w, rows, cols, x, n, out, out_stride);
 }
 
 // ---- 256-element formats: TQ2_0x4, Q4_Kx4, Q6_Kx4 ------------------------------

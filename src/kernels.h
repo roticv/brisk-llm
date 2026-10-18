@@ -88,6 +88,14 @@ void matmul_q5_0_dotprod(const void* w, std::size_t rows, std::size_t cols, cons
 void matvec_q8_0_dotprod(const void* w, std::size_t rows, std::size_t cols, const void* x, float* out);
 void matmul_q8_0_dotprod(const void* w, std::size_t rows, std::size_t cols, const void* x, std::size_t n, float* out,
                          std::size_t out_stride);
+void matmul_q5_0_i8mm(const void* w, std::size_t rows, std::size_t cols, const void* x, std::size_t n, float* out,
+                      std::size_t out_stride);
+// Q5_0x4: the four-row interleaved layout, taking Q4_0x4's prepared activations.
+void matvec_q5_0x4_dotprod(const void* w, std::size_t rows, std::size_t cols, const void* x, float* out);
+void matmul_q5_0x4_i8mm(const void* w, std::size_t rows, std::size_t cols, const void* x, std::size_t n, float* out,
+                        std::size_t out_stride);
+void matmul_q8_0_i8mm(const void* w, std::size_t rows, std::size_t cols, const void* x, std::size_t n, float* out,
+                      std::size_t out_stride);
 void matvec_q4_1_dotprod(const void* w, std::size_t rows, std::size_t cols, const void* x, float* out);
 void matmul_q4_1_dotprod(const void* w, std::size_t rows, std::size_t cols, const void* x, std::size_t n, float* out,
                       std::size_t out_stride);

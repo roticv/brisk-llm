@@ -13,7 +13,7 @@ constexpr std::size_t kBlockSize = 32;  // weights per block for Q4_0 and Q8_0
 
 // Storage formats of weight matrices that the engine can multiply by.
 // Q4_0x4 is Q4_0 repacked at load time (see BlockQ4_0x4); it never appears in files.
-enum class WeightFormat { F32, Q4_0, Q4_1, Q5_0, Q8_0, Q4_K, Q6_K, Q4_0x4, TQ2_0, TQ2_0x4, Q4_Kx4, Q6_Kx4 };
+enum class WeightFormat { F32, Q4_0, Q4_1, Q5_0, Q8_0, Q4_K, Q6_K, Q4_0x4, Q5_0x4, TQ2_0, TQ2_0x4, Q4_Kx4, Q6_Kx4 };
 
 // Weights per block and bytes per block of a quantised format.
 std::size_t block_elements(WeightFormat format);
@@ -45,6 +45,8 @@ static_assert(sizeof(BlockQ4_0x4) == 72);
 void repack_q4_0x4(const BlockQ4_0* in, std::size_t rows, std::size_t blocks, BlockQ4_0x4* out);
 void dequantize_q4_0x4_row(const BlockQ4_0x4* group, std::size_t row_in_group, float* out, std::size_t count);
 
+
+
 // 32 values as signed 8-bit with a shared half-precision scale: value = q * d.
 // Activations are quantised to this format before the integer dot products.
 struct BlockQ8_0 {
@@ -69,6 +71,20 @@ struct BlockQ5_0 {
     std::uint8_t qs[kBlockSize / 2];
 };
 static_assert(sizeof(BlockQ5_0) == 22);
+
+// Four Q5_0 rows' block: the low nibbles laid out as in Q4_0x4, and the
+// fifth bits in qh, four bytes per 16-byte nibble vector k: byte 4k + i holds
+// bit j for lane 8 (i % 2) + j of that vector's low-nibble (i < 2) or
+// high-nibble (i >= 2) elements. weight = (q - 16) * d.
+struct BlockQ5_0x4 {
+    std::uint16_t d[4];
+    std::uint8_t qs[64];
+    std::uint8_t qh[16];
+};
+static_assert(sizeof(BlockQ5_0x4) == 88);
+
+void repack_q5_0x4(const BlockQ5_0* in, std::size_t rows, std::size_t blocks, BlockQ5_0x4* out);
+void dequantize_q5_0x4_row(const BlockQ5_0x4* group, std::size_t row_in_group, float* out, std::size_t count);
 
 constexpr std::size_t kSuperBlockSize = 256;  // weights per block for the K-quants
 
@@ -176,7 +192,7 @@ void dequantize_tq2_0(const BlockTQ2_0* blocks, float* out, std::size_t count);
 template <typename Block>
 constexpr std::size_t block_elements_of() {
     return std::is_same_v<Block, BlockQ4_0> || std::is_same_v<Block, BlockQ4_1> || std::is_same_v<Block, BlockQ5_0> ||
-                   std::is_same_v<Block, BlockQ8_0> || std::is_same_v<Block, BlockQ4_0x4>
+                   std::is_same_v<Block, BlockQ8_0> || std::is_same_v<Block, BlockQ4_0x4> || std::is_same_v<Block, BlockQ5_0x4>
                ? kBlockSize
                : kSuperBlockSize;  // Q4_K, Q6_K, TQ2_0 and the grouped K-quant layouts
 }
@@ -188,6 +204,7 @@ void unpack_q6_k(const BlockQ6_K& block, std::int8_t* q);
 float dot_q4_0_q8_0(const BlockQ4_0* w, const BlockQ8_0* x, std::size_t blocks);
 // All four rows of a packed group at once: out[0..3].
 void dot_q4_0x4_q8_0(const BlockQ4_0x4* w, const BlockQ8_0* x, std::size_t blocks, float out[4]);
+void dot_q5_0x4_q8_0(const BlockQ5_0x4* w, const BlockQ8_0* x, std::size_t blocks, float out[4]);
 float dot_q4_1_q8_0(const BlockQ4_1* w, const BlockQ8_0* x, std::size_t blocks);
 float dot_q5_0_q8_0(const BlockQ5_0* w, const BlockQ8_0* x, std::size_t blocks);
 float dot_q8_0_q8_0(const BlockQ8_0* w, const BlockQ8_0* x, std::size_t blocks);

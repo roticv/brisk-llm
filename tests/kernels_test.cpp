@@ -77,6 +77,10 @@ void dequantize_row(brisk::WeightFormat format, const std::uint8_t* w, std::size
             brisk::dequantize_q4_0x4_row(reinterpret_cast<const brisk::BlockQ4_0x4*>(w + (r / 4) * blocks * sizeof(brisk::BlockQ4_0x4)),
                                          r % 4, out.data(), kCols);
             break;
+        case brisk::WeightFormat::Q5_0x4:
+            brisk::dequantize_q5_0x4_row(reinterpret_cast<const brisk::BlockQ5_0x4*>(w + (r / 4) * blocks * sizeof(brisk::BlockQ5_0x4)),
+                                         r % 4, out.data(), kCols);
+            break;
         case brisk::WeightFormat::F32: break;
     }
 }
@@ -198,6 +202,7 @@ void test_kernels_match_dequantised_reference() {
                 case brisk::WeightFormat::Q4_Kx4:
                 case brisk::WeightFormat::Q6_Kx4: break;
                 case brisk::WeightFormat::Q4_0x4:
+                case brisk::WeightFormat::Q5_0x4:
                 case brisk::WeightFormat::F32: break;
             }
         }
@@ -281,6 +286,23 @@ void test_kernels_match_dequantised_reference() {
         CHECK(a == b);
     }
     check_format(brisk::WeightFormat::Q4_0x4, rows_x4, reinterpret_cast<const std::uint8_t*>(packed.data()), x);
+
+    // Q5_0x4 the same way from Q5_0 rows.
+    std::vector<brisk::BlockQ5_0> plain5(rows_x4 * blocks);
+    for (brisk::BlockQ5_0& b : plain5) {
+        b.d = brisk::float_to_half(0.001f + 0.001f * std::fabs(normal(rng)));
+        for (std::uint8_t& q : b.qh) q = byte();
+        for (std::uint8_t& q : b.qs) q = byte();
+    }
+    std::vector<brisk::BlockQ5_0x4> packed5(rows_x4 / 4 * blocks);
+    brisk::repack_q5_0x4(plain5.data(), rows_x4, blocks, packed5.data());
+    for (std::size_t r = 0; r < rows_x4; ++r) {
+        std::vector<float> a(kCols), b(kCols);
+        brisk::dequantize_q5_0(plain5.data() + r * blocks, a.data(), kCols);
+        brisk::dequantize_q5_0x4_row(packed5.data() + (r / 4) * blocks, r % 4, b.data(), kCols);
+        CHECK(a == b);
+    }
+    check_format(brisk::WeightFormat::Q5_0x4, rows_x4, reinterpret_cast<const std::uint8_t*>(packed5.data()), x);
 }
 
 }  // namespace

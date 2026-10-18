@@ -161,6 +161,43 @@ void matvec_q4_0x4_dotprod(const void* w, std::size_t rows, std::size_t cols, co
     }
 }
 
+void matvec_q5_0x4_dotprod(const void* w, std::size_t rows, std::size_t cols, const void* x, float* out) {
+    const auto* weights = static_cast<const BlockQ5_0x4*>(w);
+    const auto* activations = static_cast<const BlockQ8_0*>(x);
+    const std::size_t blocks = cols / kBlockSize;
+    const int8x16_t sixteen = vdupq_n_s8(16);
+
+    for (std::size_t g = 0; g < rows / 4; ++g) {
+        const BlockQ5_0x4* group = weights + g * blocks;
+        float32x4_t acc = vdupq_n_f32(0.0f);
+        for (std::size_t b = 0; b < blocks; ++b) {
+            const BlockQ8_0& xb = activations[b];
+            uint8x16_t u[4][2];
+            neon::unpack_q5_0x4_u8(group[b], u);
+            int8x16_t a[4][2];
+            for (int k = 0; k < 4; ++k) {
+                a[k][0] = vsubq_s8(vreinterpretq_s8_u8(u[k][0]), sixteen);
+                a[k][1] = vsubq_s8(vreinterpretq_s8_u8(u[k][1]), sixteen);
+            }
+            int8x16_t xc[4];
+            for (int c = 0; c < 4; ++c) xc[c] = vcombine_s8(vld1_s8(xb.qs + 8 * c), vld1_s8(xb.qs + 8 * c));
+            int32x4_t s01 = vdotq_s32(vdupq_n_s32(0), a[0][0], xc[0]);
+            s01 = vdotq_s32(s01, a[1][0], xc[1]);
+            s01 = vdotq_s32(s01, a[0][1], xc[2]);
+            s01 = vdotq_s32(s01, a[1][1], xc[3]);
+            int32x4_t s23 = vdotq_s32(vdupq_n_s32(0), a[2][0], xc[0]);
+            s23 = vdotq_s32(s23, a[3][0], xc[1]);
+            s23 = vdotq_s32(s23, a[2][1], xc[2]);
+            s23 = vdotq_s32(s23, a[3][1], xc[3]);
+            const int32x4_t sums = vpaddq_s32(s01, s23);
+            const float32x4_t scales = vmulq_n_f32(vcvt_f32_f16(vreinterpret_f16_u16(vld1_u16(group[b].d))),
+                                                   vgetq_lane_f32(neon::half4_to_float(xb.d), 0));
+            acc = vmlaq_f32(acc, vcvtq_f32_s32(sums), scales);
+        }
+        vst1q_f32(out + 4 * g, acc);
+    }
+}
+
 void matvec_tq2_0_dotprod(const void* w, std::size_t rows, std::size_t cols, const void* x, float* out) {
     neon::matmul_k(static_cast<const BlockTQ2_0*>(w), rows, cols, static_cast<const BlockQ8_K*>(x), 1, out, rows,
                    [](const BlockTQ2_0* row, const BlockQ8_K* const* xs, std::size_t n, std::size_t blocks, float* o) {
