@@ -23,6 +23,7 @@
 #if BRISK_METAL
 #include "metal/metal_session.h"
 #endif
+#include "chat.h"
 #include "sampler.h"
 #include "speculative.h"
 #include "tokenizer.h"
@@ -177,28 +178,9 @@ int cmd_generate(const GenerateOptions& options) {
 
     std::string text = options.prompt;
     if (options.chat) {
-        switch (model.config().architecture) {
-            case brisk::Architecture::BitNet: text = "User: " + text + "<|eot_id|>Assistant: "; break;
-            case brisk::Architecture::Llama:
-                // Llama 3's header format (the BOS token is prepended below).
-                text = "<|start_header_id|>user<|end_header_id|>\n\n" + text +
-                       "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n";
-                break;
-            case brisk::Architecture::Qwen2:
-                text = "<|im_start|>user\n" + text + "<|im_end|>\n<|im_start|>assistant\n";
-                break;
-            case brisk::Architecture::Gemma3:
-                text = "<start_of_turn>user\n" + text + "<end_of_turn>\n<start_of_turn>model\n";
-                break;
-            case brisk::Architecture::Gemma4:
-                text = "<|turn>user\n" + text + "<turn|>\n<|turn>model\n";
-                break;
-            case brisk::Architecture::Qwen3:
-                // Qwen's ChatML turn format. An empty think block tells Qwen3 to answer directly.
-                text = "<|im_start|>user\n" + text + "<|im_end|>\n<|im_start|>assistant\n";
-                if (!options.think) text += "<think>\n\n</think>\n\n";
-                break;
-        }
+        brisk::ChatOptions chat_options;
+        chat_options.think = options.think;
+        text = brisk::render_chat(model.config().architecture, {{"user", options.prompt}}, chat_options);
     }
     std::vector<brisk::Token> prompt = tokenizer.encode(text);
     if (tokenizer.bos() >= 0) prompt.insert(prompt.begin(), tokenizer.bos());
@@ -419,6 +401,18 @@ int run(const std::vector<std::string>& args) {
         const bool list_tensors = args.size() > 1 && args[1] == "--tensors";
         if (args.size() != (list_tensors ? 3u : 2u)) return usage();
         return cmd_info(args.back(), list_tensors);
+    }
+
+    if (command == "template") {
+        // brisk template <model> (<role> <content>)...: the rendered chat prompt, for checks against llama.cpp.
+        if (args.size() < 4 || args.size() % 2 != 0) return usage();
+        const brisk::MappedFile mapped(args[1]);
+        const brisk::GgufFile file = brisk::GgufFile::parse(mapped.bytes());
+        std::vector<brisk::ChatMessage> messages;
+        for (std::size_t i = 2; i + 1 < args.size(); i += 2) messages.push_back({args[i], args[i + 1]});
+        const std::string text = brisk::render_chat(brisk::architecture_of(file), messages);
+        std::fwrite(text.data(), 1, text.size(), stdout);
+        return 0;
     }
 
     if (command == "tokenize") {

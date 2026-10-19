@@ -126,18 +126,21 @@ float require_f32(const GgufFile& file, const std::string& key) {
 
 }  // namespace
 
-Model::Model(const GgufFile& file, bool repack) : repack_(repack) {
+Architecture architecture_of(const GgufFile& file) {
     const auto architecture = file.get<std::string_view>("general.architecture");
-    if (architecture == "qwen3") config_.architecture = Architecture::Qwen3;
-    else if (architecture == "qwen2") config_.architecture = Architecture::Qwen2;
-    else if (architecture == "llama") config_.architecture = Architecture::Llama;
-    else if (architecture == "gemma3") config_.architecture = Architecture::Gemma3;
-    else if (architecture == "gemma4") config_.architecture = Architecture::Gemma4;
-    else if (architecture == "bitnet" || architecture == "bitnet-b1.58") config_.architecture = Architecture::BitNet;
-    else {
-        fail("unsupported architecture '" + std::string(architecture.value_or("(none)")) +
-             "'; qwen3, qwen2, llama, gemma3, gemma4 and bitnet are supported");
-    }
+    if (architecture == "qwen3") return Architecture::Qwen3;
+    if (architecture == "qwen2") return Architecture::Qwen2;
+    if (architecture == "llama") return Architecture::Llama;
+    if (architecture == "gemma3") return Architecture::Gemma3;
+    if (architecture == "gemma4") return Architecture::Gemma4;
+    if (architecture == "bitnet" || architecture == "bitnet-b1.58") return Architecture::BitNet;
+    fail("unsupported architecture '" + std::string(architecture.value_or("(none)")) +
+         "'; qwen3, qwen2, llama, gemma3, gemma4 and bitnet are supported");
+}
+
+Model::Model(const GgufFile& file, bool repack) : repack_(repack) {
+    config_.architecture = architecture_of(file);
+    const auto architecture = file.get<std::string_view>("general.architecture");
     const std::string prefix = std::string(*architecture) + ".";
     const bool bitnet = config_.architecture == Architecture::BitNet;
     config_.rope_neox = config_.architecture != Architecture::Llama;

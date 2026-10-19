@@ -98,6 +98,9 @@ struct Matrix {
 
 // Weights of a Qwen3 model. Float32 and Q4_0 tensors are used directly from
 // the file; 16-bit float tensors are widened into memory owned by the model.
+// The file's architecture, or a failure naming the supported ones.
+Architecture architecture_of(const GgufFile& file);
+
 class Model {
 public:
     struct Layer {

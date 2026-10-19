@@ -65,10 +65,12 @@ void quiet_log(ggml_log_level level, const char* text, void*) {
 
 int main(int argc, char** argv) {
     const std::string mode = argc > 1 ? argv[1] : "";
-    if (!((mode == "tokenize" && argc == 4) || (mode == "eval" && argc == 6) || (mode == "perplexity" && argc == 4))) {
+    if (!((mode == "tokenize" && argc == 4) || (mode == "eval" && argc == 6) || (mode == "perplexity" && argc == 4) ||
+          (mode == "template" && argc >= 5 && argc % 2 == 1))) {
         std::fprintf(stderr, "usage: llama_ref tokenize <model> <strings.bin>\n"
                              "       llama_ref eval <model> <prompt.txt> <n_generate> <logits.bin>\n"
-                             "       llama_ref perplexity <model> <text.txt>\n");
+                             "       llama_ref perplexity <model> <text.txt>\n"
+                             "       llama_ref template <model> (<role> <content>)...   (prints the rendered prompt)\n");
         return 2;
     }
 
@@ -77,13 +79,30 @@ int main(int argc, char** argv) {
 
     llama_model_params model_params = llama_model_default_params();
     model_params.n_gpu_layers = 0;
-    model_params.vocab_only = mode == "tokenize";
+    model_params.vocab_only = mode == "tokenize" || mode == "template";
     llama_model* model = llama_model_load_from_file(argv[2], model_params);
     if (model == nullptr) {
         std::fprintf(stderr, "cannot load %s\n", argv[2]);
         return 1;
     }
     const llama_vocab* vocab = llama_model_get_vocab(model);
+
+    if (mode == "template") {
+        // The model's own template through llama.cpp's built-in renderer, with the
+        // assistant prefix appended, as llama-server does without --jinja.
+        std::vector<llama_chat_message> chat;
+        for (int i = 3; i + 1 < argc; i += 2) chat.push_back({argv[i], argv[i + 1]});
+        const char* tmpl = llama_model_chat_template(model, nullptr);
+        std::vector<char> buf(1 << 16);
+        const int32_t n = llama_chat_apply_template(tmpl, chat.data(), chat.size(), true, buf.data(), buf.size());
+        if (n < 0) {
+            std::fprintf(stderr, "template not supported by llama_chat_apply_template\n");
+            return 1;
+        }
+        std::fwrite(buf.data(), 1, static_cast<std::size_t>(n), stdout);
+        llama_model_free(model);
+        return 0;
+    }
 
     if (mode == "tokenize") {
         const std::string data = read_file(argv[3]);
