@@ -115,7 +115,7 @@ brisk loads Qwen3 and BitNet b1.58 only. Most of what people run locally is a ha
 
 Each family is checked the way Qwen3 was: tokenizer ids against llama.cpp on the test strings, perplexity within 1% on the pinned texts, and a pin added.
 
-**Done when:** the Q4_K_M downloads of Llama 3.x and Qwen2.5 and the Q4_0 files of Gemma 3 and Gemma 4 E2B/E4B load and match llama.cpp's perplexity on both machines, with the GPU path taking their output matrices. Reached for Llama 3.x, Qwen2.5, Gemma 3 and Gemma 4 E2B on the Mac (both backends) and, on 2026-10-18, on the Pi: all eight files generate at or slightly above llama.cpp's rate (bandwidth-bound) and brisk's prompt processing is 1.2-1.9x llama.cpp's on the Q4_0 and K-quant Llama/Qwen files, behind only on BitNet (0.8x) and the Q4_K_M Gemma 3 (0.86x, its Q5_0/Q8_0 tensors on the plain NEON kernels). Table in `bench/RESULTS.md`.
+**Done when:** the Q4_K_M downloads of Llama 3.x and Qwen2.5 and the Q4_0 files of Gemma 3 and Gemma 4 E2B/E4B load and match llama.cpp's perplexity on both machines, with the GPU path taking their output matrices. Reached for Llama 3.x, Qwen2.5, Gemma 3 and Gemma 4 E2B on the Mac (both backends) and, on 2026-10-18, on the Pi: all eight files generate at or slightly above llama.cpp's rate (bandwidth-bound) and brisk's prompt processing is 1.2-1.9x llama.cpp's on the Q4_0 and K-quant Llama/Qwen files, behind only on BitNet (0.8x); the Q4_K_M Gemma 3 was 0.86x until Q5_0/Q8_0 got the banded batched kernel, now 1.7x. Table in `bench/RESULTS.md`.
 
 ## Later, if wanted
 

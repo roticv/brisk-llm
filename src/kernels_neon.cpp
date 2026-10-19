@@ -43,6 +43,9 @@ inline int32x4_t dot16_acc(int32x4_t acc, int8x16_t w, int8x16_t x) {
     return vpadalq_s16(acc, p);
 }
 
+const auto unpack_q5 = [](const BlockQ5_0& b, int8x16_t& l, int8x16_t& h) { neon::unpack_q5_0(b, l, h); };
+const auto unpack_q8 = [](const BlockQ8_0& b, int8x16_t& l, int8x16_t& h) { neon::unpack_q8_0(b, l, h); };
+
 }  // namespace
 
 void matvec_q4_0_neon(const void* w, std::size_t rows, std::size_t cols, const void* x, float* out) {
@@ -75,38 +78,30 @@ void matvec_q5_0_neon(const void* w, std::size_t rows, std::size_t cols, const v
     const auto* weights = static_cast<const BlockQ5_0*>(w);
     const auto* activations = static_cast<const BlockQ8_0*>(x);
     const std::size_t blocks = cols / kBlockSize;
-    for (std::size_t r = 0; r < rows; ++r) out[r] = neon::dot_row_q5_0(weights + r * blocks, activations, blocks, dot_block);
+    for (std::size_t r = 0; r < rows; ++r) {
+        out[r] = neon::dot_row_any(weights + r * blocks, activations, blocks, unpack_q5, dot_block);
+    }
 }
 
 void matmul_q5_0_neon(const void* w, std::size_t rows, std::size_t cols, const void* x, std::size_t n, float* out,
                       std::size_t out_stride) {
-    const auto* weights = static_cast<const BlockQ5_0*>(w);
-    const auto* activations = static_cast<const BlockQ8_0*>(x);
-    const std::size_t blocks = cols / kBlockSize;
-    for (std::size_t r = 0; r < rows; ++r) {
-        for (std::size_t t = 0; t < n; ++t) {
-            out[t * out_stride + r] = neon::dot_row_q5_0(weights + r * blocks, activations + t * blocks, blocks, dot_block);
-        }
-    }
+    neon::matmul_any(static_cast<const BlockQ5_0*>(w), rows, cols, static_cast<const BlockQ8_0*>(x), n, out, out_stride,
+                     unpack_q5, dot_block);
 }
 
 void matvec_q8_0_neon(const void* w, std::size_t rows, std::size_t cols, const void* x, float* out) {
     const auto* weights = static_cast<const BlockQ8_0*>(w);
     const auto* activations = static_cast<const BlockQ8_0*>(x);
     const std::size_t blocks = cols / kBlockSize;
-    for (std::size_t r = 0; r < rows; ++r) out[r] = neon::dot_row_q8_0(weights + r * blocks, activations, blocks, dot_block_wide);
+    for (std::size_t r = 0; r < rows; ++r) {
+        out[r] = neon::dot_row_any(weights + r * blocks, activations, blocks, unpack_q8, dot_block_wide);
+    }
 }
 
 void matmul_q8_0_neon(const void* w, std::size_t rows, std::size_t cols, const void* x, std::size_t n, float* out,
                       std::size_t out_stride) {
-    const auto* weights = static_cast<const BlockQ8_0*>(w);
-    const auto* activations = static_cast<const BlockQ8_0*>(x);
-    const std::size_t blocks = cols / kBlockSize;
-    for (std::size_t r = 0; r < rows; ++r) {
-        for (std::size_t t = 0; t < n; ++t) {
-            out[t * out_stride + r] = neon::dot_row_q8_0(weights + r * blocks, activations + t * blocks, blocks, dot_block_wide);
-        }
-    }
+    neon::matmul_any(static_cast<const BlockQ8_0*>(w), rows, cols, static_cast<const BlockQ8_0*>(x), n, out, out_stride,
+                     unpack_q8, dot_block_wide);
 }
 
 void matmul_q4_0_neon(const void* w, std::size_t rows, std::size_t cols, const void* x, std::size_t n, float* out,

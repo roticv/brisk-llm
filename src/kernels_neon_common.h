@@ -23,7 +23,17 @@ inline void unpack_q4_0(const BlockQ4_0& block, int8x16_t& low, int8x16_t& high)
 
 // Product of the four blocks' weight and activation scales, converted from
 // half precision in hardware.
-inline float32x4_t scales4(const BlockQ4_0* w, const BlockQ8_0* x) {
+// DotBlock(w_low, w_high, x) returns the 32 products of one block as four
+// 32-bit partial sums. Unpack(block, low, high) gives a block's 32 weights as
+// two signed 8-bit vectors; the plain formats (Q4_0, Q5_0, Q8_0) share the
+// row kernels below through it.
+inline void unpack_q8_0(const BlockQ8_0& block, int8x16_t& low, int8x16_t& high) {
+    low = vld1q_s8(block.qs);
+    high = vld1q_s8(block.qs + 16);
+}
+
+template <typename Block>
+inline float32x4_t scales4(const Block* w, const BlockQ8_0* x) {
     uint16x4_t wd = vdup_n_u16(w[0].d);
     wd = vset_lane_u16(w[1].d, wd, 1);
     wd = vset_lane_u16(w[2].d, wd, 2);
@@ -35,23 +45,22 @@ inline float32x4_t scales4(const BlockQ4_0* w, const BlockQ8_0* x) {
     return vmulq_f32(vcvt_f32_f16(vreinterpret_f16_u16(wd)), vcvt_f32_f16(vreinterpret_f16_u16(xd)));
 }
 
-inline float scale1(const BlockQ4_0& w, const BlockQ8_0& x) {
+template <typename Block>
+inline float scale1(const Block& w, const BlockQ8_0& x) {
     return vgetq_lane_f32(vcvt_f32_f16(vreinterpret_f16_u16(vdup_n_u16(w.d))), 0) *
            vgetq_lane_f32(vcvt_f32_f16(vreinterpret_f16_u16(vdup_n_u16(x.d))), 0);
 }
 
-// DotBlock(w_low, w_high, x) returns the 32 products of one block as four
-// 32-bit partial sums.
-template <typename DotBlock>
-inline float dot_row(const BlockQ4_0* w, const BlockQ8_0* x, std::size_t blocks, DotBlock dot_block) {
+template <typename Block, typename Unpack, typename DotBlock>
+inline float dot_row_any(const Block* w, const BlockQ8_0* x, std::size_t blocks, Unpack unpack, DotBlock dot_block) {
     float32x4_t acc = vdupq_n_f32(0.0f);
     std::size_t b = 0;
     for (; b + 4 <= blocks; b += 4) {
         int8x16_t l0, h0, l1, h1, l2, h2, l3, h3;
-        unpack_q4_0(w[b], l0, h0);
-        unpack_q4_0(w[b + 1], l1, h1);
-        unpack_q4_0(w[b + 2], l2, h2);
-        unpack_q4_0(w[b + 3], l3, h3);
+        unpack(w[b], l0, h0);
+        unpack(w[b + 1], l1, h1);
+        unpack(w[b + 2], l2, h2);
+        unpack(w[b + 3], l3, h3);
         const int32x4_t s0 = dot_block(l0, h0, x[b]);
         const int32x4_t s1 = dot_block(l1, h1, x[b + 1]);
         const int32x4_t s2 = dot_block(l2, h2, x[b + 2]);
@@ -63,25 +72,30 @@ inline float dot_row(const BlockQ4_0* w, const BlockQ8_0* x, std::size_t blocks,
     float total = vaddvq_f32(acc);
     for (; b < blocks; ++b) {
         int8x16_t l, h;
-        unpack_q4_0(w[b], l, h);
+        unpack(w[b], l, h);
         total += static_cast<float>(vaddvq_s32(dot_block(l, h, x[b]))) * scale1(w[b], x[b]);
     }
     return total;
 }
 
+template <typename DotBlock>
+inline float dot_row(const BlockQ4_0* w, const BlockQ8_0* x, std::size_t blocks, DotBlock dot_block) {
+    return dot_row_any(w, x, blocks, [](const BlockQ4_0& b, int8x16_t& l, int8x16_t& h) { unpack_q4_0(b, l, h); }, dot_block);
+}
+
 // One weight row against four activation rows. The weights are unpacked once
 // per block and reused, which is what makes prompt processing compute-bound.
-template <typename DotBlock>
-inline void dot_row_x4(const BlockQ4_0* w, const BlockQ8_0* const x[4], std::size_t blocks, float out[4],
-                       DotBlock dot_block) {
+template <typename Block, typename Unpack, typename DotBlock>
+inline void dot_row_x4_any(const Block* w, const BlockQ8_0* const x[4], std::size_t blocks, float out[4], Unpack unpack,
+                           DotBlock dot_block) {
     float32x4_t acc[4] = {vdupq_n_f32(0.0f), vdupq_n_f32(0.0f), vdupq_n_f32(0.0f), vdupq_n_f32(0.0f)};
     std::size_t b = 0;
     for (; b + 4 <= blocks; b += 4) {
         int8x16_t l0, h0, l1, h1, l2, h2, l3, h3;
-        unpack_q4_0(w[b], l0, h0);
-        unpack_q4_0(w[b + 1], l1, h1);
-        unpack_q4_0(w[b + 2], l2, h2);
-        unpack_q4_0(w[b + 3], l3, h3);
+        unpack(w[b], l0, h0);
+        unpack(w[b + 1], l1, h1);
+        unpack(w[b + 2], l2, h2);
+        unpack(w[b + 3], l3, h3);
         uint16x4_t wd = vdup_n_u16(w[b].d);
         wd = vset_lane_u16(w[b + 1].d, wd, 1);
         wd = vset_lane_u16(w[b + 2].d, wd, 2);
@@ -105,20 +119,26 @@ inline void dot_row_x4(const BlockQ4_0* w, const BlockQ8_0* const x[4], std::siz
     for (int t = 0; t < 4; ++t) out[t] = vaddvq_f32(acc[t]);
     for (; b < blocks; ++b) {
         int8x16_t l, h;
-        unpack_q4_0(w[b], l, h);
+        unpack(w[b], l, h);
         for (int t = 0; t < 4; ++t) {
             out[t] += static_cast<float>(vaddvq_s32(dot_block(l, h, x[t][b]))) * scale1(w[b], x[t][b]);
         }
     }
 }
 
+template <typename DotBlock>
+inline void dot_row_x4(const BlockQ4_0* w, const BlockQ8_0* const x[4], std::size_t blocks, float out[4],
+                       DotBlock dot_block) {
+    dot_row_x4_any(w, x, blocks, out, [](const BlockQ4_0& b, int8x16_t& l, int8x16_t& h) { unpack_q4_0(b, l, h); }, dot_block);
+}
+
 // Rows handled together per token tile in the batched kernels, so that the
 // band's weights and one tile's activations both stay in L1 (the A72 has 32 KB).
 constexpr std::size_t kRowBand = 8;
 
-template <typename DotBlock>
-inline void matmul(const BlockQ4_0* w, std::size_t rows, std::size_t cols, const BlockQ8_0* x, std::size_t n, float* out,
-                   std::size_t out_stride, DotBlock dot_block) {
+template <typename Block, typename Unpack, typename DotBlock>
+inline void matmul_any(const Block* w, std::size_t rows, std::size_t cols, const BlockQ8_0* x, std::size_t n, float* out,
+                       std::size_t out_stride, Unpack unpack, DotBlock dot_block) {
     const std::size_t blocks = cols / kBlockSize;
     for (std::size_t r0 = 0; r0 < rows; r0 += kRowBand) {
         const std::size_t r1 = std::min(rows, r0 + kRowBand);
@@ -128,14 +148,23 @@ inline void matmul(const BlockQ4_0* w, std::size_t rows, std::size_t cols, const
                                             x + (t + 3) * blocks};
             for (std::size_t r = r0; r < r1; ++r) {
                 float result[4];
-                dot_row_x4(w + r * blocks, xs, blocks, result, dot_block);
+                dot_row_x4_any(w + r * blocks, xs, blocks, result, unpack, dot_block);
                 for (int i = 0; i < 4; ++i) out[(t + static_cast<std::size_t>(i)) * out_stride + r] = result[i];
             }
         }
         for (; t < n; ++t) {
-            for (std::size_t r = r0; r < r1; ++r) out[t * out_stride + r] = dot_row(w + r * blocks, x + t * blocks, blocks, dot_block);
+            for (std::size_t r = r0; r < r1; ++r) {
+                out[t * out_stride + r] = dot_row_any(w + r * blocks, x + t * blocks, blocks, unpack, dot_block);
+            }
         }
     }
+}
+
+template <typename DotBlock>
+inline void matmul(const BlockQ4_0* w, std::size_t rows, std::size_t cols, const BlockQ8_0* x, std::size_t n, float* out,
+                   std::size_t out_stride, DotBlock dot_block) {
+    matmul_any(w, rows, cols, x, n, out, out_stride,
+               [](const BlockQ4_0& b, int8x16_t& l, int8x16_t& h) { unpack_q4_0(b, l, h); }, dot_block);
 }
 
 // ---- K-quants -------------------------------------------------------------

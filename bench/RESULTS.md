@@ -231,10 +231,10 @@ Every family, with the current kernels (batched Q4_0x4/Q5_0x4/Q8_0 paths, NEON G
 | Llama-3.2-1B Q4_K_M | 10.2 | 8.5 | 4.5 | 4.2 |
 | Qwen2.5-1.5B Q4_K_M | 7.3 | 6.0 | 3.5 | 3.4 |
 | Gemma-3-1B pure Q4_0 | 21.5 | 11.1 | 6.1 | 5.8 |
-| Gemma-3-1B Q4_K_M | 8.2 | 9.5 | 4.2 | 4.2 |
+| Gemma-3-1B Q4_K_M | 8.2 → 16.3 | 9.5 | 4.2 → 4.6 | 4.2 |
 | Gemma-4-E2B Q4_0 | 6.9 | 3.7 | 2.2 | 2.1 |
 
-Prompt processing is where the Pi differs from the Mac: brisk's Q4_0 batched kernels are 1.6-1.9x llama.cpp on every pure Q4_0 file (and 1.9x on Gemma 4, whose Q4_0 weights take the same path), and 1.2x on the Q4_K_M Llama and Qwen2.5 files. The two it loses on are BitNet (0.8x; the ternary kernel is compute-bound on the A72 and has no batched layout) and the Q4_K_M Gemma 3 (0.86x), whose Q5_0 and Q8_0 tensors go through the plain NEON kernels (the Q5_0x4 repack and i8mm paths that closed this gap on the Mac need `dotprod`/`i8mm`, which the A72 lacks). Generation is at the bandwidth ceiling on both engines; brisk is 0-5% ahead everywhere except the Q4_K_M Gemma 3 (level). Gemma 4 reads 1.5 GB per token for its 2.2 tokens/s: 3.3 GB/s of the 4.3 available, with 3.5 GB of RAM to hold a 2.8 GB file.
+Prompt processing is where the Pi differs from the Mac: brisk's Q4_0 batched kernels are 1.6-1.9x llama.cpp on every pure Q4_0 file (and 1.9x on Gemma 4, whose Q4_0 weights take the same path), and 1.2x on the Q4_K_M Llama and Qwen2.5 files. The two it lost on were BitNet (0.8x; the ternary kernel is compute-bound on the A72 and has no batched layout) and the Q4_K_M Gemma 3 (0.86x), whose Q5_0 and Q8_0 tensors went through row-by-row NEON kernels (the Q5_0x4 repack and i8mm paths that closed this gap on the Mac need `dotprod`/`i8mm`, which the A72 lacks). The second was fixed the same evening by routing Q5_0 and Q8_0 through the banded Q4_0 batched kernel (`matmul_any`: each block unpacked once for four tokens, eight rows per band): the Pi went from 8.2 to 16.3 tokens/s on that file (1.7x llama.cpp; the arrow in the table), and the Mac's `neon` and `dotprod` kernel sets doubled on it too (84 → 163, 100 → 209), which matters for non-i8mm phones. Generation is at the bandwidth ceiling on both engines; brisk is 0-5% ahead everywhere except the Q4_K_M Gemma 3 (level). Gemma 4 reads 1.5 GB per token for its 2.2 tokens/s: 3.3 GB/s of the 4.3 available, with 3.5 GB of RAM to hold a 2.8 GB file.
 
 ### What this means
 

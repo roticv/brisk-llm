@@ -54,14 +54,8 @@ void matvec_q5_0_dotprod(const void* w, std::size_t rows, std::size_t cols, cons
 
 void matmul_q5_0_dotprod(const void* w, std::size_t rows, std::size_t cols, const void* x, std::size_t n, float* out,
                       std::size_t out_stride) {
-    const auto* weights = static_cast<const BlockQ5_0*>(w);
-    const auto* activations = static_cast<const BlockQ8_0*>(x);
-    const std::size_t blocks = cols / kBlockSize;
-    for (std::size_t r = 0; r < rows; ++r) {
-        for (std::size_t t = 0; t < n; ++t) {
-            out[t * out_stride + r] = neon::dot_row_q5_0(weights + r * blocks, activations + t * blocks, blocks, dot_block);
-        }
-    }
+    neon::matmul_any(static_cast<const BlockQ5_0*>(w), rows, cols, static_cast<const BlockQ8_0*>(x), n, out, out_stride,
+                     [](const BlockQ5_0& b, int8x16_t& l, int8x16_t& h) { neon::unpack_q5_0(b, l, h); }, dot_block);
 }
 
 void matvec_q8_0_dotprod(const void* w, std::size_t rows, std::size_t cols, const void* x, float* out) {
@@ -73,14 +67,8 @@ void matvec_q8_0_dotprod(const void* w, std::size_t rows, std::size_t cols, cons
 
 void matmul_q8_0_dotprod(const void* w, std::size_t rows, std::size_t cols, const void* x, std::size_t n, float* out,
                       std::size_t out_stride) {
-    const auto* weights = static_cast<const BlockQ8_0*>(w);
-    const auto* activations = static_cast<const BlockQ8_0*>(x);
-    const std::size_t blocks = cols / kBlockSize;
-    for (std::size_t r = 0; r < rows; ++r) {
-        for (std::size_t t = 0; t < n; ++t) {
-            out[t * out_stride + r] = neon::dot_row_q8_0(weights + r * blocks, activations + t * blocks, blocks, dot_block);
-        }
-    }
+    neon::matmul_any(static_cast<const BlockQ8_0*>(w), rows, cols, static_cast<const BlockQ8_0*>(x), n, out, out_stride,
+                     [](const BlockQ8_0& b, int8x16_t& l, int8x16_t& h) { neon::unpack_q8_0(b, l, h); }, dot_block);
 }
 
 void matmul_q4_0_dotprod(const void* w, std::size_t rows, std::size_t cols, const void* x, std::size_t n, float* out,
