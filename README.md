@@ -1,6 +1,6 @@
 # brisk-llm
 
-A small LLM inference engine in C++20, built for two machines: a MacBook Air M4 (CPU and Metal GPU) and a Raspberry Pi 4. It runs Qwen3 and BitNet b1.58 models from GGUF files and aims to match or beat llama.cpp on them. `ROADMAP.md` has the plan and where it stands; `bench/RESULTS.md` has the measurements.
+A small LLM inference engine in C++20, built for two machines: a MacBook Air M4 (CPU and Metal GPU) and a Raspberry Pi 4. It runs Qwen3, Qwen2.5, Llama 3.x, Gemma 3, Gemma 4 and BitNet b1.58 models from GGUF files and aims to match or beat llama.cpp on them. `ROADMAP.md` has the plan and where it stands; `bench/RESULTS.md` has the measurements.
 
 ## What it does
 
@@ -63,7 +63,7 @@ Benchmarks on the Air are only meaningful with nothing else running; the fanless
 
 ## Status
 
-The CPU work (roadmap Phases 0-4) and the Metal backend (Phase 5) are done; Phase 6, more model families, is next.
+The CPU work (roadmap Phases 0-4), the Metal backend (Phase 5) and the model families (Phase 6) are done on both machines; the roadmap's Phase 7 lists the next families in three tiers (files to verify, Phi-4-mini/LFM2/SmolLM3, and the hybrid-attention and MoE models).
 
 Against llama.cpp on the same files (details in `bench/RESULTS.md`):
 

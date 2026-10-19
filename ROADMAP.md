@@ -102,20 +102,51 @@ Dropped: A72-specific kernel tuning for generation. The Pi is bandwidth-bound, s
 
 **Done when (original):** the Mac numbers beat llama.cpp's best configuration. Reached for generation on the 1.7B (level), not for prompt processing (7-9% behind) or the 0.6B.
 
-## Phase 6: More model families — not started
+## Phase 6: More model families — done
 
-brisk loads Qwen3 and BitNet b1.58 only. Most of what people run locally is a handful of other families, and most downloads are Q4_K_M files (Q4_K with Q6_K, sometimes Q5_K, for attention V and the output) rather than Q4_0. In order of cost:
+brisk loaded Qwen3 and BitNet b1.58 only when this phase started. Most of what people run locally is a handful of other families, and most downloads are Q4_K_M files (Q4_K with Q6_K, sometimes Q5_K, for attention V and the output) rather than Q4_0. In order of cost:
 
 1. **Llama 3.x, Mistral, SmolLM2, DeepSeek-R1-distill-Llama** (GGUF architecture `llama`) and **Qwen2.5, R1-distill-Qwen** (`qwen2`) — done. Same forward pass as Qwen3 without the per-head q/k norms; `qwen2` adds q/k/v biases, `llama` uses adjacent-pair RoPE and Llama 3's per-frequency rope factors. Llama-3.2-1B-Instruct and Qwen2.5-1.5B-Instruct (bartowski Q4_K_M) match llama.cpp's tokenizer on all 2,156 test strings and its perplexity within 0.6%; both pinned. The SentencePiece tokenizer of Mistral 7B and the `tekken`/`smollm` pre-tokenizers are not implemented, so those files load but do not tokenize yet.
 2. **Q5_K weights** — not needed so far: the Q4_K_M files of Llama 3.2 and Qwen2.5 use only Q4_K and Q6_K. Still open for files that have it. **Q5_0 and Q8_0 weights** — done (for Gemma's downloads), with i8mm tiles and a Q5_0x4 repacked layout.
 3. **Q4_K, Q6_K and Q4_1 on the GPU** — done (gemv, tile and embedding for each; dispatches split by format within a layer). The common Q4_0 downloads (Q6_K output, some Q4_1) and the Q4_K_M files run with `--gpu`, checked against the CPU pins and llama.cpp. After tuning the tile staging and the Q4_K gemv, prompts are level with llama.cpp Metal (within 3-4%) and generation 4-8% behind, the rest being small-matrix dispatches (`bench/RESULTS.md`). Q8_0 and Q5_K are not on the GPU.
 4. **Gemma 3** (`gemma3`) — done, on the CPU and the GPU: SentencePiece tokenizer (identical to llama.cpp on the test corpus), √dim embedding scaling, Q/K norms, post-norms around attention and the FFN (the GGUF converter folds the `1 + w` into the weights), GELU gating, sliding-window layers (every layer but each sixth; window and bases from the file), optional final softcap, and 256-wide heads in the Metal attention kernels. gemma-3-1b-it as pure Q4_0 matches llama.cpp's perplexity within 0.8% and its greedy output on every test prompt; pinned. The Q4_K_M downloads of the 1B use Q5_0 and Q8_0 (its 1152-wide embedding is not a multiple of 256); both formats were added (CPU: reference, NEON and dotprod; GPU: gemv, tile and embedding), so the stock file loads and matches llama.cpp within 0.15%; with the Q5_0x4 repacked layout and i8mm tiles its CPU prompt processing is 408-482 tokens/s against llama.cpp's 596 (generation 81 vs 73). After tuning (a NEON GELU, a Q4_0 gemv restructured after llama.cpp's) it is level with llama.cpp on generation on both backends and 4-6% behind on prompts (`bench/RESULTS.md`). Untested on the 4B and larger (head dim 256 with 2 query heads per key/value head, and the 27B's different attention scale).
 5. **Gemma 4** (`gemma4`, April 2026; E2B, E4B, 12B, 26B-A4B MoE, 31B; ggml-org and unsloth publish Q4_0/Q8_0 GGUFs) — E2B done on the CPU: the `gemma4` tokenizer (BPE by rank over raw UTF-8 characters, newline-run splitting), per-layer head sizes (256 sliding, 512 global) with the file's sliding pattern, K/V sharing (the last 20 layers read layer 13's or 14's cache), V normalised without a weight, no attention scaling, per-layer feed-forward widths, the per-layer embeddings (table row plus projected input, gated into the residual after each layer), the layer output scalars, the softcap. Matches llama.cpp within 0.8% and is level with it in speed on the CPU; on the GPU (attention kernels specialised at 512 wide, per-layer cache regions, sharing layers computing only Q, V normalised in the RoPE kernel, the PLE projection quantised to Q8_0 at load) generation 50-55 against llama.cpp's 54.5 and prompt 620 against 719 (`bench/RESULTS.md`). Not done: the MoE 26B-A4B, the dense 12B/31B (untested; no PLE there). Original notes follow. Builds on Gemma 3 and adds, per the config and Google's write-ups: a 4:1 (E2B) or 5:1 local:global layer pattern with the last layer global and sliding windows of 512 (E2B/E4B) or 1024; GQA with 2 query heads per K/V head on local layers and 8 on global ones, head dim 256 local and 512 global, with K = V on global layers; "pruned" RoPE on global layers (positions applied to the first 25% of the pairs only); K/V sharing, where the last 20 of the E2B's 35 layers reuse an earlier layer's K/V instead of projecting their own; per-layer embeddings (the E2B's 2.3B "effective" parameters are 5.1B with them: a 262144 x 256 table per layer, one row read per token and mixed into the residual stream after each block, so they cost disk, not bandwidth, which suits the Pi); the 26B-A4B is a 128-expert MoE with 8 active plus a shared expert. Multimodal inputs go through the same decoder and can be ignored for text. The E2B is the natural Pi 4 model of this family (about 1.3 GB read per token at Q4_0). Another two to three days on top of Gemma 3; worth checking llama.cpp's `gemma4` graph for the exact norm placement and the PLE gating before starting.
-6. **Phi-4-mini** (`phi3`), if wanted.
+6. **Phi-4-mini** (`phi3`) — moved to Phase 7.
 
 Each family is checked the way Qwen3 was: tokenizer ids against llama.cpp on the test strings, perplexity within 1% on the pinned texts, and a pin added.
 
 **Done when:** the Q4_K_M downloads of Llama 3.x and Qwen2.5 and the Q4_0 files of Gemma 3 and Gemma 4 E2B/E4B load and match llama.cpp's perplexity on both machines, with the GPU path taking their output matrices. Reached for Llama 3.x, Qwen2.5, Gemma 3 and Gemma 4 E2B on the Mac (both backends) and, on 2026-10-18, on the Pi: all eight files generate at or slightly above llama.cpp's rate (bandwidth-bound) and brisk's prompt processing is 1.2-1.9x llama.cpp's on the Q4_0 and K-quant Llama/Qwen files, behind only on BitNet (0.8x); the Q4_K_M Gemma 3 was 0.86x until Q5_0/Q8_0 got the banded batched kernel, now 1.7x. Table in `bench/RESULTS.md`.
+
+## Phase 7: The next families — not started
+
+What people run locally beyond Phase 6's set, in three tiers by cost (2026-10-19). Each is checked the way the others were: tokenizer against llama.cpp on the test strings, perplexity within 1% on the pinned texts, a pin added, and a line in `bench/RESULTS.md`.
+
+**Tier 1 — likely load today; need a file, a check and a pin (an hour each).**
+
+- **Llama 3.2 3B** (`llama`; the same forward pass as the 1B, a bigger file).
+- **SmolLM2** 135M-1.7B (`llama` with the `smollm` pre-tokenizer; the pre-tokenizer regex is not implemented, so tokenization needs checking first).
+- **DeepSeek-R1-Distill-Qwen 1.5B** (`qwen2`; the Qwen2.5 path).
+- **Mistral 7B and Ministral 3B** (`llama` with a 32k SentencePiece vocabulary; Gemma 3's SentencePiece tokenizer may cover it, modulo the leading-space convention — verify; 7B Q4 is 4 GB, Mac only).
+- **Gemma 4 12B dense** (`gemma4` without per-layer embeddings; 7 GB at Q4, Mac only).
+
+Done when all five tokenize identically and match perplexity, so the README's list is honest about them.
+
+**Tier 2 — new architecture work, about a day each.**
+
+- **Phi-4-mini 3.8B** (`phi3`): Llama-like with a fused QKV tensor, rotary applied to part of the head (partial rotary dims) and LongRoPE's per-frequency factors. Widely run; the partial rotary is the only new kernel feature. 2.3 GB at Q4: Mac, and the Pi with little memory to spare.
+- **LFM2** 350M-1.2B (`lfm2`): Liquid's edge family, built for Pi-class devices and present in llama.cpp. Short-convolution layers interleaved with attention: a small new kernel and a per-layer convolution state in the cache (which `rollback` must restore). The most Pi-relevant family on this list.
+- **SmolLM3 3B** (`smollm3`): Llama-like with every fourth layer carrying no positional encoding (NoPE). A per-layer skip-RoPE flag.
+- **OLMo 2** (`olmo2`): Llama-like with Gemma-style post-norms. Small addition, lower demand.
+
+Order: Phi-4-mini first (demand), then LFM2 (the Pi), then SmolLM3 if the file is popular by then.
+
+**Tier 3 — large, and where the 2026 defaults may be heading.**
+
+- **Qwen3.5 / Qwen3-Next-style hybrids**: as understood from the public descriptions (verify against llama.cpp's source before planning), these interleave Gated DeltaNet linear-attention layers with full attention. That means a recurrent state per layer in place of most of the K/V cache, a new kernel family on both backends, and changes to `rollback` and the speculator. About a week. Worth it only if their small sizes (under 4B) become the default downloads; check that first.
+- **MoE (Gemma 4 26B-A4B, Qwen3-30B-A3B)**: the routing is modest work, but the files are 15-17 GB at Q4: they do not fit the Pi and would page on a 16 GB Air. Skip unless a larger Mac appears.
+- **Mamba-2 / Granite 4 hybrids**: the same state-space machinery as the first item with less demand. Skip.
+
+Out of scope throughout: the vision and audio encoders of the multimodal families; brisk takes their text decoders only.
 
 ## Later, if wanted
 
@@ -156,7 +187,7 @@ Faster than llama.cpp: generation on the Pi, prompt processing on the Pi (1.9x o
 
 ## What's next
 
-Phase 6 (model families) is the open work. BitNet runs on the GPU (TQ2_0 gemv and tile): generation 93 tokens/s against llama.cpp Metal's 84 (the premise that llama.cpp lacked ternary Metal kernels was wrong; it has them), prompt 634 against 655; brisk's CPU path with all cores (102) is still slightly ahead of its GPU for generation. The ternary gemv reads weights at 90 GB/s of the 120 ceiling, the decode being the rest. Speculative decoding on the GPU is measured (`bench/RESULTS.md`): 2.9x on repeated text with 24 lookup guesses, a 26% loss on fresh text even with the new back-off, because a verify batch of n tokens costs about 0.7 n single tokens on the GPU; a batched gemv that reads the weights once per batch (like llama.cpp's `mul_mv_mma`) would fix that and five attempts at it were slower than the plain gemv. Also open: Q6_K/Q8_0 output matrices on the GPU, a half-precision K/V cache, SME2 CPU kernels.
+Phase 7 (the next families; tiers above) is the open work, starting with the tier 1 checks. Still open from Phase 6: BitNet prompt processing on the Pi (0.8x llama.cpp; it needs a batched ternary layout, and the A72 is near compute-bound on the ternary kernel). From Phase 5: BitNet runs on the GPU (TQ2_0 gemv and tile): generation 93 tokens/s against llama.cpp Metal's 84 (the premise that llama.cpp lacked ternary Metal kernels was wrong; it has them), prompt 634 against 655; brisk's CPU path with all cores (102) is still slightly ahead of its GPU for generation. The ternary gemv reads weights at 90 GB/s of the 120 ceiling, the decode being the rest. Speculative decoding on the GPU is measured (`bench/RESULTS.md`): 2.9x on repeated text with 24 lookup guesses, a 26% loss on fresh text even with the new back-off, because a verify batch of n tokens costs about 0.7 n single tokens on the GPU; a batched gemv that reads the weights once per batch (like llama.cpp's `mul_mv_mma`) would fix that and five attempts at it were slower than the plain gemv. Also open: Q6_K/Q8_0 output matrices on the GPU, a half-precision K/V cache, SME2 CPU kernels.
 
 ## Open questions
 
