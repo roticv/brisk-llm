@@ -69,9 +69,15 @@ if(BRISK_METAL)
     target_compile_definitions(brisk PUBLIC BRISK_METAL=1)
 endif()
 
+# The HTTP server: cpp-httplib and nlohmann/json, vendored in third_party/ (MIT).
+add_library(brisk_server STATIC src/server.cpp third_party/cpp-httplib/httplib.cpp)
+target_include_directories(brisk_server PUBLIC third_party/cpp-httplib third_party/nlohmann)
+set_source_files_properties(third_party/cpp-httplib/httplib.cpp PROPERTIES COMPILE_OPTIONS "-w")  # vendored: its warnings are not ours
+target_link_libraries(brisk_server PUBLIC brisk Threads::Threads)
+
 add_executable(brisk-cli src/main.cpp)
 set_target_properties(brisk-cli PROPERTIES OUTPUT_NAME brisk)
-target_link_libraries(brisk-cli PRIVATE brisk)
+target_link_libraries(brisk-cli PRIVATE brisk_server)
 
 add_executable(kernel_bench bench/kernel_bench.cpp)
 target_link_libraries(kernel_bench PRIVATE brisk)

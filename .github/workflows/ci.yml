@@ -63,3 +63,6 @@ jobs:
         run: |
           build-release/brisk generate models/Qwen3-0.6B-Q4_0.gguf --chat --no-think \
             -p "Name three primary colours." -n 24 -t 2
+
+      - name: Server API test
+        run: python3 tests/server_test.py

@@ -24,6 +24,7 @@
 #include "metal/metal_session.h"
 #endif
 #include "chat.h"
+#include "server.h"
 #include "sampler.h"
 #include "speculative.h"
 #include "tokenizer.h"
@@ -346,6 +347,9 @@ int usage() {
                  "       brisk tokenize <model.gguf> [--no-special] (--batch <strings.bin> | <text>)\n"
                  "       brisk generate <model.gguf> (-p <prompt> | -f <prompt-file>) [options]\n"
                  "       brisk perplexity <model.gguf> -f <text-file> [-t <threads>] [--gpu]\n"
+                 "       brisk serve <model.gguf> [--host <addr>] [--port <n>] [-t <threads>] [--gpu] [--ctx <tokens>]\n"
+                 "                  [--name <id>] [-v]   OpenAI-compatible API (/v1/chat/completions, /v1/models)\n"
+                 "       brisk template <model.gguf> (<role> <content>)...   the rendered chat prompt\n"
                  "\n"
                  "generate options:\n"
                  "  -n <count>            most tokens to generate (default 128)\n"
@@ -401,6 +405,29 @@ int run(const std::vector<std::string>& args) {
         const bool list_tensors = args.size() > 1 && args[1] == "--tensors";
         if (args.size() != (list_tensors ? 3u : 2u)) return usage();
         return cmd_info(args.back(), list_tensors);
+    }
+
+    if (command == "serve") {
+        if (args.size() < 2) return usage();
+        brisk::ServeOptions o;
+        o.model_path = args[1];
+        o.threads = static_cast<std::size_t>(std::thread::hardware_concurrency());
+        for (std::size_t i = 2; i < args.size(); ++i) {
+            const std::string& flag = args[i];
+            auto value = [&]() -> const std::string& {
+                if (i + 1 >= args.size()) throw std::runtime_error(flag + " needs a value");
+                return args[++i];
+            };
+            if (flag == "--host") o.host = value();
+            else if (flag == "--port") o.port = std::stoi(value());
+            else if (flag == "-t") o.threads = std::stoul(value());
+            else if (flag == "--gpu") o.gpu = true;
+            else if (flag == "--ctx") o.max_context = std::stoul(value());
+            else if (flag == "--name") o.name = value();
+            else if (flag == "-v" || flag == "--verbose") o.verbose = true;
+            else return usage();
+        }
+        return brisk::serve(o);
     }
 
     if (command == "template") {

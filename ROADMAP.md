@@ -148,9 +148,12 @@ Order: Phi-4-mini first (demand), then LFM2 (the Pi), then SmolLM3 if the file i
 
 Out of scope throughout: the vision and audio encoders of the multimodal families; brisk takes their text decoders only.
 
+## Phase 8: An OpenAI-compatible server — done
+
+`brisk serve`: `/v1/chat/completions` (streamed with SSE or not), `/v1/completions`, `/v1/models`, `/health`, over one model on either backend, with cpp-httplib and nlohmann/json vendored in `third_party/`. Each family's chat template renders a full messages array (`src/chat.cpp`; `tests/compare_chat.py` checks it against `llama_chat_apply_template` on every model present; Gemma 4's and BitNet's templates are outside llama.cpp's built-in list and follow the files' Jinja by hand). The session persists between requests and a request rolls back to the longest common token prefix with what the session holds, so a conversation's next turn evaluates only the new message and the previous answer; one request at a time. Streaming holds back incomplete UTF-8 sequences and possible stop-string prefixes. `tests/server_test.py` runs the API end to end and is in CI. Not done: tool calls, `logprobs`, `n > 1`, parallel requests, a separate `reasoning_content` field for Qwen3's thinking (it is passed through in the content, which the common front-ends render).
+
 ## Later, if wanted
 
-- OpenAI-compatible HTTP server.
 - Sparsity experiments (skipping inactive neurons).
 - Layer pruning and 3-bit weights, which trade some quality for fewer bytes.
 - Own weight file format, if GGUF layout becomes the bottleneck.
@@ -187,7 +190,7 @@ Faster than llama.cpp: generation on the Pi, prompt processing on the Pi (1.9x o
 
 ## What's next
 
-Phase 7 (the next families; tiers above) is the open work, starting with the tier 1 checks. Still open from Phase 6: BitNet prompt processing on the Pi (0.8x llama.cpp; it needs a batched ternary layout, and the A72 is near compute-bound on the ternary kernel). From Phase 5: BitNet runs on the GPU (TQ2_0 gemv and tile): generation 93 tokens/s against llama.cpp Metal's 84 (the premise that llama.cpp lacked ternary Metal kernels was wrong; it has them), prompt 634 against 655; brisk's CPU path with all cores (102) is still slightly ahead of its GPU for generation. The ternary gemv reads weights at 90 GB/s of the 120 ceiling, the decode being the rest. Speculative decoding on the GPU is measured (`bench/RESULTS.md`): 2.9x on repeated text with 24 lookup guesses, a 26% loss on fresh text even with the new back-off, because a verify batch of n tokens costs about 0.7 n single tokens on the GPU; a batched gemv that reads the weights once per batch (like llama.cpp's `mul_mv_mma`) would fix that and five attempts at it were slower than the plain gemv. Also open: Q6_K/Q8_0 output matrices on the GPU, a half-precision K/V cache, SME2 CPU kernels.
+Phase 7 (the next families; tiers above) is the open work, starting with the tier 1 checks; the server (Phase 8) is done. Still open from Phase 6: BitNet prompt processing on the Pi (0.8x llama.cpp; it needs a batched ternary layout, and the A72 is near compute-bound on the ternary kernel). From Phase 5: BitNet runs on the GPU (TQ2_0 gemv and tile): generation 93 tokens/s against llama.cpp Metal's 84 (the premise that llama.cpp lacked ternary Metal kernels was wrong; it has them), prompt 634 against 655; brisk's CPU path with all cores (102) is still slightly ahead of its GPU for generation. The ternary gemv reads weights at 90 GB/s of the 120 ceiling, the decode being the rest. Speculative decoding on the GPU is measured (`bench/RESULTS.md`): 2.9x on repeated text with 24 lookup guesses, a 26% loss on fresh text even with the new back-off, because a verify batch of n tokens costs about 0.7 n single tokens on the GPU; a batched gemv that reads the weights once per batch (like llama.cpp's `mul_mv_mma`) would fix that and five attempts at it were slower than the plain gemv. Also open: Q6_K/Q8_0 output matrices on the GPU, a half-precision K/V cache, SME2 CPU kernels.
 
 ## Open questions
 
