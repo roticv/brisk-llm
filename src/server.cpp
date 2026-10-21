@@ -167,7 +167,7 @@ private:
             if (body.contains("reasoning") && body["reasoning"].is_object()) {
                 co.think = body["reasoning"].value("effort", "medium") != "none";
             }
-            text = render_chat(model_.config().architecture, messages, co);
+            text = render_chat(chat_format_of(file_), messages, co);
         } else {
             if (!body.contains("prompt") || !body["prompt"].is_string()) throw std::invalid_argument("'prompt' must be a string");
             text = body["prompt"].get<std::string>();

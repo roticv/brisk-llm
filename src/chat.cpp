@@ -109,18 +109,88 @@ std::string render_bitnet(const std::vector<ChatMessage>& messages, const ChatOp
     return out;
 }
 
+// Mistral's [INST] format (v0.3), as llama.cpp renders it: the system message
+// precedes the first user message with a newline; "[INST] text [/INST]" per
+// user turn, the answer followed by </s>. The BOS token comes from the tokenizer.
+std::string render_mistral(const std::vector<ChatMessage>& messages, const ChatOptions&) {
+    std::string out, pending_system;
+    for (std::size_t i = 0; i < messages.size(); ++i) {
+        const ChatMessage& m = messages[i];
+        check_role(m);
+        if (m.role == "system") {
+            if (i != 0) throw std::runtime_error("chat: Mistral takes a system message only first");
+            pending_system = m.content;
+            continue;
+        }
+        if (m.role == "user") {
+            out += "[INST] ";
+            if (!pending_system.empty()) {
+                out += pending_system + "\n";
+                pending_system.clear();
+            }
+            out += m.content + " [/INST]";
+        } else {
+            out += m.content + "</s>";
+        }
+    }
+    return out;
+}
+
+// DeepSeek R1 (distills): the system message as plain text, then
+// <｜User｜>text<｜Assistant｜>answer<｜end▁of▁sentence｜> per exchange.
+std::string render_deepseek(const std::vector<ChatMessage>& messages, const ChatOptions&) {
+    std::string out;
+    for (std::size_t i = 0; i < messages.size(); ++i) {
+        const ChatMessage& m = messages[i];
+        check_role(m);
+        if (m.role == "system") {
+            if (i != 0) throw std::runtime_error("chat: DeepSeek takes a system message only first");
+            out += m.content + "\n\n";
+        } else if (m.role == "user") {
+            out += "<｜User｜>" + m.content + "<｜Assistant｜>";
+        } else {
+            out += m.content + "<｜end▁of▁sentence｜>";
+        }
+    }
+    return out;
+}
+
 }  // namespace
 
-std::string render_chat(Architecture architecture, const std::vector<ChatMessage>& messages, const ChatOptions& options) {
-    switch (architecture) {
-        case Architecture::Qwen3: return render_chatml(messages, options, true);
-        case Architecture::Qwen2: return render_chatml(messages, options, false);
-        case Architecture::Llama: return render_llama3(messages, options);
-        case Architecture::Gemma3: return render_gemma3(messages, options);
-        case Architecture::Gemma4: return render_gemma4(messages, options);
-        case Architecture::BitNet: return render_bitnet(messages, options);
+ChatFormat chat_format_of(const GgufFile& file) {
+    const std::string_view tmpl = file.get<std::string_view>("tokenizer.chat_template").value_or("");
+    if (tmpl.find("<|im_start|>") != std::string_view::npos) {
+        return tmpl.find("<think>") != std::string_view::npos ? ChatFormat::Qwen3 : ChatFormat::ChatML;
     }
-    throw std::runtime_error("chat: no template for this architecture");
+    if (tmpl.find("<|start_header_id|>") != std::string_view::npos) return ChatFormat::Llama3;
+    if (tmpl.find("<start_of_turn>") != std::string_view::npos) return ChatFormat::Gemma3;
+    if (tmpl.find("<|turn>") != std::string_view::npos) return ChatFormat::Gemma4;
+    if (tmpl.find("[INST]") != std::string_view::npos) return ChatFormat::Mistral;
+    if (tmpl.find("<｜User｜>") != std::string_view::npos) return ChatFormat::DeepSeek;
+    if (tmpl.find("capitalize") != std::string_view::npos) return ChatFormat::BitNet;
+    switch (architecture_of(file)) {  // no template, or an unknown one: the family's usual format
+        case Architecture::Qwen3: return ChatFormat::Qwen3;
+        case Architecture::Qwen2: return ChatFormat::ChatML;
+        case Architecture::Llama: return ChatFormat::Llama3;
+        case Architecture::Gemma3: return ChatFormat::Gemma3;
+        case Architecture::Gemma4: return ChatFormat::Gemma4;
+        case Architecture::BitNet: return ChatFormat::BitNet;
+    }
+    throw std::runtime_error("chat: no template for this file");
+}
+
+std::string render_chat(ChatFormat format, const std::vector<ChatMessage>& messages, const ChatOptions& options) {
+    switch (format) {
+        case ChatFormat::Qwen3: return render_chatml(messages, options, true);
+        case ChatFormat::ChatML: return render_chatml(messages, options, false);
+        case ChatFormat::Llama3: return render_llama3(messages, options);
+        case ChatFormat::Gemma3: return render_gemma3(messages, options);
+        case ChatFormat::Gemma4: return render_gemma4(messages, options);
+        case ChatFormat::Mistral: return render_mistral(messages, options);
+        case ChatFormat::DeepSeek: return render_deepseek(messages, options);
+        case ChatFormat::BitNet: return render_bitnet(messages, options);
+    }
+    throw std::runtime_error("chat: unknown format");
 }
 
 }  // namespace brisk

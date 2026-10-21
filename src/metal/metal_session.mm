@@ -52,7 +52,7 @@ struct RopeParams {
 struct AttentionParams {
     uint32_t n, position0, head_count, kv_head_count, head_dim, max_context;
     float scale;
-    uint32_t write_half, splits, chunk, block_tokens, window, head_blocks;
+    uint32_t write_half, splits, chunk, block_tokens, window, head_blocks, heads;
 };
 struct PleParams {
     uint32_t n, layers, dim;
@@ -126,7 +126,14 @@ struct MetalSession::Impl {
                                 matmul_mm_q80 = nil, rope = nil,
                                 attention = nil,
                                 attention_small = nil, attention_combine = nil;
-    std::size_t block_tokens = 8;  // tokens per threadgroup of the batched attention (for the largest head size)
+    // The batched attention's threadgroup shape for a layer: tokens, head blocks per kv head, heads per block.
+    std::tuple<std::size_t, std::size_t, std::size_t> batched_shape(std::size_t l) const {
+        const ModelConfig& c = model.config();
+        const std::size_t rows = c.head_dim_of(l) > 256 ? 8 : 16;
+        const std::size_t group = c.head_count / c.kv_head_count_of(l);
+        const std::size_t heads = std::min(group, rows);
+        return {std::max<std::size_t>(1, rows / heads), (group + heads - 1) / heads, heads};
+    }
     id<MTLBuffer> ple_proj_out = nil, ple_table_out = nil, ple_in = nil, ple_gate_out = nil, ple_gate_h = nil, x_h = nil;  // Gemma 4
     bool tiles_fit = false;  // every matrix has rows and columns in multiples of 64, as the tiled kernel needs
 
@@ -352,13 +359,17 @@ struct MetalSession::Impl {
         gate_h = make(kMaxBatch * ff * 2);
         tiles_fit = embd % 64 == 0 && qdim % 64 == 0 && kvdim % 64 == 0 && ff % 64 == 0 && c.vocab_size % 64 == 0;
         if (c.head_dim > 512 || c.head_dim % 8 != 0) fail("attention kernel supports head_dim <= 512, a multiple of 8");
-        // The batched kernel holds 16 query rows (8 at 512 wide): tokens per threadgroup
-        // = rows / (query heads per key/value head), at least 1; the small kernel takes
-        // 8 / (head size / 128) heads per threadgroup and runs several per token.
-        block_tokens = std::max<std::size_t>(1, 16 / (c.head_count / c.kv_head_count));
-        const std::size_t block_tokens_min = std::max<std::size_t>(1, (c.head_dim > 256 ? 8 : 16) / (c.head_count / c.kv_head_count));
-        // 16 score rows per attention threadgroup: (batch / block_tokens) x kv heads threadgroups.
-        scores = make(((kMaxBatch + block_tokens_min - 1) / block_tokens_min) * c.kv_head_count * 16 * max_context * 4);
+        // The batched kernel holds 16 query rows (8 at 512 wide): a threadgroup takes
+        // as many of a kv head's query heads as fit (several threadgroups per kv head
+        // when the group is larger) and as many tokens as fill the rows; the small
+        // kernel takes 8 / (head size / 128) heads per threadgroup. Score rows: 16
+        // per threadgroup, so the buffer is sized by the layer with the most threadgroups.
+        std::size_t most_groups = 0;
+        for (std::size_t l = 0; l < c.layer_count; ++l) {
+            const auto [bt, hb, heads] = batched_shape(l);
+            most_groups = std::max(most_groups, ((kMaxBatch + bt - 1) / bt) * c.kv_head_count_of(l) * hb);
+        }
+        scores = make(most_groups * 16 * max_context * 4);
         // Partials: kSmallBatch tokens x heads x splits, each head_dim + 2 floats.
         partial = make(kSmallBatch * c.head_count * ((max_context + kSmallChunk - 1) / kSmallChunk) * (c.head_dim + 2) * 4);
         logits = make(Engine::kMaxScoredTokens * c.vocab_size * 4);
@@ -367,7 +378,7 @@ struct MetalSession::Impl {
         for (std::size_t l = 0; l < layers.size(); ++l) {
             if (layers[l].own_kv) {
                 layers[l].cache_offset = cache;
-                cache += std::size_t{c.kv_head_count} * max_context * c.head_dim_of(l) * 4;
+                cache += std::size_t{c.kv_head_count_of(l)} * max_context * c.head_dim_of(l) * 4;
             }
         }
         for (std::size_t l = 0; l < layers.size(); ++l) {
@@ -665,12 +676,12 @@ struct MetalSession::Impl {
             for (std::size_t l = 0; l < std::min(layers.size(), layer_cap); ++l) {
                 const Layer& g = layers[l];
                 const std::size_t head_dim = c.head_dim_of(l);
-                const std::size_t qdim = std::size_t{c.head_count} * head_dim, kvdim = std::size_t{c.kv_head_count} * head_dim;
+                const std::size_t kv_head_count = c.kv_head_count_of(l);
+                const std::size_t qdim = std::size_t{c.head_count} * head_dim, kvdim = kv_head_count * head_dim;
                 const std::size_t ff = c.ff_dim_of(l);
                 const std::size_t cache_layer = g.cache_offset;
                 const int kind = c.head_dim_of(l) == c.head_dim ? 0 : 1;  // attention pipelines by head size
-                const std::size_t rows_max = head_dim > 256 ? 8 : 16;
-                const std::size_t block_tokens_l = std::max<std::size_t>(1, rows_max / (c.head_count / c.kv_head_count));
+                const auto [block_tokens_l, batched_head_blocks, batched_heads] = batched_shape(l);
 
                 if (!next_prenormed) encode_norm(enc, x, g.attn_norm, normed_a, n, embd);
                 next_prenormed = false;
@@ -693,8 +704,8 @@ struct MetalSession::Impl {
                 [enc setBuffer:v_cache offset:cache_layer atIndex:6];
                 const bool slides = c.layer_slides(l);
                 // The per-frequency factors apply to the global layers only.
-                const RopeParams rp{static_cast<uint32_t>(n), static_cast<uint32_t>(position), c.head_count, c.kv_head_count,
-                                    static_cast<uint32_t>(head_dim), static_cast<uint32_t>(max_context), c.rms_epsilon,
+                const RopeParams rp{static_cast<uint32_t>(n), static_cast<uint32_t>(position), c.head_count,
+                                    static_cast<uint32_t>(kv_head_count), static_cast<uint32_t>(head_dim), static_cast<uint32_t>(max_context), c.rms_epsilon,
                                     slides ? c.rope_base_local : c.rope_base, slides ? 1.0f : c.rope_scale,
                                     g.q_norm.buffer != nil ? 1u : 0u, c.rope_neox ? 1u : 0u,
                                     g.q_bias.buffer != nil ? 1u : 0u, rope_factors.buffer != nil && !slides ? 1u : 0u,
@@ -705,7 +716,7 @@ struct MetalSession::Impl {
                 set(enc, g.v_bias.buffer != nil ? g.v_bias : g.attn_norm, 10);
                 set(enc, rope_factors.buffer != nil ? rope_factors : g.attn_norm, 11);
                 set(enc, v_stage, 12);
-                groups(enc, (n * (c.head_count + (g.own_kv ? c.kv_head_count : 0)) + 3) / 4, 128);
+                groups(enc, (n * (c.head_count + (g.own_kv ? kv_head_count : 0)) + 3) / 4, 128);
                 checkpoint("rope");
 
                 // A small batch has too few (token, head) items to fill the GPU, so
@@ -719,14 +730,16 @@ struct MetalSession::Impl {
                     chunk = static_cast<uint32_t>(kSmallChunk);
                 }
                 // BitNet normalises the attention output first, which rewrites the half copy.
-                const std::size_t group = c.head_count / c.kv_head_count;
+                const std::size_t group = c.head_count / kv_head_count;
                 const std::size_t max_group = 8 / (head_dim > 256 ? 4 : head_dim > 128 ? 2 : 1);  // heads per small-kernel threadgroup
-                const std::size_t head_blocks = (group + max_group - 1) / max_group;
+                const std::size_t head_blocks = small ? (group + max_group - 1) / max_group : batched_head_blocks;
                 const AttentionParams ap{static_cast<uint32_t>(n), static_cast<uint32_t>(position), c.head_count,
-                                         c.kv_head_count, static_cast<uint32_t>(head_dim), static_cast<uint32_t>(max_context),
+                                         static_cast<uint32_t>(kv_head_count), static_cast<uint32_t>(head_dim),
+                                         static_cast<uint32_t>(max_context),
                                          c.attention_scale != 0.0f ? c.attention_scale : 1.0f / std::sqrt(static_cast<float>(head_dim)),
                                          tiled(n) && !bitnet ? 1u : 0u, splits, chunk, static_cast<uint32_t>(block_tokens_l),
-                                         slides ? c.sliding_window : 0u, static_cast<uint32_t>(head_blocks)};
+                                         slides ? c.sliding_window : 0u, static_cast<uint32_t>(head_blocks),
+                                         static_cast<uint32_t>(batched_heads)};
                 if (small) {
                     [enc setComputePipelineState:attention_small_by_kind[kind]];
                     set(enc, q, 0);
@@ -734,7 +747,7 @@ struct MetalSession::Impl {
                     [enc setBuffer:v_cache offset:cache_layer atIndex:2];
                     set(enc, partial, 3);
                     bytes(enc, ap, 4);
-                    groups(enc, n * c.kv_head_count * head_blocks * splits, 128);
+                    groups(enc, n * kv_head_count * head_blocks * splits, 128);
                 } else {
                     [enc setComputePipelineState:attention_by_kind[kind]];
                     set(enc, q, 0);
@@ -744,7 +757,7 @@ struct MetalSession::Impl {
                     set(enc, scores, 4);
                     bytes(enc, ap, 5);
                     set(enc, attended_h, 6);
-                    groups(enc, ((n + block_tokens_l - 1) / block_tokens_l) * c.kv_head_count, 128);
+                    groups(enc, ((n + block_tokens_l - 1) / block_tokens_l) * kv_head_count * head_blocks, 128);
                 }
                 if (small) {
                     [enc setComputePipelineState:attention_combine];
@@ -789,11 +802,14 @@ struct MetalSession::Impl {
                     next_prenormed = !last;
                 } else if (g.ffn_post_norm.buffer != nil) {
                     encode_matmul(enc, {Target{&g.down, embd, Act{proj, nil}}}, ff, gate_a, n);
-                    // ... and the next layer's attention pre-norm in the same pass.
+                    // ... and the next layer's attention pre-norm in the same pass (Gemma 4's
+                    // layer scalar, where the file has one, applies to the updated residual).
                     const bool last = l + 1 == layers.size();
-                    encode_norm_add(enc, proj, g.ffn_post_norm, x, n, embd, last ? nullptr : &layers[l + 1].attn_norm, normed_a);
+                    encode_norm_add(enc, proj, g.ffn_post_norm, x, n, embd, last ? nullptr : &layers[l + 1].attn_norm, normed_a,
+                                    g.out_scale);
                     next_prenormed = !last;
                 } else {
+                    if (g.out_scale != 1.0f) fail("a layer output scale without a post-FFN norm is not supported on the GPU");
                     encode_matmul(enc, {Target{&g.down, embd, x_a}}, ff, gate_a, n, kResidual, x);
                 }
                 checkpoint("matmul");
@@ -844,6 +860,12 @@ struct MetalSession::Impl {
                 }
                 std::fprintf(stderr, "  %-9s max %12.4f  non-finite %zu / %zu\n", name, worst, nans, count);
             };
+            {   // the last token's residual, comparable with the CPU's BRISK_CPU_DEBUG line
+                const float* v = static_cast<const float*>(x.contents) + (n - 1) * embd;
+                double sum = 0.0;
+                for (std::size_t i = 0; i < embd; ++i) sum += std::fabs(v[i]);
+                std::fprintf(stderr, "  last token: mean|h| %.6f  h[0..3] %.5f %.5f %.5f %.5f\n", sum / embd, v[0], v[1], v[2], v[3]);
+            }
             report("x", x, n * embd);
             report("normed", normed, n * embd);
             const std::size_t qdim = std::size_t{c.head_count} * c.head_dim, kvdim = std::size_t{c.kv_head_count} * c.head_dim,

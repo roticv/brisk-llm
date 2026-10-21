@@ -53,5 +53,37 @@
     "model": "gemma-4-E2B-it-Q4_0.gguf",
     "text": "tests/perplexity_text.txt",
     "perplexity": 103.0144
+  },
+  {
+    "model": "SmolLM2-1.7B-Instruct-Q4_K_M.gguf",
+    "text": "tests/perplexity_text.txt",
+    "perplexity": 12.6593
+  },
+  {
+    "model": "DeepSeek-R1-Distill-Qwen-1.5B-Q4_K_M.gguf",
+    "text": "tests/perplexity_text.txt",
+    "perplexity": 62.2188
+  },
+  {
+    "model": "Llama-3.2-3B-Instruct-Q4_K_M.gguf",
+    "text": "tests/perplexity_text.txt",
+    "perplexity": 19.078
+  },
+  {
+    "model": "Mistral-7B-Instruct-v0.3-Q4_K_M.gguf",
+    "text": "tests/perplexity_text.txt",
+    "perplexity": 7.5599
+  },
+  {
+    "model": "gemma-4-E4B-it-Q4_0.gguf",
+    "text": "bench/prompt512.txt",
+    "perplexity": 5.5915,
+    "gpu_tolerance": 0.1
+  },
+  {
+    "model": "gemma-4-12B-it-Q4_0.gguf",
+    "text": "bench/prompt512.txt",
+    "perplexity": 22.1612,
+    "gpu_tolerance": 0.1
   }
 ]

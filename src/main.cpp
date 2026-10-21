@@ -181,7 +181,7 @@ int cmd_generate(const GenerateOptions& options) {
     if (options.chat) {
         brisk::ChatOptions chat_options;
         chat_options.think = options.think;
-        text = brisk::render_chat(model.config().architecture, {{"user", options.prompt}}, chat_options);
+        text = brisk::render_chat(brisk::chat_format_of(file), {{"user", options.prompt}}, chat_options);
     }
     std::vector<brisk::Token> prompt = tokenizer.encode(text);
     if (tokenizer.bos() >= 0) prompt.insert(prompt.begin(), tokenizer.bos());
@@ -437,7 +437,7 @@ int run(const std::vector<std::string>& args) {
         const brisk::GgufFile file = brisk::GgufFile::parse(mapped.bytes());
         std::vector<brisk::ChatMessage> messages;
         for (std::size_t i = 2; i + 1 < args.size(); i += 2) messages.push_back({args[i], args[i + 1]});
-        const std::string text = brisk::render_chat(brisk::architecture_of(file), messages);
+        const std::string text = brisk::render_chat(brisk::chat_format_of(file), messages);
         std::fwrite(text.data(), 1, text.size(), stdout);
         return 0;
     }

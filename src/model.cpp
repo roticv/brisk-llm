@@ -192,7 +192,17 @@ Model::Model(const GgufFile& file, bool repack) : repack_(repack) {
         if (!config_.ff_dims.empty() && config_.ff_dims.size() != config_.layer_count) fail("feed_forward_length array length");
     }
     config_.head_count = require_u32(file, prefix + "attention.head_count");
-    config_.kv_head_count = require_u32(file, prefix + "attention.head_count_kv");
+    if (const auto kv = file.get<GgufArray>(prefix + "attention.head_count_kv")) {  // per layer (Gemma 4 12B)
+        if (kv->elem_type == GgufType::I32) {
+            for (const std::int32_t v : kv->values<std::int32_t>()) config_.kv_head_counts.push_back(static_cast<std::uint32_t>(v));
+        } else {
+            config_.kv_head_counts = kv->values<std::uint32_t>();
+        }
+        if (config_.kv_head_counts.size() != config_.layer_count) fail("head_count_kv array length");
+        config_.kv_head_count = *std::max_element(config_.kv_head_counts.begin(), config_.kv_head_counts.end());
+    } else {
+        config_.kv_head_count = require_u32(file, prefix + "attention.head_count_kv");
+    }
     config_.feed_forward_dim = config_.ff_dims.empty() ? require_u32(file, prefix + "feed_forward_length")
                                                        : *std::max_element(config_.ff_dims.begin(), config_.ff_dims.end());
     config_.context_length = require_u32(file, prefix + "context_length");
@@ -203,8 +213,11 @@ Model::Model(const GgufFile& file, bool repack) : repack_(repack) {
         config_.kv_head_count == 0 || config_.feed_forward_dim == 0 || config_.context_length == 0) {
         fail("a model dimension is zero");
     }
-    if (config_.head_count % config_.kv_head_count != 0) fail("head_count is not a multiple of head_count_kv");
-    if (config_.head_count / config_.kv_head_count > 8) fail("more than 8 query heads per key/value head is not supported");
+    for (std::size_t l = 0; l < config_.layer_count; ++l) {
+        const std::uint32_t kv = config_.kv_head_count_of(l);
+        if (kv == 0 || config_.head_count % kv != 0) fail("head_count is not a multiple of head_count_kv");
+        if (config_.head_count / kv > kMaxHeadsPerKv) fail("more than 16 query heads per key/value head is not supported");
+    }
 
     // Qwen3 sets the head size explicitly; it is not always embedding_dim / head_count.
     config_.head_dim = file.get<std::uint32_t>(prefix + "attention.key_length")
@@ -255,7 +268,7 @@ Model::Model(const GgufFile& file, bool repack) : repack_(repack) {
         Layer& layer = layers_[i];
         const std::size_t head_dim_l = config_.head_dim_of(i);
         const std::size_t query_dim_l = static_cast<std::size_t>(config_.head_count) * head_dim_l;
-        const std::size_t kv_dim_l = static_cast<std::size_t>(config_.kv_head_count) * head_dim_l;
+        const std::size_t kv_dim_l = static_cast<std::size_t>(config_.kv_head_count_of(i)) * head_dim_l;
         const std::size_t ff_l = config_.ff_dim_of(i);
         const bool own_kv = config_.kv_layer_of(i) == i;
         layer.attention_norm = load(file, block + "attn_norm.weight", embd);
@@ -565,7 +578,7 @@ void Session::eval_batch(std::span<const Token> tokens, bool all_logits) {
     const ModelConfig& c = model_.config();
     const std::size_t n = tokens.size();
     const std::size_t embd = c.embedding_dim;
-    const std::size_t heads_per_kv = c.head_count / c.kv_head_count;
+
     const std::size_t length = position_ + n;  // positions visible to the last token of the batch
     // Gemma 4's sliding layers have smaller heads than its global ones; the
     // buffers are sized for the larger (c.head_dim), the tables per kind.
@@ -629,7 +642,9 @@ void Session::eval_batch(std::span<const Token> tokens, bool all_logits) {
         const Model::Layer& layer = model_.layers()[l];
         const std::size_t head_dim = c.head_dim_of(l);
         const std::size_t query_dim = static_cast<std::size_t>(c.head_count) * head_dim;
-        const std::size_t kv_dim = static_cast<std::size_t>(c.kv_head_count) * head_dim;
+        const std::size_t kv_head_count = c.kv_head_count_of(l);
+        const std::size_t heads_per_kv = c.head_count / kv_head_count;
+        const std::size_t kv_dim = kv_head_count * head_dim;
         const float attention_scale = c.attention_scale != 0.0f ? c.attention_scale : 1.0f / std::sqrt(static_cast<float>(head_dim));
         // A layer without its own K/V reads the cache of an earlier layer of its kind (Gemma 4).
         const std::size_t kv_layer = c.kv_layer_of(l);
@@ -637,7 +652,7 @@ void Session::eval_batch(std::span<const Token> tokens, bool all_logits) {
         std::vector<float>& keys = key_cache_[kv_layer];
         std::vector<float>& values = value_cache_[kv_layer];
         if (keys.empty()) {
-            keys.resize(static_cast<std::size_t>(c.kv_head_count) * max_context_ * head_dim);
+            keys.resize(kv_head_count * max_context_ * head_dim);
             values.resize(keys.size());
         }
         // Row p of key/value head kv in this layer's cache.
@@ -676,7 +691,7 @@ void Session::eval_batch(std::span<const Token> tokens, bool all_logits) {
                 apply_rope(q, rope, c.rope_neox);
             }
             if (!own_kv) return;
-            for (std::size_t h = 0; h < c.kv_head_count; ++h) {
+            for (std::size_t h = 0; h < kv_head_count; ++h) {
                 const std::span<float> k(new_keys + t * kv_dim + h * head_dim, head_dim);
                 const std::span<float> v(new_values + t * kv_dim + h * head_dim, head_dim);
                 if (!layer.key_norm.empty()) rms_norm(k, layer.key_norm, c.rms_epsilon, k);
@@ -694,9 +709,9 @@ void Session::eval_batch(std::span<const Token> tokens, bool all_logits) {
         // tokens, so each cached row is read once for all their query heads.
         constexpr std::size_t kTokenTile = 16;  // wide, so the cache is streamed once per 16 tokens, not per 4
         const std::size_t token_tiles = (n + kTokenTile - 1) / kTokenTile;
-        pool_.run(token_tiles * c.kv_head_count, [&](std::size_t task) {
-            const std::size_t tile = task / c.kv_head_count;
-            const std::size_t kv = task % c.kv_head_count;
+        pool_.run(token_tiles * kv_head_count, [&](std::size_t task) {
+            const std::size_t tile = task / kv_head_count;
+            const std::size_t kv = task % kv_head_count;
             const std::size_t t0 = tile * kTokenTile;
             const std::size_t t1 = std::min(n, t0 + kTokenTile);
             const std::size_t visible_last = position_ + t1;  // positions seen by the tile's last token
@@ -709,8 +724,8 @@ void Session::eval_batch(std::span<const Token> tokens, bool all_logits) {
             // All the tile's queries (each token's heads for this key/value
             // head) against every position the last token sees; positions a
             // token cannot see are computed too but ignored by its softmax.
-            const float* queries[kTokenTile * 8];
-            float* rows_out[kTokenTile * 8];
+            const float* queries[kTokenTile * kMaxHeadsPerKv];
+            float* rows_out[kTokenTile * kMaxHeadsPerKv];
             std::size_t nq = 0;
             for (std::size_t t = t0; t < t1; ++t) {
                 for (std::size_t g = 0; g < heads_per_kv; ++g) {
@@ -813,6 +828,12 @@ void Session::eval_batch(std::span<const Token> tokens, bool all_logits) {
             pool_.run(n, [&](std::size_t t) {
                 for (float& v : rows(hidden_, t, embd)) v *= layer.out_scale;
             });
+        }
+        if (std::getenv("BRISK_CPU_DEBUG") != nullptr) {  // the last token's residual after each layer
+            double sum = 0.0;
+            for (const float v : rows(hidden_, n - 1, embd)) sum += std::fabs(v);
+            std::fprintf(stderr, "layer %zu pos %zu: mean|h| %.6f  h[0..3] %.5f %.5f %.5f %.5f\n", l, position_ + n - 1, sum / embd,
+                         hidden_[(n - 1) * embd], hidden_[(n - 1) * embd + 1], hidden_[(n - 1) * embd + 2], hidden_[(n - 1) * embd + 3]);
         }
     }
 

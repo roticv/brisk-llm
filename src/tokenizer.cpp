@@ -61,9 +61,124 @@ std::uint32_t ascii_lower(std::uint32_t cp) { return cp >= 'A' && cp <= 'Z' ? cp
 
 }  // namespace
 
+namespace {
+
+// GPT-2's pattern, as llama.cpp's unicode_regex_split_custom_gpt2 matches it:
+// 's|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+
+std::vector<std::string_view> pretokenize_gpt2(std::string_view text) {
+    constexpr std::uint32_t kOutOfRange = 0xFFFFFFFF;
+    struct Flags {
+        bool present = false;
+        bool letter = false;
+        bool number = false;
+        bool whitespace = false;
+        bool other() const { return present && !letter && !number && !whitespace; }
+    };
+    const std::vector<Codepoint> cps = decode_utf8(text);
+    const std::size_t n = cps.size();
+    auto cp_at = [&](std::size_t pos) -> std::uint32_t {
+        if (pos >= n) return kOutOfRange;
+        return cps[pos].valid ? cps[pos].value : 0xFFFD;
+    };
+    auto flags_at = [&](std::size_t pos) -> Flags {
+        if (pos >= n) return {};
+        const std::uint32_t cp = cp_at(pos);
+        return {true, is_letter(cp), is_number(cp), is_whitespace(cp)};
+    };
+    std::vector<std::string_view> words;
+    auto emit = [&](std::size_t begin, std::size_t end) {
+        const std::size_t from = cps[begin].offset;
+        const std::size_t to = end < n ? cps[end].offset : text.size();
+        words.push_back(text.substr(from, to - from));
+    };
+    std::size_t pos = 0;
+    while (pos < n) {
+        const std::size_t begin = pos;
+        const std::uint32_t cp = cp_at(pos);
+        const Flags flags = flags_at(pos);
+        if (cp == '\'' && pos + 1 < n) {  // case-sensitive contractions
+            const std::uint32_t next = cp_at(pos + 1);
+            if (next == 's' || next == 't' || next == 'm' || next == 'd') {
+                pos += 2;
+                emit(begin, pos);
+                continue;
+            }
+            if (pos + 2 < n) {
+                const std::uint32_t after = cp_at(pos + 2);
+                if ((next == 'r' && after == 'e') || (next == 'v' && after == 'e') || (next == 'l' && after == 'l')) {
+                    pos += 3;
+                    emit(begin, pos);
+                    continue;
+                }
+            }
+        }
+        Flags run = cp == ' ' ? flags_at(pos + 1) : flags;
+        if (run.letter) {  //  ?\p{L}+
+            if (cp == ' ') ++pos;
+            while (flags_at(pos).letter) ++pos;
+            emit(begin, pos);
+            continue;
+        }
+        if (run.number) {  //  ?\p{N}+
+            if (cp == ' ') ++pos;
+            while (flags_at(pos).number) ++pos;
+            emit(begin, pos);
+            continue;
+        }
+        if (run.other()) {  //  ?[^\s\p{L}\p{N}]+
+            if (cp == ' ') ++pos;
+            while (flags_at(pos).other()) ++pos;
+            emit(begin, pos);
+            continue;
+        }
+        std::size_t whitespace = 0;
+        while (flags_at(pos + whitespace).whitespace) ++whitespace;
+        if (whitespace > 1 && pos + whitespace < n) {  // \s+(?!\S)
+            pos += whitespace - 1;
+            emit(begin, pos);
+            continue;
+        }
+        if (whitespace > 0) {  // \s+
+            pos += whitespace;
+            emit(begin, pos);
+            continue;
+        }
+        ++pos;
+        emit(begin, pos);
+    }
+    return words;
+}
+
+// SmolLM: llama.cpp applies \p{N} first, which makes each digit its own piece
+// and the text between digits further pieces, then GPT-2's pattern on each.
+std::vector<std::string_view> pretokenize_smollm(std::string_view text) {
+    std::vector<std::string_view> words;
+    const std::vector<Codepoint> cps = decode_utf8(text);
+    std::size_t begin = 0;  // byte offset of the current non-digit run
+    auto flush = [&](std::size_t end) {
+        if (end > begin) {
+            for (const std::string_view w : pretokenize_gpt2(text.substr(begin, end - begin))) words.push_back(w);
+        }
+    };
+    for (std::size_t i = 0; i < cps.size(); ++i) {
+        if (cps[i].valid && is_number(cps[i].value)) {
+            flush(cps[i].offset);
+            const std::size_t next = i + 1 < cps.size() ? cps[i + 1].offset : text.size();
+            words.push_back(text.substr(cps[i].offset, next - cps[i].offset));
+            begin = next;
+        }
+    }
+    flush(text.size());
+    return words;
+}
+
+}  // namespace
+
 // This mirrors llama.cpp's hand-written matcher for the same regex, including
 // its treatment of edge cases, so both engines split text identically.
 std::vector<std::string_view> pretokenize(std::string_view text, PreTokenizer pre) {
+    if (pre == PreTokenizer::Gpt2) return pretokenize_gpt2(text);
+    if (pre == PreTokenizer::SmolLM) return pretokenize_smollm(text);
     constexpr std::uint32_t kOutOfRange = 0xFFFFFFFF;
     struct Flags {
         bool present = false;
@@ -193,6 +308,12 @@ Tokenizer::Tokenizer(const GgufFile& file) {
         pre_ = PreTokenizer::Qwen2;
     } else if (pre == "llama-bpe") {
         pre_ = PreTokenizer::Llama3;
+    } else if (pre == "smollm") {
+        pre_ = PreTokenizer::SmolLM;
+    } else if (pre == "gpt-2") {
+        pre_ = PreTokenizer::Gpt2;
+    } else if (pre == "deepseek-r1-qwen") {  // the Qwen2 pattern, as in llama.cpp
+        pre_ = PreTokenizer::Qwen2;
     } else {
         fail("unsupported pre-tokenizer '" + std::string(pre.value_or("(none)")) + "'");
     }
@@ -253,6 +374,22 @@ Tokenizer::Tokenizer(const GgufFile& file) {
         }
     }
 
+    // Tokens that end a turn, by text: llama.cpp treats these as control tokens
+    // whatever type the file gives them (DeepSeek's vocabulary has </s> as a
+    // plain token), so they parse as specials and stop generation.
+    static constexpr std::string_view kEndTexts[] = {"<|endoftext|>", "<|im_end|>", "<|eot_id|>", "<|end_of_text|>",
+                                                     "<end_of_turn>", "<turn|>", "<eos>", "</s>", "<|end|>", "<|eom_id|>",
+                                                     "<\xef\xbd\x9c" "end\xe2\x96\x81of\xe2\x96\x81sentence" "\xef\xbd\x9c>"};
+    // ... except that Gemma 4 (and PLaMo) have a plain </s>, which llama.cpp
+    // recognises by their own end markers being present.
+    bool plain_s = false;
+    for (const std::string& piece : pieces_) plain_s |= piece == "<|tool_response>" || piece == "<|plamo:eos|>";
+    for (std::size_t id = 0; id < pieces_.size(); ++id) {
+        if (plain_s && pieces_[id] == "</s>") continue;
+        if (std::find(std::begin(kEndTexts), std::end(kEndTexts), pieces_[id]) != std::end(kEndTexts)) {
+            types_[id] = kTypeControl;
+        }
+    }
     for (std::size_t id = 0; id < pieces_.size(); ++id) {
         if (is_special_type(types_[id]) && !pieces_[id].empty()) {
             specials_.push_back({pieces_[id], static_cast<Token>(id), types_[id] != kTypeUserDefined});
@@ -289,16 +426,10 @@ Tokenizer::Tokenizer(const GgufFile& file) {
     };
     if (const auto eos = file.get<std::uint32_t>("tokenizer.ggml.eos_token_id")) add_end_token(static_cast<Token>(*eos));
     for (const Special& special : specials_) {
-        if (special.text == "<|endoftext|>" || special.text == "<|im_end|>" || special.text == "<|eot_id|>" ||
-            special.text == "<|end_of_text|>" || special.text == "<end_of_turn>") {
-            add_end_token(special.id);
-        }
+        if (std::find(std::begin(kEndTexts), std::end(kEndTexts), special.text) != std::end(kEndTexts)) add_end_token(special.id);
     }
     if (file.get<bool>("tokenizer.ggml.add_bos_token").value_or(raw_bpe_)) {  // Gemma 4 files omit the key; it adds BOS
         if (const auto bos = file.get<std::uint32_t>("tokenizer.ggml.bos_token_id")) bos_ = static_cast<Token>(*bos);
-    }
-    for (const Special& special : specials_) {
-        if (special.text == "<turn|>" || special.text == "<eos>") add_end_token(special.id);
     }
 }
 
@@ -403,6 +534,7 @@ std::vector<Token> Tokenizer::encode(std::string_view text, bool parse_special) 
             continue;
         }
         if (sentencepiece_) {
+            if (fragment.text.empty()) continue;  // nothing to prefix a space to
             encode_sentencepiece(fragment.text, add_space_prefix_ && prev_special, out);
             prev_special = false;
             continue;

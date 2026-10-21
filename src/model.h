@@ -26,6 +26,9 @@ enum class Architecture {
     BitNet,  // ternary weights, extra norms before the output projections, squared-ReLU feed-forward
 };
 
+// Query heads per key/value head, at most (the attention tiles size their query arrays by it).
+inline constexpr std::size_t kMaxHeadsPerKv = 16;
+
 struct ModelConfig {
     Architecture architecture = Architecture::Qwen3;
     std::uint32_t vocab_size = 0;
@@ -60,6 +63,7 @@ struct ModelConfig {
     // the feed-forward width varies per layer; per-layer embeddings of
     // ple_dim modulate the residual after each layer.
     std::vector<std::uint8_t> sliding_pattern;  // 1 = sliding, per layer (empty: every layer but each sixth)
+    std::vector<std::uint32_t> kv_head_counts;   // per-layer key/value heads (Gemma 4 12B); empty: kv_head_count everywhere
     std::uint32_t head_dim_local = 0;           // 0: same as head_dim
     std::uint32_t kv_from_start = 0;            // 0: every layer has its own K/V
     std::vector<std::uint32_t> ff_dims;         // empty: feed_forward_dim for all
@@ -70,6 +74,9 @@ struct ModelConfig {
     bool layer_slides(std::size_t layer) const {
         if (!sliding_pattern.empty()) return sliding_pattern[layer] != 0;
         return sliding_window != 0 && layer % 6 != 5;
+    }
+    std::uint32_t kv_head_count_of(std::size_t layer) const {
+        return kv_head_counts.empty() ? kv_head_count : kv_head_counts[layer];
     }
     std::uint32_t head_dim_of(std::size_t layer) const {
         return head_dim_local != 0 && layer_slides(layer) ? head_dim_local : head_dim;

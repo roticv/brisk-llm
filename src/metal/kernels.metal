@@ -104,7 +104,9 @@ struct AttentionParams {
     uint chunk;       // positions per split, a multiple of 8
     uint block_tokens;  // tokens per threadgroup of the batched kernel: kMaxQueries / group
     uint window;        // a token sees only the last `window` positions (0: all)
-    uint head_blocks;   // small kernel: threadgroups per (token, kv head, split), each taking kMaxGroup query heads
+    uint head_blocks;   // threadgroups per (token or token block, kv head, split): the kv head's query heads are
+                        // taken kMaxGroup (small kernel) or `heads` (batched) at a time
+    uint heads;         // batched kernel: query heads per threadgroup (the group, capped at kMaxQueries)
 };
 
 // ---- embedding ---------------------------------------------------------------
@@ -969,9 +971,15 @@ kernel void attention(device const float* q [[buffer(0)]],
     threadgroup float inv_sum[16];
     threadgroup float row_max[16];
     const uint kv_heads = p.kv_head_count;
-    const uint group = p.head_count / kv_heads;  // query heads per key/value head
+    const uint all_heads = p.head_count / kv_heads;  // query heads per key/value head
+    // Threadgroup: (token block, kv head, head block, split); it takes `group`
+    // = p.heads of the kv head's query heads (all of them when they fit).
     const uint split = tg % p.splits;
-    const uint block = (tg / p.splits) / kv_heads, kv = (tg / p.splits) % kv_heads;
+    const uint hb = (tg / p.splits) % p.head_blocks;
+    const uint item = (tg / p.splits) / p.head_blocks;
+    const uint block = item / kv_heads, kv = item % kv_heads;
+    const uint head0 = kv * all_heads + hb * p.heads;
+    const uint group = min(p.heads, all_heads - hb * p.heads);
     const uint t0 = block * p.block_tokens;
     const uint tokens = min(p.block_tokens, p.n - t0);
     const uint queries = tokens * group;
@@ -987,7 +995,7 @@ kernel void attention(device const float* q [[buffer(0)]],
     // Query i is token t0 + i / group, head kv * group + i % group; unused rows are zero.
     for (uint i = tid; i < kMaxQueries * kAttnDim; i += 128) {
         const uint qi = i / kAttnDim, d = i % kAttnDim;
-        const uint t = t0 + qi / group, h = kv * group + qi % group;
+        const uint t = t0 + qi / group, h = head0 + qi % group;
         qs[i] = (qi < queries && d < p.head_dim) ? q[(t * p.head_count + h) * p.head_dim + d] : 0.0f;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -1076,7 +1084,7 @@ kernel void attention(device const float* q [[buffer(0)]],
             // row's maximum and denominator, at [token][head][split].
             for (uint i = tid; i < queries * dims; i += 128) {
                 const uint qi = i / dims, d = dbase + i % dims;
-                const uint t = t0 + qi / group, h = kv * group + qi % group;
+                const uint t = t0 + qi / group, h = head0 + qi % group;
                 const ulong slot = ((ulong)t * p.head_count + h) * p.splits + split;
                 out[slot * (p.head_dim + 2) + d] = stage[qi * 128 + d - dbase];
                 if (d == 0) {
@@ -1088,7 +1096,7 @@ kernel void attention(device const float* q [[buffer(0)]],
         }
         for (uint i = tid; i < queries * dims; i += 128) {
             const uint qi = i / dims, d = dbase + i % dims;
-            const uint t = t0 + qi / group, h = kv * group + qi % group;
+            const uint t = t0 + qi / group, h = head0 + qi % group;
             const float v = stage[qi * 128 + d - dbase] * inv_sum[qi];
             out[(t * p.head_count + h) * p.head_dim + d] = v;
             if (p.write_half) out_half[(t * p.head_count + h) * p.head_dim + d] = half(v);

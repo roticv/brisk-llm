@@ -15,7 +15,10 @@ using Token = std::int32_t;
 
 // Which pre-tokenizer regex a vocabulary was built with. They differ only in
 // how digits are grouped: Qwen2 takes one digit per word, Llama 3 up to three.
-enum class PreTokenizer { Qwen2, Llama3 };
+// Qwen2 and Llama3 are llama.cpp's hand-written matchers for those models'
+// regexes; Gpt2 is the original GPT-2 pattern; SmolLM is Gpt2 after every
+// digit has been cut into its own piece.
+enum class PreTokenizer { Qwen2, Llama3, Gpt2, SmolLM };
 
 // Splits text into the words that byte-pair encoding is applied to, following
 // the Qwen2 pre-tokenizer regex:

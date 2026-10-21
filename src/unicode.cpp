@@ -98,6 +98,10 @@ bool is_letter(std::uint32_t cp) {
     return in_ranges(kLetterRanges, cp);
 }
 
+bool is_punctuation(std::uint32_t cp) { return in_ranges(kPunctuationRanges, cp); }
+bool is_symbol(std::uint32_t cp) { return in_ranges(kSymbolRanges, cp); }
+bool is_mark(std::uint32_t cp) { return in_ranges(kMarkRanges, cp); }
+
 bool is_number(std::uint32_t cp) {
     if (cp < 0x80) return cp >= '0' && cp <= '9';
     return in_ranges(kNumberRanges, cp);

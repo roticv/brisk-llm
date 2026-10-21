@@ -63,7 +63,9 @@ def main():
             print(f"{pin['model']} on {pin['text']}: {value:.4f} (pinned)")
             continue
         gap = abs(value - pin["perplexity"]) / pin["perplexity"]
-        ok = gap <= (GPU_TOLERANCE if gpu else TOLERANCE)
+        # A pin may widen the GPU tolerance: the Gemma 4 Q4_0 files are numerically
+        # chaotic (kernel sets of the same backend disagree by several percent).
+        ok = gap <= (pin.get("gpu_tolerance", GPU_TOLERANCE) if gpu else TOLERANCE)
         failures += not ok
         print(f"{pin['model']} on {pin['text']}: {value:.4f} vs pinned {pin['perplexity']:.4f} | gap {gap * 100:.2f}% | {'ok' if ok else 'FAIL'}")
 

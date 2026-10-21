@@ -24,5 +24,8 @@ void append_utf8(std::uint32_t codepoint, std::string& out);
 bool is_letter(std::uint32_t codepoint);      // general category L*
 bool is_number(std::uint32_t codepoint);      // general category N*
 bool is_whitespace(std::uint32_t codepoint);  // Unicode White_Space property
+bool is_punctuation(std::uint32_t codepoint); // general category P*
+bool is_symbol(std::uint32_t codepoint);      // general category S*
+bool is_mark(std::uint32_t codepoint);        // general category M*
 
 }  // namespace brisk
