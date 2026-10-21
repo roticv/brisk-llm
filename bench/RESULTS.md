@@ -236,6 +236,10 @@ Every family, with the current kernels (batched Q4_0x4/Q5_0x4/Q8_0 paths, NEON G
 
 Prompt processing is where the Pi differs from the Mac: brisk's Q4_0 batched kernels are 1.6-1.9x llama.cpp on every pure Q4_0 file (and 1.9x on Gemma 4, whose Q4_0 weights take the same path), and 1.2x on the Q4_K_M Llama and Qwen2.5 files. The two it lost on were BitNet (0.8x; the ternary kernel is compute-bound on the A72 and has no batched layout) and the Q4_K_M Gemma 3 (0.86x), whose Q5_0 and Q8_0 tensors went through row-by-row NEON kernels (the Q5_0x4 repack and i8mm paths that closed this gap on the Mac need `dotprod`/`i8mm`, which the A72 lacks). The second was fixed the same evening by routing Q5_0 and Q8_0 through the banded Q4_0 batched kernel (`matmul_any`: each block unpacked once for four tokens, eight rows per band): the Pi went from 8.2 to 16.3 tokens/s on that file (1.7x llama.cpp; the arrow in the table), and the Mac's `neon` and `dotprod` kernel sets doubled on it too (84 → 163, 100 → 209), which matters for non-i8mm phones. Generation is at the bandwidth ceiling on both engines; brisk is 0-5% ahead everywhere except the Q4_K_M Gemma 3 (level). Gemma 4 reads 1.5 GB per token for its 2.2 tokens/s: 3.3 GB/s of the 4.3 available, with 3.5 GB of RAM to hold a 2.8 GB file.
 
+### Phase 7 on the Pi (2026-10-21)
+
+LFM2-1.2B Q4_0 (Liquid's file; 0.7 GB), the family picked for the Pi: brisk 15.4 / 5.2 tokens/s (prompt / generation, 4 threads, medians of 3) against llama.cpp `8216c84`'s 9.1 / 5.1. Generation sits at the bandwidth ceiling for a 0.7 GB file as the others do; the prompt rate is 1.7x, the batched Q4_0 kernels again. Its ten convolution layers cost little: the conv itself is three multiply-adds per channel per token. Not benchmarked on the Mac yet (it runs there at 140 tokens/s on the CPU and 130 on the GPU for generation, from single runs). Phi-4-mini was not tried on the Pi: 2.5 GB of weights plus the repacked copies would not leave room in 4 GB.
+
 ### What this means
 
 - Generation is bandwidth-bound, as the user's earlier benchmarks also showed. Better kernels on the same file can gain at most about 20%.
