@@ -129,6 +129,8 @@ KernelSet generic_kernels(WeightFormat format) {
             return {matvec_generic<BlockQ8_0, BlockQ8_0, dot_q8_0_q8_0>, matmul_generic<BlockQ8_0, BlockQ8_0, dot_q8_0_q8_0>};
         case WeightFormat::Q4_K:
             return {matvec_generic<BlockQ4_K, BlockQ8_K, dot_q4_k_q8_k>, matmul_generic<BlockQ4_K, BlockQ8_K, dot_q4_k_q8_k>};
+        case WeightFormat::Q5_K:
+            return {matvec_generic<BlockQ5_K, BlockQ8_K, dot_q5_k_q8_k>, matmul_generic<BlockQ5_K, BlockQ8_K, dot_q5_k_q8_k>};
         case WeightFormat::Q6_K:
             return {matvec_generic<BlockQ6_K, BlockQ8_K, dot_q6_k_q8_k>, matmul_generic<BlockQ6_K, BlockQ8_K, dot_q6_k_q8_k>};
         case WeightFormat::TQ2_0:
@@ -152,6 +154,10 @@ std::vector<NamedKernels> neon_kernels(WeightFormat format) {
         case WeightFormat::Q4_K:
             out.push_back({"neon", {matvec_q4_k_neon, matmul_q4_k_neon}});
             if (dotprod) out.push_back({"dotprod", {matvec_q4_k_dotprod, matmul_q4_k_dotprod}});
+            break;
+        case WeightFormat::Q5_K:
+            out.push_back({"neon", {matvec_q5_k_neon, matmul_q5_k_neon}});
+            if (dotprod) out.push_back({"dotprod", {matvec_q5_k_dotprod, matmul_q5_k_dotprod}});
             break;
         case WeightFormat::Q6_K:
             out.push_back({"neon", {matvec_q6_k_neon, matmul_q6_k_neon}});

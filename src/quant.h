@@ -13,7 +13,7 @@ constexpr std::size_t kBlockSize = 32;  // weights per block for Q4_0 and Q8_0
 
 // Storage formats of weight matrices that the engine can multiply by.
 // Q4_0x4 is Q4_0 repacked at load time (see BlockQ4_0x4); it never appears in files.
-enum class WeightFormat { F32, Q4_0, Q4_1, Q5_0, Q8_0, Q4_K, Q6_K, Q4_0x4, Q5_0x4, TQ2_0, TQ2_0x4, Q4_Kx4, Q6_Kx4 };
+enum class WeightFormat { F32, Q4_0, Q4_1, Q5_0, Q8_0, Q4_K, Q5_K, Q6_K, Q4_0x4, Q5_0x4, TQ2_0, TQ2_0x4, Q4_Kx4, Q6_Kx4 };
 
 // Weights per block and bytes per block of a quantised format.
 std::size_t block_elements(WeightFormat format);
@@ -97,6 +97,18 @@ struct BlockQ4_K {
     std::uint8_t qs[kSuperBlockSize / 2];
 };
 static_assert(sizeof(BlockQ4_K) == 144);
+
+// Q4_K with a fifth bit per weight: bit j of qh[i] (j = 2 * chunk for the
+// low-nibble sub-block of chunk, 2 * chunk + 1 for the high-nibble one)
+// is the high bit of weight i of that sub-block.
+struct BlockQ5_K {
+    std::uint16_t d;
+    std::uint16_t dmin;
+    std::uint8_t scales[12];
+    std::uint8_t qh[kSuperBlockSize / 8];
+    std::uint8_t qs[kSuperBlockSize / 2];
+};
+static_assert(sizeof(BlockQ5_K) == 176);
 
 // 256 weights as 6-bit values (low 4 bits in ql, high 2 in qh) in 16
 // sub-blocks of 16 with signed 8-bit scales: weight = d * scale * (q - 32).
@@ -186,6 +198,7 @@ void dequantize_q4_1(const BlockQ4_1* blocks, float* out, std::size_t count);
 void dequantize_q5_0(const BlockQ5_0* blocks, float* out, std::size_t count);
 void dequantize_q8_0(const BlockQ8_0* blocks, float* out, std::size_t count);
 void dequantize_q4_k(const BlockQ4_K* blocks, float* out, std::size_t count);
+void dequantize_q5_k(const BlockQ5_K* blocks, float* out, std::size_t count);
 void dequantize_q6_k(const BlockQ6_K* blocks, float* out, std::size_t count);
 void dequantize_tq2_0(const BlockTQ2_0* blocks, float* out, std::size_t count);
 
@@ -209,6 +222,7 @@ float dot_q4_1_q8_0(const BlockQ4_1* w, const BlockQ8_0* x, std::size_t blocks);
 float dot_q5_0_q8_0(const BlockQ5_0* w, const BlockQ8_0* x, std::size_t blocks);
 float dot_q8_0_q8_0(const BlockQ8_0* w, const BlockQ8_0* x, std::size_t blocks);
 float dot_q4_k_q8_k(const BlockQ4_K* w, const BlockQ8_K* x, std::size_t blocks);
+float dot_q5_k_q8_k(const BlockQ5_K* w, const BlockQ8_K* x, std::size_t blocks);
 float dot_q6_k_q8_k(const BlockQ6_K* w, const BlockQ8_K* x, std::size_t blocks);
 float dot_tq2_0_q8_k(const BlockTQ2_0* w, const BlockQ8_K* x, std::size_t blocks);
 // All four rows of a packed ternary group at once: out[0..3].

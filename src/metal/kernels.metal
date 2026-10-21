@@ -89,6 +89,8 @@ struct RopeParams {
     uint has_factors;   // Llama 3: per-frequency divisors of the angles
     uint has_kv;        // 0: the layer shares another's cache; only the queries are processed (Gemma 4)
     uint value_norm;    // Gemma 4: V is RMS-normalised (no weight) before the cache copy
+    uint rope_dim;      // dimensions rotated per head (head_dim, or fewer for Phi)
+    float attn_factor;  // LongRoPE: the rotated values are scaled by this
 };
 
 struct AttentionParams {
@@ -205,6 +207,42 @@ kernel void to_half(device const float* in [[buffer(0)]],
                     constant uint& count [[buffer(2)]],
                     uint i [[thread_position_in_grid]]) {
     if (i < count) out[i] = half(in[i]);
+}
+
+// LFM2's short convolution. in = [b | c | x] per token (3 * dim); the state
+// bx = b * x of every position is kept in `cache`; out = c * sum_k w[d][k] *
+// bx[pos + k + 1 - taps] (zero before the start). In-batch positions take bx
+// from `in` directly, so the cache writes need no ordering.
+struct ConvParams {
+    uint n, dim, taps, position0, write_half;
+};
+
+kernel void shortconv(device const float* in [[buffer(0)]],
+                      device const float* w [[buffer(1)]],
+                      device float* cache [[buffer(2)]],
+                      device float* out [[buffer(3)]],
+                      device half* out_half [[buffer(4)]],
+                      constant ConvParams& p [[buffer(5)]],
+                      uint i [[thread_position_in_grid]]) {
+    if (i >= p.n * p.dim) return;
+    const uint t = i / p.dim, d = i % p.dim;
+    const uint pos = p.position0 + t;
+    auto bx_at = [&](uint q) -> float {  // the state at position q
+        if (q >= p.position0) {
+            const uint tq = q - p.position0;
+            return in[tq * 3 * p.dim + d] * in[tq * 3 * p.dim + 2 * p.dim + d];
+        }
+        return cache[q * p.dim + d];
+    };
+    cache[pos * p.dim + d] = bx_at(pos);
+    float sum = 0.0f;
+    for (uint k = 0; k < p.taps; ++k) {
+        if (pos + k + 1 < p.taps) continue;
+        sum += w[d * p.taps + k] * bx_at(pos + k + 1 - p.taps);
+    }
+    const float v = in[t * 3 * p.dim + p.dim + d] * sum;
+    out[i] = v;
+    if (p.write_half) out_half[i] = half(v);
 }
 
 // Gemma 4's per-layer embedding inputs: ple[l][t][d] = (proj[t][l][d] + table[t][l][d] * table_scale) / sqrt(2),
@@ -373,6 +411,25 @@ inline void q4k_subblock(device const uchar* row, uint sub, thread float4 (&v)[8
     }
 }
 
+// Q5_K: Q4_K with 32 bytes of high bits between the scales and the nibbles
+// (bit j of byte i is the fifth bit of value i of sub-block j); 176 bytes.
+inline void q5k_subblock(device const uchar* row, uint sub, thread float4 (&v)[8]) {
+    device const uchar* blk = row + (sub / 8) * 176;
+    const uint j = sub % 8;
+    const float d = float(*(device const half*)blk), dmin = float(*(device const half*)(blk + 2));
+    uint scale, min;
+    q4k_scale_min(blk + 4, j, scale, min);
+    const float ds = d * float(scale), dm = dmin * float(min);
+    device const uint* qh = (device const uint*)(blk + 16);                  // 176 k + 16: 4-byte aligned
+    device const uint* q = (device const uint*)(blk + 48 + (j / 2) * 32);
+    const uint shift = (j % 2) * 4;
+    for (uint k = 0; k < 8; ++k) {
+        const uint4 lo = uint4(q[k]) >> (uint4(0, 8, 16, 24) + shift) & 0xF;
+        const uint4 hi = (uint4(qh[k]) >> (uint4(0, 8, 16, 24) + j) & 1) << 4;
+        v[k] = float4(lo | hi) * ds - dm;
+    }
+}
+
 // Sub-block `sub` (32 values) of a Q6_K row, as eight float4s.
 inline void q6k_subblock(device const uchar* row, uint sub, thread float4 (&v)[8]) {
     device const uchar* blk = row + (sub / 8) * 210;
@@ -431,11 +488,12 @@ inline void q8_0_subblock(device const uchar* row, uint sub, thread float4 (&v)[
     }
 }
 
-// Row stride in bytes of a format with 32-value sub-blocks: 2 = Q4_K, 3 = Q6_K, 4 = Q4_1, 5 = Q5_0, 6 = Q8_0.
+// Row stride in bytes of a format with 32-value sub-blocks: 2 = Q4_K, 3 = Q6_K, 4 = Q4_1, 5 = Q5_0, 6 = Q8_0, 7 = Q5_K.
 inline ulong subblock_row_bytes(uint format, uint cols) {
     switch (format) {
         case 2: return (ulong)(cols / 256) * 144;
         case 3: return (ulong)(cols / 256) * 210;
+        case 7: return (ulong)(cols / 256) * 176;
         case 4: return (ulong)(cols / 32) * 20;
         case 5: return (ulong)(cols / 32) * 22;
         default: return (ulong)(cols / 32) * 34;
@@ -446,6 +504,7 @@ inline void subblock_dequant(uint format, device const uchar* row, uint sub, thr
     switch (format) {
         case 2: q4k_subblock(row, sub, v); break;
         case 3: q6k_subblock(row, sub, v); break;
+        case 7: q5k_subblock(row, sub, v); break;
         case 4: q4_1_subblock(row, sub, v); break;
         case 5: q5_0_subblock(row, sub, v); break;
         default: q8_0_subblock(row, sub, v); break;
@@ -914,11 +973,13 @@ kernel void qk_norm_rope(device float* q [[buffer(0)]],
         const float scale = rsqrt(sum / float(p.head_dim) + p.eps);
         for (uint i = lane; i < p.head_dim; i += 32) vec[i] = vec[i] * scale * norm[i];
     }
-    const uint half_dim = p.head_dim / 2;
+    // Only the first rope_dim dimensions rotate (all of them unless the model
+    // rotates part of the head, as Phi does); the rotated values take attn_factor.
+    const uint half_dim = p.rope_dim / 2;
     for (uint i = lane; i < half_dim; i += 32) {
-        float theta = float(position) * p.rope_scale * pow(p.rope_base, -2.0f * float(i) / float(p.head_dim));
+        float theta = float(position) * p.rope_scale * pow(p.rope_base, -2.0f * float(i) / float(p.rope_dim));
         if (p.has_factors) theta /= factors[i];
-        const float c = cos(theta), s = sin(theta);
+        const float c = cos(theta) * p.attn_factor, s = sin(theta) * p.attn_factor;
         const uint a = p.neox ? i : 2 * i, b = p.neox ? i + half_dim : 2 * i + 1;
         const float x0 = vec[a], x1 = vec[b];
         vec[a] = x0 * c - x1 * s;

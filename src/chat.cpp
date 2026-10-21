@@ -155,6 +155,18 @@ std::string render_deepseek(const std::vector<ChatMessage>& messages, const Chat
     return out;
 }
 
+// Phi-4-mini: <|role|>content<|end|> per message, as its file's template has it
+// (llama.cpp's built-in renderer adds Phi-3's newlines; the file does not).
+std::string render_phi(const std::vector<ChatMessage>& messages, const ChatOptions& o) {
+    std::string out;
+    for (const ChatMessage& m : messages) {
+        check_role(m);
+        out += "<|" + m.role + "|>" + m.content + "<|end|>";
+    }
+    if (o.generation_prompt) out += "<|assistant|>";
+    return out;
+}
+
 }  // namespace
 
 ChatFormat chat_format_of(const GgufFile& file) {
@@ -166,6 +178,7 @@ ChatFormat chat_format_of(const GgufFile& file) {
     if (tmpl.find("<start_of_turn>") != std::string_view::npos) return ChatFormat::Gemma3;
     if (tmpl.find("<|turn>") != std::string_view::npos) return ChatFormat::Gemma4;
     if (tmpl.find("[INST]") != std::string_view::npos) return ChatFormat::Mistral;
+    if (tmpl.find("<|assistant|>") != std::string_view::npos && tmpl.find("<|end|>") != std::string_view::npos) return ChatFormat::Phi;
     if (tmpl.find("<｜User｜>") != std::string_view::npos) return ChatFormat::DeepSeek;
     if (tmpl.find("capitalize") != std::string_view::npos) return ChatFormat::BitNet;
     switch (architecture_of(file)) {  // no template, or an unknown one: the family's usual format
@@ -175,6 +188,7 @@ ChatFormat chat_format_of(const GgufFile& file) {
         case Architecture::Gemma3: return ChatFormat::Gemma3;
         case Architecture::Gemma4: return ChatFormat::Gemma4;
         case Architecture::BitNet: return ChatFormat::BitNet;
+        case Architecture::Phi3: return ChatFormat::Phi;
     }
     throw std::runtime_error("chat: no template for this file");
 }
@@ -188,6 +202,7 @@ std::string render_chat(ChatFormat format, const std::vector<ChatMessage>& messa
         case ChatFormat::Gemma4: return render_gemma4(messages, options);
         case ChatFormat::Mistral: return render_mistral(messages, options);
         case ChatFormat::DeepSeek: return render_deepseek(messages, options);
+        case ChatFormat::Phi: return render_phi(messages, options);
         case ChatFormat::BitNet: return render_bitnet(messages, options);
     }
     throw std::runtime_error("chat: unknown format");

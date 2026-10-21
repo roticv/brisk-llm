@@ -24,6 +24,9 @@ def render(prog, model, conv):
 def main():
     ok = True
     models = sorted(p for p in (ROOT / "models").glob("*.gguf") if "draft" not in p.name)
+    # Phi-4-mini's file template has no newlines after the role tags; llama.cpp's
+    # built-in renderer applies Phi-3's, which has. brisk follows the file.
+    models = [p for p in models if not p.name.startswith("Phi-4")]
     for model in models:
         skipped = 0
         for conv in CONVERSATIONS:

@@ -47,7 +47,8 @@ struct NormParams {
 struct RopeParams {
     uint32_t n, position0, head_count, kv_head_count, head_dim, max_context;
     float eps, rope_base, rope_scale;
-    uint32_t has_qk_norm, neox, has_bias, has_factors, has_kv, value_norm;
+    uint32_t has_qk_norm, neox, has_bias, has_factors, has_kv, value_norm, rope_dim;
+    float attn_factor;
 };
 struct AttentionParams {
     uint32_t n, position0, head_count, kv_head_count, head_dim, max_context;
@@ -57,6 +58,9 @@ struct AttentionParams {
 struct PleParams {
     uint32_t n, layers, dim;
     float table_scale;
+};
+struct ConvParams {
+    uint32_t n, dim, taps, position0, write_half;
 };
 constexpr std::size_t kSmallChunk = 128;  // positions per split of a small batch's attention (as in the kernel)
 constexpr std::size_t kSmallBatch = 8;    // rows that take the gemv and the split attention
@@ -91,6 +95,7 @@ id<MTLComputePipelineState> specialised_pipeline(id<MTLDevice> device, id<MTLLib
 uint32_t kquant_format_id(WeightFormat f) {
     switch (f) {
         case WeightFormat::Q4_K: return 2;
+        case WeightFormat::Q5_K: return 7;
         case WeightFormat::Q6_K: return 3;
         case WeightFormat::Q4_1: return 4;
         case WeightFormat::Q5_0: return 5;
@@ -118,11 +123,11 @@ struct MetalSession::Impl {
 
     id<MTLDevice> device = nil;
     id<MTLCommandQueue> queue = nil;
-    id<MTLComputePipelineState> embed = nil, embed_q4k = nil, embed_q6k = nil, embed_q41 = nil, embed_q50 = nil,
-                                embed_q80 = nil, rms_norm = nil, matmul_kq = nil, ple_combine = nil, to_half = nil, softcap = nil,
+    id<MTLComputePipelineState> embed = nil, embed_q4k = nil, embed_q5k = nil, embed_q6k = nil, embed_q41 = nil, embed_q50 = nil,
+                                embed_q80 = nil, rms_norm = nil, matmul_kq = nil, ple_combine = nil, to_half = nil, softcap = nil, shortconv = nil,
                                 attention_by_kind[2] = {nil, nil}, attention_small_by_kind[2] = {nil, nil}, matmul = nil, matmul_tq2 = nil, matmul_q4k = nil,
                                 matmul_q6k = nil, matmul_q41 = nil, matmul_mm = nil, matmul_mm_tq2 = nil,
-                                matmul_mm_q4k = nil, matmul_mm_q6k = nil, matmul_mm_q41 = nil, matmul_mm_q50 = nil,
+                                matmul_mm_q4k = nil, matmul_mm_q5k = nil, matmul_mm_q6k = nil, matmul_mm_q41 = nil, matmul_mm_q50 = nil,
                                 matmul_mm_q80 = nil, rope = nil,
                                 attention = nil,
                                 attention_small = nil, attention_combine = nil;
@@ -135,6 +140,7 @@ struct MetalSession::Impl {
         return {std::max<std::size_t>(1, rows / heads), (group + heads - 1) / heads, heads};
     }
     id<MTLBuffer> ple_proj_out = nil, ple_table_out = nil, ple_in = nil, ple_gate_out = nil, ple_gate_h = nil, x_h = nil;  // Gemma 4
+    id<MTLBuffer> conv_buf = nil;  // LFM2: [token][3 * embd] from in_proj
     bool tiles_fit = false;  // every matrix has rows and columns in multiples of 64, as the tiled kernel needs
 
     id<MTLBuffer> weights = nil;  // the whole mapped file, no copy
@@ -144,6 +150,8 @@ struct MetalSession::Impl {
         Buf attn_norm, q, k, v, q_norm, k_norm, q_bias, k_bias, v_bias, attn_sub_norm, attn_post_norm, o, ffn_norm, gate, up,
             ffn_sub_norm, ffn_post_norm, down;
         Buf ple_gate, ple_proj, ple_post_norm;  // Gemma 4
+        Buf conv_in, conv_out, conv_w;          // LFM2 short-convolution layers
+        id<MTLBuffer> conv_cache = nil;         // [max_context][embd] of b*x
         float out_scale = 1.0f;
         std::size_t cache_offset = 0;  // byte offset of this layer's (or its shared source's) K/V cache
         bool own_kv = true;
@@ -203,8 +211,10 @@ struct MetalSession::Impl {
         matmul_mm = tile_pipeline(device, library, 0);
         matmul_mm_tq2 = tile_pipeline(device, library, 1);
         matmul_mm_q4k = tile_pipeline(device, library, 2);
+        matmul_mm_q5k = tile_pipeline(device, library, 7);
         matmul_mm_q6k = tile_pipeline(device, library, 3);
         embed_q4k = specialised_pipeline(device, library, "embed_k", 3, 2);
+        embed_q5k = specialised_pipeline(device, library, "embed_k", 3, 7);
         embed_q6k = specialised_pipeline(device, library, "embed_k", 3, 3);
         matmul_kq = pipeline("matmul_k");
         matmul_mm_q41 = tile_pipeline(device, library, 4);
@@ -225,6 +235,7 @@ struct MetalSession::Impl {
         }
         ple_combine = pipeline("ple_combine");
         to_half = pipeline("to_half");
+        shortconv = pipeline("shortconv");
         softcap = pipeline("softcap");
         attention_combine = pipeline("attention_combine");
     }
@@ -261,12 +272,30 @@ struct MetalSession::Impl {
         if (token_embd.format == WeightFormat::TQ2_0) fail("the Metal backend needs a Q4_0 or K-quant token embedding");
         output = matrix(model.output_projection(), "output.weight");
         output_norm = floats(model.output_norm());
-        if (!model.config().rope_factors.empty()) rope_factors = floats(model.config().rope_factors);
+        {
+            // LongRoPE (Phi): the long-context factors past the original context, else the short ones.
+            const ModelConfig& c = model.config();
+            const bool long_ctx = !c.rope_factors_long.empty() && c.rope_original_context != 0 && max_context > c.rope_original_context;
+            const std::vector<float>& factors = long_ctx ? c.rope_factors_long : c.rope_factors;
+            if (!factors.empty()) rope_factors = floats(factors);
+        }
         for (std::size_t li = 0; li < model.layers().size(); ++li) {
             const Model::Layer& l = model.layers()[li];
             Layer g;
             g.own_kv = c.kv_layer_of(li) == li;
             g.attn_norm = floats(l.attention_norm);
+            if (c.layer_is_conv(li)) {
+                g.conv_in = matrix(l.conv_in, "shortconv.in_proj");
+                g.conv_out = matrix(l.conv_out, "shortconv.out_proj");
+                g.conv_w = floats(l.conv_weight);
+                g.ffn_norm = floats(l.feed_forward_norm);
+                g.gate = matrix(l.gate, "ffn_gate");
+                g.up = matrix(l.up, "ffn_up");
+                g.down = matrix(l.down, "ffn_down");
+                g.own_kv = false;
+                layers.push_back(g);
+                continue;
+            }
             g.q = matrix(l.query, "attn_q");
             if (g.own_kv) {
                 g.k = matrix(l.key, "attn_k");
@@ -307,12 +336,13 @@ struct MetalSession::Impl {
         const bool supported = m.format == WeightFormat::Q4_0 || m.format == WeightFormat::Q4_1 ||
                                m.format == WeightFormat::Q5_0 || m.format == WeightFormat::Q8_0 ||
                                m.format == WeightFormat::TQ2_0 || m.format == WeightFormat::Q4_K ||
-                               m.format == WeightFormat::Q6_K;
+                               m.format == WeightFormat::Q5_K || m.format == WeightFormat::Q6_K;
         if (!supported || !in_file(m.bytes.data(), m.bytes.size())) {
             fail(std::string("the Metal backend needs ") + name +
-                 " as Q4_0, Q4_1, Q5_0, Q8_0, Q4_K, Q6_K or TQ2_0 in the file (load the model without repacking)");
+                 " as Q4_0, Q4_1, Q5_0, Q8_0, Q4_K, Q5_K, Q6_K or TQ2_0 in the file (load the model without repacking)");
         }
-        const bool super_blocks = m.format == WeightFormat::TQ2_0 || m.format == WeightFormat::Q4_K || m.format == WeightFormat::Q6_K;
+        const bool super_blocks = m.format == WeightFormat::TQ2_0 || m.format == WeightFormat::Q4_K ||
+                                  m.format == WeightFormat::Q5_K || m.format == WeightFormat::Q6_K;
         if (super_blocks && m.cols % 256 != 0) fail(std::string("columns not a multiple of 256: ") + name);
         return {weights, static_cast<NSUInteger>(m.bytes.data() - file.data()), m.format};
     }
@@ -337,6 +367,12 @@ struct MetalSession::Impl {
         const std::size_t embd = c.embedding_dim, qdim = std::size_t{c.head_count} * c.head_dim,
                           kvdim = std::size_t{c.kv_head_count} * c.head_dim, ff = c.feed_forward_dim;
         tokens = make(kMaxBatch * sizeof(int32_t));
+        if (c.conv_taps != 0) {
+            conv_buf = make(kMaxBatch * 3 * embd * 4);
+            for (std::size_t l = 0; l < layers.size(); ++l) {
+                if (c.layer_is_conv(l)) layers[l].conv_cache = make(max_context * embd * 4);
+            }
+        }
         if (c.ple_dim != 0) {
             const std::size_t all = static_cast<std::size_t>(c.ple_dim) * c.layer_count;
             ple_proj_out = make(kMaxBatch * all * 4);
@@ -366,6 +402,7 @@ struct MetalSession::Impl {
         // per threadgroup, so the buffer is sized by the layer with the most threadgroups.
         std::size_t most_groups = 0;
         for (std::size_t l = 0; l < c.layer_count; ++l) {
+            if (c.layer_is_conv(l)) continue;
             const auto [bt, hb, heads] = batched_shape(l);
             most_groups = std::max(most_groups, ((kMaxBatch + bt - 1) / bt) * c.kv_head_count_of(l) * hb);
         }
@@ -382,7 +419,7 @@ struct MetalSession::Impl {
             }
         }
         for (std::size_t l = 0; l < layers.size(); ++l) {
-            if (!layers[l].own_kv) layers[l].cache_offset = layers[c.kv_layer_of(l)].cache_offset;
+            if (!layers[l].own_kv && !c.layer_is_conv(l)) layers[l].cache_offset = layers[c.kv_layer_of(l)].cache_offset;
         }
         k_cache = make(cache);
         v_cache = make(cache);
@@ -421,6 +458,7 @@ struct MetalSession::Impl {
         switch (f) {
             case WeightFormat::TQ2_0: return matmul_mm_tq2;
             case WeightFormat::Q4_K: return matmul_mm_q4k;
+            case WeightFormat::Q5_K: return matmul_mm_q5k;
             case WeightFormat::Q6_K: return matmul_mm_q6k;
             case WeightFormat::Q4_1: return matmul_mm_q41;
             case WeightFormat::Q5_0: return matmul_mm_q50;
@@ -432,6 +470,7 @@ struct MetalSession::Impl {
         switch (f) {
             case WeightFormat::TQ2_0: return matmul_tq2;
             case WeightFormat::Q4_K:
+            case WeightFormat::Q5_K:
             case WeightFormat::Q6_K:
             case WeightFormat::Q4_1:
             case WeightFormat::Q5_0:
@@ -516,6 +555,7 @@ struct MetalSession::Impl {
     id<MTLComputePipelineState> embed_for(WeightFormat f) const {
         switch (f) {
             case WeightFormat::Q4_K: return embed_q4k;
+            case WeightFormat::Q5_K: return embed_q5k;
             case WeightFormat::Q6_K: return embed_q6k;
             case WeightFormat::Q4_1: return embed_q41;
             case WeightFormat::Q5_0: return embed_q50;
@@ -675,6 +715,31 @@ struct MetalSession::Impl {
             bool next_prenormed = false;  // the previous layer's fused post-norm already wrote this layer's pre-norm
             for (std::size_t l = 0; l < std::min(layers.size(), layer_cap); ++l) {
                 const Layer& g = layers[l];
+                if (g.conv_in.buffer != nil) {
+                    // LFM2 short-convolution layer: norm, in_proj, the conv, out_proj into the residual.
+                    const std::size_t ff_l = c.ff_dim_of(l);
+                    encode_norm(enc, x, g.attn_norm, normed_a, n, embd);
+                    encode_matmul(enc, {Target{&g.conv_in, 3 * embd, Act{conv_buf, nil}}}, embd, normed_a, n);
+                    [enc setComputePipelineState:shortconv];
+                    set(enc, conv_buf, 0);
+                    set(enc, g.conv_w, 1);
+                    set(enc, g.conv_cache, 2);
+                    set(enc, attended, 3);
+                    set(enc, attended_h, 4);
+                    const ConvParams cp{static_cast<uint32_t>(n), static_cast<uint32_t>(embd), c.conv_taps,
+                                        static_cast<uint32_t>(position), tiled(n) ? 1u : 0u};
+                    bytes(enc, cp, 5);
+                    [enc dispatchThreads:MTLSizeMake(n * embd, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                    checkpoint("attention");
+                    encode_matmul(enc, {Target{&g.conv_out, embd, x_a}}, embd, attended_a, n, kResidual, x);
+                    encode_norm(enc, x, g.ffn_norm, normed_a, n, embd);
+                    checkpoint("matmul_o");
+                    encode_gated(enc, g.gate, g.up, ff_l, embd, normed_a, n, kSiluMul, gate_a);
+                    checkpoint("matmul_gateup");
+                    encode_matmul(enc, {Target{&g.down, embd, x_a}}, ff_l, gate_a, n, kResidual, x);
+                    checkpoint("matmul_down");
+                    continue;
+                }
                 const std::size_t head_dim = c.head_dim_of(l);
                 const std::size_t kv_head_count = c.kv_head_count_of(l);
                 const std::size_t qdim = std::size_t{c.head_count} * head_dim, kvdim = kv_head_count * head_dim;
@@ -709,7 +774,9 @@ struct MetalSession::Impl {
                                     slides ? c.rope_base_local : c.rope_base, slides ? 1.0f : c.rope_scale,
                                     g.q_norm.buffer != nil ? 1u : 0u, c.rope_neox ? 1u : 0u,
                                     g.q_bias.buffer != nil ? 1u : 0u, rope_factors.buffer != nil && !slides ? 1u : 0u,
-                                    g.own_kv ? 1u : 0u, c.value_norm ? 1u : 0u};
+                                    g.own_kv ? 1u : 0u, c.value_norm ? 1u : 0u,
+                                    static_cast<uint32_t>(slides ? head_dim : std::min<std::size_t>(c.rope_dim_of(), head_dim)),
+                                    c.rope_attn_factor};
                 bytes(enc, rp, 7);
                 set(enc, g.q_bias.buffer != nil ? g.q_bias : g.attn_norm, 8);  // unused when has_bias is 0
                 set(enc, g.k_bias.buffer != nil ? g.k_bias : g.attn_norm, 9);
@@ -955,6 +1022,7 @@ struct StandaloneMatmul {
     static uint32_t format_id(WeightFormat f) {
         switch (f) {
             case WeightFormat::Q4_K: return 2;
+        case WeightFormat::Q5_K: return 7;
             case WeightFormat::Q6_K: return 3;
             case WeightFormat::Q4_1: return 4;
             case WeightFormat::Q5_0: return 5;

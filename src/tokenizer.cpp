@@ -172,6 +172,104 @@ std::vector<std::string_view> pretokenize_smollm(std::string_view text) {
     return words;
 }
 
+// o200k (GPT-4o, Phi-4): llama.cpp runs its adapted regex with std::regex over
+// the collapsed text, so "upper" means a letter that is not ASCII a-z and
+// "lower" a letter that is not ASCII A-Z (every non-ASCII letter is both):
+//   [^\r\n\p{L}\p{N}]?U*L+C? | [^\r\n\p{L}\p{N}]?U+L*C? | \p{N}{1,3} |
+//    ?[^\s\p{L}\p{N}]+[\r\n/]* | \s*[\r\n]+ | \s+(?!\S) | \s+
+// with C a case-insensitive contraction ('s 't 're 've 'm 'll 'd), the
+// alternatives tried in order and the optional prefix greedily. \s is ASCII
+// whitespace or, through the collapse, any Unicode whitespace.
+std::vector<std::string_view> pretokenize_gpt4o(std::string_view text) {
+    const std::vector<Codepoint> cps = decode_utf8(text);
+    const std::size_t n = cps.size();
+    auto cp_at = [&](std::size_t pos) -> std::uint32_t { return cps[pos].valid ? cps[pos].value : 0xFFFD; };
+    auto letter = [&](std::size_t p) { return p < n && is_letter(cp_at(p)); };
+    auto number = [&](std::size_t p) { return p < n && is_number(cp_at(p)); };
+    auto upper = [&](std::size_t p) { return letter(p) && !(cp_at(p) >= 'a' && cp_at(p) <= 'z'); };
+    auto lower = [&](std::size_t p) { return letter(p) && !(cp_at(p) >= 'A' && cp_at(p) <= 'Z'); };
+    auto space = [&](std::size_t p) {
+        if (p >= n) return false;
+        const std::uint32_t cp = cp_at(p);
+        return cp < 0x80 ? (cp == ' ' || (cp >= '\t' && cp <= '\r')) : is_whitespace(cp);
+    };
+    auto newline = [&](std::size_t p) { return p < n && (cp_at(p) == '\r' || cp_at(p) == '\n'); };
+    auto lower_ascii = [](std::uint32_t cp) { return cp >= 'A' && cp <= 'Z' ? cp + 32 : cp; };
+    auto contraction = [&](std::size_t p) -> std::size_t {  // length of a contraction at p, or 0
+        if (p >= n || cp_at(p) != '\'' || p + 1 >= n) return 0;
+        const std::uint32_t c1 = lower_ascii(cp_at(p + 1));
+        if (c1 == 's' || c1 == 't' || c1 == 'm' || c1 == 'd') return 2;
+        if (p + 2 < n) {
+            const std::uint32_t c2 = lower_ascii(cp_at(p + 2));
+            if ((c1 == 'r' && c2 == 'e') || (c1 == 'v' && c2 == 'e') || (c1 == 'l' && c2 == 'l')) return 3;
+        }
+        return 0;
+    };
+    // The two letter alternatives from p (after the optional prefix): the
+    // match end, or 0. `first_upper` is alternative 2 (U+ then L*).
+    auto letters = [&](std::size_t p, bool first_upper) -> std::size_t {
+        std::size_t u = p;
+        while (upper(u)) ++u;
+        if (first_upper) {
+            if (u == p) return 0;
+            std::size_t l = u;
+            while (lower(l)) ++l;
+            return l + contraction(l);
+        }
+        std::size_t l = u;
+        while (lower(l)) ++l;
+        if (l == u) {  // L+ needs a letter: U* gives back its last one if it is also an L
+            if (u > p && lower(u - 1)) l = u;
+            else return 0;
+        }
+        return l + contraction(l);
+    };
+
+    std::vector<std::string_view> words;
+    auto emit = [&](std::size_t begin, std::size_t end) {
+        const std::size_t from = cps[begin].offset;
+        const std::size_t to = end < n ? cps[end].offset : text.size();
+        words.push_back(text.substr(from, to - from));
+    };
+    std::size_t pos = 0;
+    while (pos < n) {
+        const std::size_t begin = pos;
+        const bool prefix = !newline(pos) && !letter(pos) && !number(pos);  // [^\r\n\p{L}\p{N}]
+        std::size_t end = 0;
+        for (const bool first_upper : {false, true}) {
+            if (prefix) end = letters(pos + 1, first_upper);
+            if (end == 0) end = letters(pos, first_upper);
+            if (end != 0) break;
+        }
+        if (end == 0 && number(pos)) {  // \p{N}{1,3}
+            end = pos + 1;
+            while (end - pos < 3 && number(end)) ++end;
+        }
+        if (end == 0) {  //  ?[^\s\p{L}\p{N}]+[\r\n/]*
+            std::size_t p = pos + (cp_at(pos) == ' ' ? 1 : 0);
+            auto other = [&](std::size_t q) { return q < n && !space(q) && !letter(q) && !number(q); };
+            if (other(p)) {
+                while (other(p)) ++p;
+                while (p < n && (newline(p) || cp_at(p) == '/')) ++p;
+                end = p;
+            }
+        }
+        if (end == 0) {  // \s*[\r\n]+ | \s+(?!\S) | \s+
+            std::size_t p = pos, last_newline = 0;
+            while (space(p)) {
+                if (newline(p)) last_newline = p + 1;
+                ++p;
+            }
+            if (last_newline != 0) end = last_newline;
+            else if (p > pos) end = (p - pos > 1 && p < n) ? p - 1 : p;
+        }
+        if (end == 0) end = pos + 1;  // no match: the character alone
+        pos = end;
+        emit(begin, pos);
+    }
+    return words;
+}
+
 }  // namespace
 
 // This mirrors llama.cpp's hand-written matcher for the same regex, including
@@ -179,6 +277,7 @@ std::vector<std::string_view> pretokenize_smollm(std::string_view text) {
 std::vector<std::string_view> pretokenize(std::string_view text, PreTokenizer pre) {
     if (pre == PreTokenizer::Gpt2) return pretokenize_gpt2(text);
     if (pre == PreTokenizer::SmolLM) return pretokenize_smollm(text);
+    if (pre == PreTokenizer::Gpt4o) return pretokenize_gpt4o(text);
     constexpr std::uint32_t kOutOfRange = 0xFFFFFFFF;
     struct Flags {
         bool present = false;
@@ -306,12 +405,14 @@ Tokenizer::Tokenizer(const GgufFile& file) {
         fail("unsupported tokenizer model '" + std::string(model.value_or("(none)")) + "'");
     } else if (pre == "qwen2") {
         pre_ = PreTokenizer::Qwen2;
-    } else if (pre == "llama-bpe") {
+    } else if (pre == "llama-bpe" || pre == "lfm2") {  // LFM2 reuses Llama 3's pattern
         pre_ = PreTokenizer::Llama3;
     } else if (pre == "smollm") {
         pre_ = PreTokenizer::SmolLM;
     } else if (pre == "gpt-2") {
         pre_ = PreTokenizer::Gpt2;
+    } else if (pre == "gpt-4o") {
+        pre_ = PreTokenizer::Gpt4o;
     } else if (pre == "deepseek-r1-qwen") {  // the Qwen2 pattern, as in llama.cpp
         pre_ = PreTokenizer::Qwen2;
     } else {

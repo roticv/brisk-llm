@@ -21,6 +21,7 @@ const char* name(WeightFormat f) {
         case WeightFormat::Q5_0: return "q5_0";
         case WeightFormat::Q8_0: return "q8_0";
         case WeightFormat::Q4_K: return "q4_k";
+        case WeightFormat::Q5_K: return "q5_k";
         case WeightFormat::Q6_K: return "q6_k";
         default: return "?";
     }
@@ -47,7 +48,8 @@ std::vector<std::byte> random_blocks(WeightFormat format, std::size_t rows, std:
                 std::memcpy(blk + 2, &m, 2);
                 break;
             }
-            case WeightFormat::Q4_K: {
+            case WeightFormat::Q4_K:
+            case WeightFormat::Q5_K: {
                 const std::uint16_t dmin = float_to_half(scale(rng) * 0.1f);
                 std::memcpy(blk, &d, 2);
                 std::memcpy(blk + 2, &dmin, 2);
@@ -64,6 +66,7 @@ std::vector<std::byte> random_blocks(WeightFormat format, std::size_t rows, std:
         case WeightFormat::Q4_0: dequantize_q4_0(reinterpret_cast<const BlockQ4_0*>(bytes.data()), values.data(), count); break;
         case WeightFormat::Q4_1: dequantize_q4_1(reinterpret_cast<const BlockQ4_1*>(bytes.data()), values.data(), count); break;
         case WeightFormat::Q4_K: dequantize_q4_k(reinterpret_cast<const BlockQ4_K*>(bytes.data()), values.data(), count); break;
+        case WeightFormat::Q5_K: dequantize_q5_k(reinterpret_cast<const BlockQ5_K*>(bytes.data()), values.data(), count); break;
         case WeightFormat::Q6_K: dequantize_q6_k(reinterpret_cast<const BlockQ6_K*>(bytes.data()), values.data(), count); break;
         case WeightFormat::Q5_0: dequantize_q5_0(reinterpret_cast<const BlockQ5_0*>(bytes.data()), values.data(), count); break;
         case WeightFormat::Q8_0: dequantize_q8_0(reinterpret_cast<const BlockQ8_0*>(bytes.data()), values.data(), count); break;
@@ -130,7 +133,7 @@ int main() {
     ok &= check(WeightFormat::Q4_0, 128, 2048, 64, true);
     ok &= check(WeightFormat::Q4_0, 256, 1024, 100, true);
     ok &= check(WeightFormat::Q4_0, 384, 96, 130, true);
-    for (const WeightFormat f : {WeightFormat::Q4_1, WeightFormat::Q5_0, WeightFormat::Q8_0, WeightFormat::Q4_K, WeightFormat::Q6_K}) {
+    for (const WeightFormat f : {WeightFormat::Q4_1, WeightFormat::Q5_0, WeightFormat::Q8_0, WeightFormat::Q4_K, WeightFormat::Q5_K, WeightFormat::Q6_K}) {
         const std::size_t cols = (f == WeightFormat::Q4_1 || f == WeightFormat::Q5_0 || f == WeightFormat::Q8_0) ? 1056 : 1280;
         ok &= check(f, 66, cols, 1, false);
         ok &= check(f, 130, cols, 3, false);

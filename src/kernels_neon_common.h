@@ -308,6 +308,29 @@ inline void unpack_q4_k(const BlockQ4_K& block, int8x16_t q[16], std::uint8_t sc
     for (int j = 0; j < 8; ++j) q4_k_scale_min(block.scales, j, scales[j], mins[j]);
 }
 
+// Decodes a Q5_K block like a Q4_K one, with the fifth bits from qh folded in.
+inline void unpack_q5_k(const BlockQ5_K& block, int8x16_t q[16], std::uint8_t scales[8], std::uint8_t mins[8]) {
+    const uint8x16_t low_mask = vdupq_n_u8(0x0F);
+    const uint8x16_t one = vdupq_n_u8(1);
+    uint8x16_t h0 = vld1q_u8(block.qh), h1 = vld1q_u8(block.qh + 16);
+    for (int chunk = 0; chunk < 4; ++chunk) {
+        const uint8x16_t c0 = vld1q_u8(block.qs + chunk * 32);
+        const uint8x16_t c1 = vld1q_u8(block.qs + chunk * 32 + 16);
+        // The chunk's two sub-blocks take the low two bits of qh (shifted down two per chunk).
+        const uint8x16_t lo_bits0 = vshlq_n_u8(vandq_u8(h0, one), 4);
+        const uint8x16_t lo_bits1 = vshlq_n_u8(vandq_u8(h1, one), 4);
+        const uint8x16_t hi_bits0 = vshlq_n_u8(vandq_u8(vshrq_n_u8(h0, 1), one), 4);
+        const uint8x16_t hi_bits1 = vshlq_n_u8(vandq_u8(vshrq_n_u8(h1, 1), one), 4);
+        q[chunk * 4 + 0] = vreinterpretq_s8_u8(vorrq_u8(vandq_u8(c0, low_mask), lo_bits0));
+        q[chunk * 4 + 1] = vreinterpretq_s8_u8(vorrq_u8(vandq_u8(c1, low_mask), lo_bits1));
+        q[chunk * 4 + 2] = vreinterpretq_s8_u8(vorrq_u8(vshrq_n_u8(c0, 4), hi_bits0));
+        q[chunk * 4 + 3] = vreinterpretq_s8_u8(vorrq_u8(vshrq_n_u8(c1, 4), hi_bits1));
+        h0 = vshrq_n_u8(h0, 2);
+        h1 = vshrq_n_u8(h1, 2);
+    }
+    for (int j = 0; j < 8; ++j) q4_k_scale_min(block.scales, j, scales[j], mins[j]);
+}
+
 // Sum over one Q6_K block for one activation block, before the block scales.
 template <typename Dot16>
 inline std::int32_t q6_k_block_sum(const int8x16_t q[16], const std::int8_t* scales, const BlockQ8_K& x, Dot16 dot16) {
@@ -320,9 +343,9 @@ inline std::int32_t q6_k_block_sum(const int8x16_t q[16], const std::int8_t* sca
     return vaddvq_s32(vaddq_s32(acc0, acc1));
 }
 
-template <typename Dot16>
+template <typename Block, typename Dot16>
 inline float q4_k_block_value(const int8x16_t q[16], const std::uint8_t scales[8], const std::uint8_t mins[8],
-                              const BlockQ4_K& w, const BlockQ8_K& x, Dot16 dot16) {
+                              const Block& w, const BlockQ8_K& x, Dot16 dot16) {
     int32x4_t acc0 = vdupq_n_s32(0);
     int32x4_t acc1 = vdupq_n_s32(0);
     std::int32_t offsets = 0;
@@ -360,6 +383,19 @@ inline void dot_rows_q4_k(const BlockQ4_K* w, const BlockQ8_K* const* xs, std::s
         int8x16_t q[16];
         std::uint8_t scales[8], mins[8];
         unpack_q4_k(w[b], q, scales, mins);
+        for (std::size_t t = 0; t < n; ++t) sums[t] += q4_k_block_value(q, scales, mins, w[b], xs[t][b], dot16);
+    }
+    for (std::size_t t = 0; t < n; ++t) out[t] = sums[t];
+}
+
+template <typename Dot16>
+inline void dot_rows_q5_k(const BlockQ5_K* w, const BlockQ8_K* const* xs, std::size_t n, std::size_t blocks,
+                          float* out, Dot16 dot16) {
+    float sums[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    for (std::size_t b = 0; b < blocks; ++b) {
+        int8x16_t q[16];
+        std::uint8_t scales[8], mins[8];
+        unpack_q5_k(w[b], q, scales, mins);
         for (std::size_t t = 0; t < n; ++t) sums[t] += q4_k_block_value(q, scales, mins, w[b], xs[t][b], dot16);
     }
     for (std::size_t t = 0; t < n; ++t) out[t] = sums[t];

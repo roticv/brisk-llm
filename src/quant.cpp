@@ -20,6 +20,7 @@ std::size_t block_elements(WeightFormat format) {
         case WeightFormat::Q5_0x4: return kBlockSize;
         case WeightFormat::Q8_0: return kBlockSize;
         case WeightFormat::Q4_K:
+        case WeightFormat::Q5_K:
         case WeightFormat::Q6_K:
         case WeightFormat::TQ2_0:
         case WeightFormat::TQ2_0x4:
@@ -39,6 +40,7 @@ std::size_t block_bytes(WeightFormat format) {
         case WeightFormat::Q5_0x4: return sizeof(BlockQ5_0x4) / 4;  // per row
         case WeightFormat::Q8_0: return sizeof(BlockQ8_0);
         case WeightFormat::Q4_K: return sizeof(BlockQ4_K);
+        case WeightFormat::Q5_K: return sizeof(BlockQ5_K);
         case WeightFormat::Q6_K: return sizeof(BlockQ6_K);
         case WeightFormat::TQ2_0: return sizeof(BlockTQ2_0);
         case WeightFormat::TQ2_0x4: return sizeof(BlockTQ2_0x4) / 4;  // per row
@@ -49,7 +51,7 @@ std::size_t block_bytes(WeightFormat format) {
 }
 
 bool takes_q8_k(WeightFormat format) {
-    return format == WeightFormat::Q4_K || format == WeightFormat::Q6_K || format == WeightFormat::TQ2_0 ||
+    return format == WeightFormat::Q4_K || format == WeightFormat::Q5_K || format == WeightFormat::Q6_K || format == WeightFormat::TQ2_0 ||
            format == WeightFormat::TQ2_0x4 || format == WeightFormat::Q4_Kx4 || format == WeightFormat::Q6_Kx4;
 }
 
@@ -247,6 +249,28 @@ void dequantize_q4_k(const BlockQ4_K* blocks, float* out, std::size_t count) {
             for (int i = 0; i < 32; ++i) {
                 y[chunk * 64 + i] = d1 * static_cast<float>(q[i] & 0xF) - m1;
                 y[chunk * 64 + 32 + i] = d2 * static_cast<float>(q[i] >> 4) - m2;
+            }
+        }
+    }
+}
+
+void dequantize_q5_k(const BlockQ5_K* blocks, float* out, std::size_t count) {
+    for (std::size_t b = 0; b < count / kSuperBlockSize; ++b) {
+        const BlockQ5_K& block = blocks[b];
+        const float d = half_to_float(block.d);
+        const float dmin = half_to_float(block.dmin);
+        float* y = out + b * kSuperBlockSize;
+        for (int chunk = 0; chunk < 4; ++chunk) {
+            std::uint8_t scale, min;
+            q4_k_scale_min(block.scales, 2 * chunk, scale, min);
+            const float d1 = d * scale, m1 = dmin * min;
+            q4_k_scale_min(block.scales, 2 * chunk + 1, scale, min);
+            const float d2 = d * scale, m2 = dmin * min;
+            const std::uint8_t* q = block.qs + chunk * 32;
+            const std::uint8_t lo_bit = static_cast<std::uint8_t>(1u << (2 * chunk)), hi_bit = static_cast<std::uint8_t>(lo_bit << 1);
+            for (int i = 0; i < 32; ++i) {
+                y[chunk * 64 + i] = d1 * static_cast<float>((q[i] & 0xF) | ((block.qh[i] & lo_bit) ? 16 : 0)) - m1;
+                y[chunk * 64 + 32 + i] = d2 * static_cast<float>((q[i] >> 4) | ((block.qh[i] & hi_bit) ? 16 : 0)) - m2;
             }
         }
     }
@@ -482,6 +506,32 @@ float dot_q4_k_q8_k(const BlockQ4_K* w, const BlockQ8_K* x, std::size_t blocks) 
             const std::int8_t* xq = xb.qs + sb * 32;
             std::int32_t dot = 0;
             for (int i = 0; i < 32; ++i) dot += ((sb % 2 == 0) ? (q[i] & 0xF) : (q[i] >> 4)) * xq[i];
+            weighted += scale * dot;
+            offsets += min * (xb.bsums[2 * sb] + xb.bsums[2 * sb + 1]);
+        }
+        sum += xb.d * (half_to_float(wb.d) * static_cast<float>(weighted) - half_to_float(wb.dmin) * static_cast<float>(offsets));
+    }
+    return sum;
+}
+
+float dot_q5_k_q8_k(const BlockQ5_K* w, const BlockQ8_K* x, std::size_t blocks) {
+    float sum = 0.0f;
+    for (std::size_t b = 0; b < blocks; ++b) {
+        const BlockQ5_K& wb = w[b];
+        const BlockQ8_K& xb = x[b];
+        std::int32_t weighted = 0;
+        std::int32_t offsets = 0;
+        for (int sb = 0; sb < 8; ++sb) {
+            std::uint8_t scale, min;
+            q4_k_scale_min(wb.scales, sb, scale, min);
+            const std::uint8_t* q = wb.qs + (sb / 2) * 32;
+            const std::uint8_t bit = static_cast<std::uint8_t>(1u << sb);
+            const std::int8_t* xq = xb.qs + sb * 32;
+            std::int32_t dot = 0;
+            for (int i = 0; i < 32; ++i) {
+                const int v = ((sb % 2 == 0) ? (q[i] & 0xF) : (q[i] >> 4)) | ((wb.qh[i] & bit) ? 16 : 0);
+                dot += v * xq[i];
+            }
             weighted += scale * dot;
             offsets += min * (xb.bsums[2 * sb] + xb.bsums[2 * sb + 1]);
         }

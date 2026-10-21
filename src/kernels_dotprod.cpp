@@ -76,6 +76,21 @@ void matmul_q4_0_dotprod(const void* w, std::size_t rows, std::size_t cols, cons
     neon::matmul(static_cast<const BlockQ4_0*>(w), rows, cols, static_cast<const BlockQ8_0*>(x), n, out, out_stride, dot_block);
 }
 
+void matvec_q5_k_dotprod(const void* w, std::size_t rows, std::size_t cols, const void* x, float* out) {
+    neon::matmul_k(static_cast<const BlockQ5_K*>(w), rows, cols, static_cast<const BlockQ8_K*>(x), 1, out, rows,
+                   [](const BlockQ5_K* row, const BlockQ8_K* const* xs, std::size_t n, std::size_t blocks, float* o) {
+                       neon::dot_rows_q5_k(row, xs, n, blocks, o, dot16);
+                   });
+}
+
+void matmul_q5_k_dotprod(const void* w, std::size_t rows, std::size_t cols, const void* x, std::size_t n, float* out,
+                      std::size_t out_stride) {
+    neon::matmul_k(static_cast<const BlockQ5_K*>(w), rows, cols, static_cast<const BlockQ8_K*>(x), n, out, out_stride,
+                   [](const BlockQ5_K* row, const BlockQ8_K* const* xs, std::size_t count, std::size_t blocks, float* o) {
+                       neon::dot_rows_q5_k(row, xs, count, blocks, o, dot16);
+                   });
+}
+
 void matvec_q4_k_dotprod(const void* w, std::size_t rows, std::size_t cols, const void* x, float* out) {
     neon::matmul_k(static_cast<const BlockQ4_K*>(w), rows, cols, static_cast<const BlockQ8_K*>(x), 1, out, rows,
                    [](const BlockQ4_K* row, const BlockQ8_K* const* xs, std::size_t n, std::size_t blocks, float* o) {

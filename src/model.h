@@ -24,6 +24,8 @@ enum class Architecture {
     Gemma3,  // Q/K norms, norms after attention and the feed-forward, GELU gating, sliding-window layers
     Gemma4,  // Gemma 3 plus per-layer embeddings, K/V sharing, wider global heads, no attention scaling
     BitNet,  // ternary weights, extra norms before the output projections, squared-ReLU feed-forward
+    Phi3,    // Phi-3/4-mini: fused QKV and gate/up tensors, partial rotary with LongRoPE factors
+    LFM2,    // Liquid LFM2: short-convolution layers (gated 3-tap causal conv) between attention layers
 };
 
 // Query heads per key/value head, at most (the attention tiles size their query arrays by it).
@@ -47,6 +49,15 @@ struct ModelConfig {
     // Per-frequency divisors of the RoPE angles (Llama 3's long-context
     // scaling, from rope_freqs.weight); empty when the angles are unscaled.
     std::vector<float> rope_factors;
+    // LongRoPE (Phi): the factors for contexts up to rope_original_context
+    // and beyond it; a session picks by its context length. rope_dim is how
+    // many of a head's dimensions rotate (the rest pass through), and the
+    // rotated values are multiplied by rope_attn_factor.
+    std::vector<float> rope_factors_short, rope_factors_long;
+    std::uint32_t rope_original_context = 0;
+    std::uint32_t rope_dim = 0;  // 0: head_dim
+    float rope_attn_factor = 1.0f;
+    std::uint32_t rope_dim_of() const { return rope_dim != 0 ? rope_dim : head_dim; }
     // Gemma 3: every layer whose index is not 5 mod 6 attends only to the
     // last `sliding_window` positions and uses `rope_base_local`; the global
     // layers use rope_base scaled by `rope_scale`. 0 when no layer slides.
@@ -78,6 +89,9 @@ struct ModelConfig {
     std::uint32_t kv_head_count_of(std::size_t layer) const {
         return kv_head_counts.empty() ? kv_head_count : kv_head_counts[layer];
     }
+    // LFM2: a layer with no key/value heads is a short-convolution layer.
+    bool layer_is_conv(std::size_t layer) const { return kv_head_count_of(layer) == 0; }
+    std::uint32_t conv_taps = 0;  // LFM2's shortconv.l_cache: the conv kernel's width in tokens
     std::uint32_t head_dim_of(std::size_t layer) const {
         return head_dim_local != 0 && layer_slides(layer) ? head_dim_local : head_dim;
     }
@@ -112,6 +126,10 @@ class Model {
 public:
     struct Layer {
         std::span<const float> attention_norm;
+        // LFM2 short-convolution layers: in_proj gives [b | c | x] (3 x embd), the
+        // conv kernel is `conv_taps` weights per channel (oldest first), out_proj follows.
+        Matrix conv_in, conv_out;
+        std::span<const float> conv_weight;
         Matrix query;
         Matrix key;
         Matrix value;
@@ -160,6 +178,9 @@ public:
 private:
     std::span<const float> load(const GgufFile& file, std::string_view name, std::size_t expected_elements);
     Matrix load_matrix(const GgufFile& file, std::string_view name, std::size_t rows, std::size_t cols);
+    // Rows [row0, row0 + rows) of a tensor of total_rows rows (a fused QKV or gate/up tensor).
+    Matrix load_matrix_rows(const GgufFile& file, std::string_view name, std::size_t row0, std::size_t rows,
+                            std::size_t total_rows, std::size_t cols);
 
     ModelConfig config_;
     Matrix token_embedding_;
@@ -226,6 +247,8 @@ private:
     std::size_t max_context_ = 0;
     std::vector<std::vector<float>> key_cache_;
     std::vector<std::vector<float>> value_cache_;
+    std::vector<std::vector<float>> conv_cache_;  // LFM2: per conv layer, b*x per position (the conv's state)
+    std::vector<float> conv_;                     // [token][3 * embd]: the in_proj output
     std::vector<float> kv_staging_;  // this batch's new keys or values, [token][kv_dim], before copying in
 
     // Scratch, with one row per token of the current batch.
@@ -237,6 +260,7 @@ private:
     std::vector<float> gate_;
     std::vector<float> up_;
     std::vector<float> scores_;
+    std::vector<float> rope_factors_;  // the RoPE angle divisors this session uses (see ModelConfig)
     std::vector<float> rope_;        // cos, sin pairs per position in the batch
     std::vector<float> rope_local_;  // the same with the sliding-window layers' base (Gemma)
     std::vector<float> ple_;         // Gemma 4: per-layer embedding inputs, [token][layer][ple_dim]

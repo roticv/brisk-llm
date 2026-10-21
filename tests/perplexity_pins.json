@@ -85,5 +85,20 @@
     "text": "bench/prompt512.txt",
     "perplexity": 22.1612,
     "gpu_tolerance": 0.1
+  },
+  {
+    "model": "Phi-4-mini-instruct-Q4_K_M.gguf",
+    "text": "tests/perplexity_text.txt",
+    "perplexity": 15.302
+  },
+  {
+    "model": "LFM2-1.2B-Q4_0.gguf",
+    "text": "tests/perplexity_text.txt",
+    "perplexity": 65.2623
+  },
+  {
+    "model": "LFM2-1.2B-Q4_K_M.gguf",
+    "text": "tests/perplexity_text.txt",
+    "perplexity": 69.9843
   }
 ]

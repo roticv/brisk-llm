@@ -99,6 +99,12 @@ void matmul_q8_0_i8mm(const void* w, std::size_t rows, std::size_t cols, const v
 void matvec_q4_1_dotprod(const void* w, std::size_t rows, std::size_t cols, const void* x, float* out);
 void matmul_q4_1_dotprod(const void* w, std::size_t rows, std::size_t cols, const void* x, std::size_t n, float* out,
                       std::size_t out_stride);
+void matvec_q5_k_neon(const void* w, std::size_t rows, std::size_t cols, const void* x, float* out);
+void matmul_q5_k_neon(const void* w, std::size_t rows, std::size_t cols, const void* x, std::size_t n, float* out,
+                      std::size_t out_stride);
+void matvec_q5_k_dotprod(const void* w, std::size_t rows, std::size_t cols, const void* x, float* out);
+void matmul_q5_k_dotprod(const void* w, std::size_t rows, std::size_t cols, const void* x, std::size_t n, float* out,
+                         std::size_t out_stride);
 void matvec_q4_k_neon(const void* w, std::size_t rows, std::size_t cols, const void* x, float* out);
 void matmul_q4_k_neon(const void* w, std::size_t rows, std::size_t cols, const void* x, std::size_t n, float* out,
                       std::size_t out_stride);
