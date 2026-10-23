@@ -620,32 +620,64 @@ kernel void matmul_k(device const uchar* w0 [[buffer(0)]],
     const uint subs = p.cols / 32;
 
     float acc0 = 0.0f, acc1 = 0.0f;
-    for (uint sub = lane; sub < subs; sub += 32) {
-        if (format == 2) {
-            // Q4_K: sum(q x) and sum(x) per sub-block, scaled once: value = d scale q - dmin min.
-            const uint j = sub % 8;
-            device const uchar* blk0 = wrow0 + (sub / 8) * 144;
-            device const uchar* blk1 = wrow1 + (sub / 8) * 144;
-            uint sc0, mn0, sc1, mn1;
-            q4k_scale_min(blk0 + 4, j, sc0, mn0);
-            q4k_scale_min(blk1 + 4, j, sc1, mn1);
-            device const uint* q0 = (device const uint*)(blk0 + 16 + (j / 2) * 32);
-            device const uint* q1 = (device const uint*)(blk1 + 16 + (j / 2) * 32);
-            const uint shift = (j % 2) * 4;
-            float4 s0 = 0.0f, s1 = 0.0f, xs = 0.0f;
-            for (uint k = 0; k < 8; ++k) {
-                const float4 xv = xrow[sub * 8 + k];
-                xs += xv;
-                s0 = fma(float4(uint4(q0[k]) >> (uint4(0, 8, 16, 24) + shift) & 0xF), xv, s0);
-                s1 = fma(float4(uint4(q1[k]) >> (uint4(0, 8, 16, 24) + shift) & 0xF), xv, s1);
+    if (format == 2) {
+        // Q4_K after llama.cpp's mul_mv_q4_K: four blocks in flight per simdgroup,
+        // eight lanes per block. Lane (iq, ir) of a block takes 8-value slices at
+        // elements 64 iq + 8 ir (+32, +128, +160): the low and high nibbles of
+        // 4 words of chunk iq and of chunk iq + 2, so the nibbles are never
+        // shifted (activations are pre-divided by 256 and 16 instead), and the
+        // sub-block scales/mins come from 16-bit words of the scale bytes.
+        const uint ix = lane / 8, it = lane % 8, iq = it / 4, ir = it % 4;
+        const uint blocks = p.cols / 256;
+        device const float* y = x + t * p.cols + 64 * iq + 8 * ir;
+        for (uint ib = ix; ib < blocks; ib += 4) {
+            device const float* y4 = y + ib * 256;
+            float yl[16], yh[16];
+            float4 sumy = 0.0f;
+            for (uint i = 0; i < 8; ++i) {
+                yl[i] = y4[i];
+                yl[i + 8] = y4[i + 32];
+                yh[i] = y4[i + 128];
+                yh[i + 8] = y4[i + 160];
+                sumy += float4(yl[i], yl[i + 8], yh[i], yh[i + 8]);
             }
-            const float xsum = (xs.x + xs.y) + (xs.z + xs.w);
-            const float d0 = float(*(device const half*)blk0), dm0 = float(*(device const half*)(blk0 + 2));
-            const float d1 = float(*(device const half*)blk1), dm1 = float(*(device const half*)(blk1 + 2));
-            acc0 += d0 * float(sc0) * ((s0.x + s0.y) + (s0.z + s0.w)) - dm0 * float(mn0) * xsum;
-            acc1 += d1 * float(sc1) * ((s1.x + s1.y) + (s1.z + s1.w)) - dm1 * float(mn1) * xsum;
-            continue;
+            for (uint r = 0; r < 2; ++r) {
+                device const uchar* blk = (r == 0 ? wrow0 : wrow1) + ib * 144;
+                device const ushort* sc = (device const ushort*)(blk + 4) + iq;
+                device const ushort* q1 = (device const ushort*)(blk + 16) + 16 * iq + 4 * ir;
+                device const ushort* q2 = q1 + 32;
+                // Scales and minimums of sub-blocks 2iq, 2iq+1 (low nibbles) and 2iq+4, 2iq+5 (high):
+                // bytes 0,1 scales of 2iq..2iq+1, 2,3 their mins, 4,5 scales of 2iq+4.., 6,7 their mins.
+                ushort sc16[4];
+                sc16[0] = sc[0] & 0x3f3f;
+                sc16[1] = sc[2] & 0x3f3f;
+                sc16[2] = ((sc[4] >> 0) & 0x0f0f) | ((sc[0] & 0xc0c0) >> 2);
+                sc16[3] = ((sc[4] >> 4) & 0x0f0f) | ((sc[2] & 0xc0c0) >> 2);
+                thread const uchar* sc8 = (thread const uchar*)sc16;
+                float4 lo = 0.0f, hi = 0.0f;
+                for (uint i = 0; i < 4; ++i) {
+                    const uint w1 = q1[i], w2 = q2[i];
+                    lo[0] += yl[2 * i] * float(w1 & 0x000F);
+                    lo[1] += yl[2 * i + 1] * float(w1 & 0x0F00);
+                    lo[2] += yl[2 * i + 8] * float(w1 & 0x00F0);
+                    lo[3] += yl[2 * i + 9] * float(w1 & 0xF000);
+                    hi[0] += yh[2 * i] * float(w2 & 0x000F);
+                    hi[1] += yh[2 * i + 1] * float(w2 & 0x0F00);
+                    hi[2] += yh[2 * i + 8] * float(w2 & 0x00F0);
+                    hi[3] += yh[2 * i + 9] * float(w2 & 0xF000);
+                }
+                const float d = float(*(device const half*)blk), dmin = float(*(device const half*)(blk + 2));
+                const float v = d * ((lo[0] + lo[1] * (1.0f / 256.0f)) * float(sc8[0]) +
+                                     (lo[2] + lo[3] * (1.0f / 256.0f)) * float(sc8[1]) * (1.0f / 16.0f) +
+                                     (hi[0] + hi[1] * (1.0f / 256.0f)) * float(sc8[4]) +
+                                     (hi[2] + hi[3] * (1.0f / 256.0f)) * float(sc8[5]) * (1.0f / 16.0f)) -
+                                dmin * (sumy[0] * float(sc8[2]) + sumy[1] * float(sc8[3]) + sumy[2] * float(sc8[6]) + sumy[3] * float(sc8[7]));
+                if (r == 0) acc0 += v;
+                else acc1 += v;
+            }
         }
+    }
+    for (uint sub = lane; sub < (format == 2 ? 0u : subs); sub += 32) {  // the other formats: a sub-block per lane
         float4 va[8], vb[8];
         subblock_dequant(format, wrow0, sub, va);
         subblock_dequant(format, wrow1, sub, vb);

@@ -156,6 +156,20 @@ Tokenizer identical to llama.cpp on 2,178 strings; CPU perplexity 128.85 against
 
 Where the GPU's 18.3 ms per token goes (profiled per kernel class): gate/up 6.4, output 4.2 (the tied Q8_0 embedding, 430 MB at 102 GB/s), down 3.4, q/kv 1.3, o 1.3, attention 0.55, per-layer embeddings 0.5, rope 0.35. The 1536-row matrices (down, o) stream at 87-94 GB/s against 104-114 for the taller ones: 1536 rows is 384 simdgroups at 4 rows each, too few to hide latency, and halving the rows per simdgroup made it worse rather than better. The softcap moved from the CPU (262,144 `tanh` calls between batches, about 1 ms) to a kernel. The bandwidth floor at 110 GB/s would be ~15 ms (65 tokens/s); both engines sit at ~18.
 
+#### Phase 7 families on the Mac (2026-10-23)
+
+Same conditions as the tables above (`--warmup` prompts, 64-token generation, llama-bench alongside; single runs on an idle machine, so +-3%). Tokens/s, brisk / llama.cpp.
+
+| File | CPU 4 threads prompt | CPU generation | GPU prompt | GPU generation |
+|---|---:|---:|---:|---:|
+| SmolLM2-1.7B Q4_K_M | 207 / 199 | 62 / 63 | 759 / 816 | 84 / 82 |
+| Llama-3.2-3B Q4_K_M | 119 / 102 | 33 / 31 | 443 / 365 | 46 / 40 |
+| Phi-4-mini Q4_K_M | 93 / 89 | 28 / 29 | 401 / 398 | 35-36 / 36 |
+| LFM2-1.2B Q4_0 | 405 / 462 | 100 / 100 | 1283 / 1372 | 128 / 128 |
+| Qwen3-1.7B Q4_K_M (for reference) | | | | 75-77 / 78 |
+
+The GPU generation column is after a rewrite of the Q4_K gemv in the layout of llama.cpp's `mul_mv_q4_K`: four blocks in flight per simdgroup with eight lanes per block, each lane taking 8-value slices from four places in the block so the nibbles are never shifted (the activations are pre-divided by 256 and 16, as in the Q4_0 kernel), and the sub-block scales read as 16-bit words. In the standalone harness that took the Q4_K gemv from 85-95 GB/s to 101-116, level with Q4_0; in the models it was worth 8-12% on generation for the Q4_K_M files (SmolLM2 75 to 84, Llama 3B 44 to 46, Qwen3-1.7B Q4_K_M 70 to 76). Two things that did not help, measured in the same harness with interleaved runs: four rows per simdgroup for the K-quant gemv (5% slower than two, more registers and fewer simdgroups), and the same llama.cpp-style layout for Q6_K (93-98 GB/s either way; Q6_K's sixteen scales per block cost the same however the lanes are arranged). Q5_K stays at ~80 GB/s on the old layout; it is 14% of Phi's bytes. The remaining prompt-side gap on the small models (LFM2, SmolLM2: 7%) is the tile path's known 4-9%.
+
 #### Speculative decoding on the GPU
 
 Qwen3-1.7B pure Q4_0, `--gpu`, greedy, lookup (n-gram) drafting, output identical to plain decoding. The Speculator now backs off after a round with no accepted guess (plain single-token rounds, doubling up to 32, halved again on success), which is what keeps the fresh-answer penalty bounded.
