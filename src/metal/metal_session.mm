@@ -131,6 +131,7 @@ struct MetalSession::Impl {
                                 matmul_mm_q80 = nil, rope = nil,
                                 attention = nil,
                                 attention_small = nil, attention_combine = nil;
+    static constexpr std::size_t kAttentionGroups = 256;  // threadgroups per batched-attention dispatch, at most
     // The batched attention's threadgroup shape for a layer: tokens, head blocks per kv head, heads per block.
     std::tuple<std::size_t, std::size_t, std::size_t> batched_shape(std::size_t l) const {
         const ModelConfig& c = model.config();
@@ -398,15 +399,12 @@ struct MetalSession::Impl {
         // The batched kernel holds 16 query rows (8 at 512 wide): a threadgroup takes
         // as many of a kv head's query heads as fit (several threadgroups per kv head
         // when the group is larger) and as many tokens as fill the rows; the small
-        // kernel takes 8 / (head size / 128) heads per threadgroup. Score rows: 16
-        // per threadgroup, so the buffer is sized by the layer with the most threadgroups.
-        std::size_t most_groups = 0;
-        for (std::size_t l = 0; l < c.layer_count; ++l) {
-            if (c.layer_is_conv(l)) continue;
-            const auto [bt, hb, heads] = batched_shape(l);
-            most_groups = std::max(most_groups, ((kMaxBatch + bt - 1) / bt) * c.kv_head_count_of(l) * hb);
-        }
-        scores = make(most_groups * 16 * max_context * 6);  // float scores plus half probabilities per entry
+        // kernel takes 8 / (head size / 128) heads per threadgroup. Each threadgroup
+        // scores its 16 rows over the whole context, so a batch's attention is
+        // dispatched in token chunks of at most kAttentionGroups threadgroups and
+        // the scores buffer is sized for one dispatch: 16 x context x 6 bytes per
+        // threadgroup (float scores, half probabilities), 200 MB at 8192 tokens.
+        scores = make(kAttentionGroups * 16 * max_context * 6);
         // Partials: kSmallBatch tokens x heads x splits, each head_dim + 2 floats.
         partial = make(kSmallBatch * c.head_count * ((max_context + kSmallChunk - 1) / kSmallChunk) * (c.head_dim + 2) * 4);
         logits = make(Engine::kMaxScoredTokens * c.vocab_size * 4);
@@ -816,15 +814,24 @@ struct MetalSession::Impl {
                     bytes(enc, ap, 4);
                     groups(enc, n * kv_head_count * head_blocks * splits, 128);
                 } else {
-                    [enc setComputePipelineState:attention_by_kind[kind]];
-                    set(enc, q, 0);
-                    [enc setBuffer:k_cache offset:cache_layer atIndex:1];
-                    [enc setBuffer:v_cache offset:cache_layer atIndex:2];
-                    set(enc, attended, 3);
-                    set(enc, scores, 4);
-                    bytes(enc, ap, 5);
-                    set(enc, attended_h, 6);
-                    groups(enc, ((n + block_tokens_l - 1) / block_tokens_l) * kv_head_count * head_blocks, 128);
+                    // Token chunks of at most kAttentionGroups threadgroups, each reusing the scores buffer.
+                    const std::size_t per_block = kv_head_count * head_blocks;
+                    const std::size_t chunk_tokens = std::max<std::size_t>(1, kAttentionGroups / per_block) * block_tokens_l;
+                    for (std::size_t t0 = 0; t0 < n; t0 += chunk_tokens) {
+                        const std::size_t tokens = std::min(chunk_tokens, n - t0);
+                        AttentionParams cp = ap;
+                        cp.n = static_cast<uint32_t>(tokens);
+                        cp.position0 = static_cast<uint32_t>(position + t0);
+                        [enc setComputePipelineState:attention_by_kind[kind]];
+                        [enc setBuffer:q offset:t0 * qdim * 4 atIndex:0];
+                        [enc setBuffer:k_cache offset:cache_layer atIndex:1];
+                        [enc setBuffer:v_cache offset:cache_layer atIndex:2];
+                        [enc setBuffer:attended offset:t0 * qdim * 4 atIndex:3];
+                        set(enc, scores, 4);
+                        bytes(enc, cp, 5);
+                        [enc setBuffer:attended_h offset:t0 * qdim * 2 atIndex:6];
+                        groups(enc, ((tokens + block_tokens_l - 1) / block_tokens_l) * per_block, 128);
+                    }
                 }
                 if (small) {
                     [enc setComputePipelineState:attention_combine];

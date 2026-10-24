@@ -83,7 +83,7 @@ MemoryEstimate estimate_memory(const GgufFile& file, const ModelConfig& c, bool 
         constexpr std::size_t batch = 512;
         e.scratch += batch * (4 * c.embedding_dim + 2 * qdim + 2 * kvdim + c.feed_forward_dim) * sizeof(float);
         e.scratch += batch * (c.embedding_dim + qdim + c.feed_forward_dim) * 2;  // half copies
-        e.scratch += batch * c.head_count * context * 6;                         // scores + probabilities
+        e.scratch += 256 * 16 * context * 6;  // the attention scores buffer: 256 threadgroups x 16 rows (scores + probabilities)
         e.scratch += 8 * c.head_count * ((context + 127) / 128) * (c.head_dim + 2) * sizeof(float);  // partials
         e.scratch += 64 * c.vocab_size * sizeof(float);
         if (c.ple_dim != 0) e.scratch += batch * std::size_t{c.ple_dim} * c.layer_count * sizeof(float) * 3;
