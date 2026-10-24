@@ -210,7 +210,7 @@ void matvec_tq2_0_dotprod(const void* w, std::size_t rows, std::size_t cols, con
 
 void matmul_tq2_0_dotprod(const void* w, std::size_t rows, std::size_t cols, const void* x, std::size_t n, float* out,
                       std::size_t out_stride) {
-    neon::matmul_k(static_cast<const BlockTQ2_0*>(w), rows, cols, static_cast<const BlockQ8_K*>(x), n, out, out_stride,
+    neon::matmul_k<neon::kTernaryTokens>(static_cast<const BlockTQ2_0*>(w), rows, cols, static_cast<const BlockQ8_K*>(x), n, out, out_stride,
                    [](const BlockTQ2_0* row, const BlockQ8_K* const* xs, std::size_t count, std::size_t blocks, float* o) {
                        neon::dot_rows_tq2_0(row, xs, count, blocks, o, dot16_acc);
                    });

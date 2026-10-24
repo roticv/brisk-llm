@@ -420,48 +420,93 @@ inline void unpack_tq2_0(const BlockTQ2_0& block, int8x16_t q[16]) {
 
 // Weight row of TQ2_0 blocks against up to 4 activation rows.
 // Dot16Acc(acc, w, x) adds the 16 products of w and x into acc's four lanes.
+// Ternary rows against up to kTernaryTokens activation rows. The codes are
+// 0..2, so 64 products fit an int16 lane with room to spare (64 * 2 * 127 =
+// 16256): each quarter of the block is multiplied-accumulated in 16 bits by
+// vmull/vmlal and widened to 32 bits once, instead of after every 16 values.
+// Four independent chains keep the A72's multiplier busy.
+constexpr std::size_t kTernaryTokens = 8;
+
+inline int32x4_t ternary_quarter(const int8x16_t* q, const std::int8_t* x) {
+    const int8x16_t x0 = vld1q_s8(x), x1 = vld1q_s8(x + 16), x2 = vld1q_s8(x + 32), x3 = vld1q_s8(x + 48);
+    // Two chains of four, so consecutive multiply-accumulates do not wait on each other.
+    int16x8_t p = vmull_s8(vget_low_s8(q[0]), vget_low_s8(x0));
+    int16x8_t r = vmull_s8(vget_high_s8(q[0]), vget_high_s8(x0));
+    p = vmlal_s8(p, vget_low_s8(q[1]), vget_low_s8(x1));
+    r = vmlal_s8(r, vget_high_s8(q[1]), vget_high_s8(x1));
+    p = vmlal_s8(p, vget_low_s8(q[2]), vget_low_s8(x2));
+    r = vmlal_s8(r, vget_high_s8(q[2]), vget_high_s8(x2));
+    p = vmlal_s8(p, vget_low_s8(q[3]), vget_low_s8(x3));
+    r = vmlal_s8(r, vget_high_s8(q[3]), vget_high_s8(x3));
+    return vpaddlq_s16(vaddq_s16(p, r));
+}
+
+// The dotprod variant: dot16(acc, w, x) accumulates 16 products with one 8-bit dot instruction.
 template <typename Dot16Acc>
 inline void dot_rows_tq2_0(const BlockTQ2_0* w, const BlockQ8_K* const* xs, std::size_t n, std::size_t blocks,
                            float* out, Dot16Acc dot16) {
-    float sums[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float sums[kTernaryTokens] = {};
     for (std::size_t b = 0; b < blocks; ++b) {
         int8x16_t q[16];
         unpack_tq2_0(w[b], q);
         const float d = vgetq_lane_f32(half4_to_float(w[b].d), 0);
         for (std::size_t t = 0; t < n; ++t) {
             const BlockQ8_K& x = xs[t][b];
-            int32x4_t acc0 = vdupq_n_s32(0);
-            int32x4_t acc1 = vdupq_n_s32(0);
-            int32x4_t acc2 = vdupq_n_s32(0);
-            int32x4_t acc3 = vdupq_n_s32(0);
+            int32x4_t acc0 = vdupq_n_s32(0), acc1 = vdupq_n_s32(0), acc2 = vdupq_n_s32(0), acc3 = vdupq_n_s32(0);
             for (int g = 0; g < 16; g += 4) {
                 acc0 = dot16(acc0, q[g], vld1q_s8(x.qs + 16 * g));
                 acc1 = dot16(acc1, q[g + 1], vld1q_s8(x.qs + 16 * g + 16));
                 acc2 = dot16(acc2, q[g + 2], vld1q_s8(x.qs + 16 * g + 32));
                 acc3 = dot16(acc3, q[g + 3], vld1q_s8(x.qs + 16 * g + 48));
             }
-            acc0 = vaddq_s32(vaddq_s32(acc0, acc1), vaddq_s32(acc2, acc3));
+            const int32x4_t acc = vaddq_s32(vaddq_s32(acc0, acc1), vaddq_s32(acc2, acc3));
+            const int16x8_t bsums = vaddq_s16(vld1q_s16(x.bsums), vld1q_s16(x.bsums + 8));
+            const std::int32_t xsum = vaddlvq_s16(bsums);
+            sums[t] += x.d * d * static_cast<float>(vaddvq_s32(acc) - xsum);
+        }
+    }
+    for (std::size_t t = 0; t < n; ++t) out[t] = sums[t];
+}
+
+// The baseline NEON variant: 16-bit accumulation per quarter block (above).
+inline void dot_rows_tq2_0_wide(const BlockTQ2_0* w, const BlockQ8_K* const* xs, std::size_t n, std::size_t blocks,
+                                float* out) {
+    float sums[kTernaryTokens] = {};
+    for (std::size_t b = 0; b < blocks; ++b) {
+        int8x16_t q[16];
+        unpack_tq2_0(w[b], q);
+        const float d = vgetq_lane_f32(half4_to_float(w[b].d), 0);
+        for (std::size_t t = 0; t < n; ++t) {
+            const BlockQ8_K& x = xs[t][b];
+            const int32x4_t a0 = ternary_quarter(q, x.qs);
+            const int32x4_t a1 = ternary_quarter(q + 4, x.qs + 64);
+            const int32x4_t a2 = ternary_quarter(q + 8, x.qs + 128);
+            const int32x4_t a3 = ternary_quarter(q + 12, x.qs + 192);
+            const int32x4_t acc = vaddq_s32(vaddq_s32(a0, a1), vaddq_s32(a2, a3));
             // sum((q - 1) x) = sum(q x) - sum(x)
             const int16x8_t bsums = vaddq_s16(vld1q_s16(x.bsums), vld1q_s16(x.bsums + 8));
             const std::int32_t xsum = vaddlvq_s16(bsums);
-            sums[t] += x.d * d * static_cast<float>(vaddvq_s32(acc0) - xsum);
+            sums[t] += x.d * d * static_cast<float>(vaddvq_s32(acc) - xsum);
         }
     }
     for (std::size_t t = 0; t < n; ++t) out[t] = sums[t];
 }
 
 // Generic driver for the K-quant kernels: `dot_rows(w_row, xs, n, blocks, out)`.
-template <typename Block, typename DotRows>
+// Tokens are taken in groups of `Group` per unpacked weight block (4, or
+// kTernaryTokens for the ternary kernel, whose unpack is the larger share).
+template <std::size_t Group = 4, typename Block, typename DotRows>
 inline void matmul_k(const Block* w, std::size_t rows, std::size_t cols, const BlockQ8_K* x, std::size_t n, float* out,
                      std::size_t out_stride, DotRows dot_rows) {
     const std::size_t blocks = cols / kSuperBlockSize;
     for (std::size_t r0 = 0; r0 < rows; r0 += kRowBand) {
         const std::size_t r1 = std::min(rows, r0 + kRowBand);
-        for (std::size_t t = 0; t < n; t += 4) {
-            const std::size_t count = std::min<std::size_t>(4, n - t);
-            const BlockQ8_K* xs[4] = {x + t * blocks, x + (t + 1) * blocks, x + (t + 2) * blocks, x + (t + 3) * blocks};
+        for (std::size_t t = 0; t < n; t += Group) {
+            const std::size_t count = std::min<std::size_t>(Group, n - t);
+            const BlockQ8_K* xs[Group];
+            for (std::size_t i = 0; i < Group; ++i) xs[i] = x + (t + std::min(i, count - 1)) * blocks;  // clamped, unused past count
             for (std::size_t r = r0; r < r1; ++r) {
-                float result[4];
+                float result[Group];
                 dot_rows(w + r * blocks, xs, count, blocks, result);
                 for (std::size_t i = 0; i < count; ++i) out[(t + i) * out_stride + r] = result[i];
             }

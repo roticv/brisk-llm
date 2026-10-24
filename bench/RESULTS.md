@@ -204,7 +204,7 @@ Every file brisk runs on the Pi, with the current engine (half-precision K/V cac
 | LFM2-1.2B Q4_0 | 15.5 (15.4) | 8.0 | 5.2 (5.2) | 4.9 |
 | Gemma-4-E2B Q4_0 | 7.1 (6.9) | 3.7 | 2.2 (2.2) | 2.1 |
 
-Generation is at the bandwidth ceiling on both engines and brisk is 2-9% ahead on every file (the half-precision cache changed nothing measurable at these context lengths). Prompt processing: brisk is 1.2-1.9x llama.cpp on every file but BitNet (0.83x, the ternary kernel being compute-bound on the A72 with no batched layout) — the Q4_0 files at 1.7-1.9x, the K-quant files at 1.2x, the Q4_K_M Gemma 3 at 1.7x since its Q5_0/Q8_0 tensors took the banded kernel (8.2 to 16.2). The 3B Llama at 1.9 GB per token is the slowest usable file here (1.8 tokens/s); the 2.8 GB Gemma 4 E2B needs `--ctx 1024` to fit beside the OS.
+Generation is at the bandwidth ceiling on both engines and brisk is 2-9% ahead on every file (the half-precision cache changed nothing measurable at these context lengths). Prompt processing: brisk is 1.2-1.9x llama.cpp on every file but BitNet (0.83x; a restructured ternary kernel the same day — 16-bit accumulation per quarter block, 128-bit loads, eight tokens per unpacked block — reached 6.2-6.4, still short of 7.2: the A72 is at about a quarter of its multiplier peak on it and a lookup-table method is what would change that) — the Q4_0 files at 1.7-1.9x, the K-quant files at 1.2x, the Q4_K_M Gemma 3 at 1.7x since its Q5_0/Q8_0 tensors took the banded kernel (8.2 to 16.2). The 3B Llama at 1.9 GB per token is the slowest usable file here (1.8 tokens/s); the 2.8 GB Gemma 4 E2B needs `--ctx 1024` to fit beside the OS.
 
 Same llama.cpp commit `8216c84`, CPU only, 4 threads, 5 repetitions, 20 s cool-down. Speeds in tokens/s.
 
