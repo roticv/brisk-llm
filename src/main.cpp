@@ -12,6 +12,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <filesystem>
 #include <thread>
 #include <type_traits>
 #include <vector>
@@ -23,6 +24,7 @@
 #if BRISK_METAL
 #include "metal/metal_session.h"
 #endif
+#include "catalog.h"
 #include "chat.h"
 #include "memory.h"
 #include "server.h"
@@ -356,6 +358,7 @@ int usage() {
                  "                  [--name <id>] [-v] [--no-prefetch] [--mlock]\n"
                  "                  OpenAI-compatible API (/v1/chat/completions, /v1/models); the weights are paged in at start\n"
                  "       brisk template <model.gguf> (<role> <content>)...   the rendered chat prompt\n"
+                 "       brisk pull [<name>...] [--dir <dir>]   download a verified model file (no name: list them)\n"
                  "\n"
                  "generate options:\n"
                  "  -n <count>            most tokens to generate (default 128)\n"
@@ -425,6 +428,36 @@ int run(const std::vector<std::string>& args) {
         }
         if (args.size() != (list_tensors ? 3u : 2u)) return usage();
         return cmd_info(args.back(), list_tensors);
+    }
+
+    if (command == "pull") {
+        // brisk pull [<name>...] [--dir <dir>]: downloads verified files; no name lists them.
+        std::string dir = "models";
+        std::vector<std::string> names;
+        for (std::size_t i = 1; i < args.size(); ++i) {
+            if (args[i] == "--dir" && i + 1 < args.size()) dir = args[++i];
+            else names.push_back(args[i]);
+        }
+        if (names.empty()) {
+            std::printf("%-18s %9s  %-40s %s\n", "name", "size", "file", "notes");
+            for (const brisk::CatalogEntry& e : brisk::catalog()) {
+                const bool present = std::filesystem::exists(std::filesystem::path(dir) / std::string(e.file));
+                std::printf("%-18.*s %7.2f GB  %-40.*s %.*s%s\n", static_cast<int>(e.name.size()), e.name.data(),
+                            static_cast<double>(e.bytes) / (1024.0 * 1024.0 * 1024.0), static_cast<int>(e.file.size()), e.file.data(),
+                            static_cast<int>(e.note.size()), e.note.data(), present ? " [present]" : "");
+            }
+            std::printf("\nbrisk pull <name> downloads into %s/ (resumable); then: brisk generate %s/<file> --chat -p \"...\"\n", dir.c_str(), dir.c_str());
+            return 0;
+        }
+        for (const std::string& name : names) {
+            const brisk::CatalogEntry* e = brisk::catalog_find(name);
+            if (e == nullptr) throw std::runtime_error("unknown model '" + name + "'; brisk pull lists the names");
+            std::fprintf(stderr, "pulling %.*s (%.2f GB)\n", static_cast<int>(e->file.size()), e->file.data(),
+                         static_cast<double>(e->bytes) / (1024.0 * 1024.0 * 1024.0));
+            const std::string path = brisk::pull(*e, dir, false);
+            std::printf("%s\n", path.c_str());
+        }
+        return 0;
     }
 
     if (command == "serve") {
