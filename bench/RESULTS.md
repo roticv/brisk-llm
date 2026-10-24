@@ -185,6 +185,27 @@ Measured along the way: a 128x64 tile with 8 simdgroups ran 3x slower (register 
 
 ## Raspberry Pi 4 Model B (4 GB, Cortex-A72 x4, Debian 13, 64-bit)
 
+### Pi, all families (2026-10-24, brisk `03a337a`)
+
+Every file brisk runs on the Pi, with the current engine (half-precision K/V cache, banded Q5_0/Q8_0 kernels, the Phase 7 families): `bench/run_brisk_bench.sh`, 4 threads, medians of 3 (`raspberrypi-brisk-03a337a.md`); llama.cpp `8216c84` by `run_llama_bench.sh` on the same files (`raspberrypi-llama.cpp-8216c84-2026-10-24.md`). Prompt = 492-513 tokens; generation = 128 tokens. Tokens/s; in brackets the 18 October numbers where a file was measured then. The Pi reached 77 C and its soft throttle (`0xe0000`) during the brisk run and 57 C during llama-bench, so brisk's prompt numbers are, if anything, pessimistic.
+
+| File | brisk prompt | llama.cpp prompt | brisk generation | llama.cpp generation |
+|---|---:|---:|---:|---:|
+| Qwen3-0.6B pure Q4_0 | 30.6 (30.1) | 18.0 | 10.6 (10.3) | 9.8 |
+| Qwen3-1.7B pure Q4_0 | 11.0 (10.9) | 5.7 | 3.6 (3.6) | 3.4 |
+| BitNet 2B4T TQ2_0 (e4) | 6.0 (5.9) | 7.2 | 4.8 (4.7) | 4.4 |
+| Llama-3.2-1B Q4_K_M | 10.5 (10.2) | 8.6 | 4.6 (4.5) | 4.3 |
+| Llama-3.2-3B Q4_K_M | 3.2 | 2.8 | 1.8 | 1.7 |
+| Qwen2.5-1.5B Q4_K_M | 7.3 (7.3) | 6.0 | 3.6 (3.5) | 3.4 |
+| DeepSeek-R1-Distill-Qwen 1.5B Q4_K_M | 7.3 | 6.0 | 3.6 | 3.4 |
+| SmolLM2-1.7B Q4_K_M | 5.8 | 4.9 | 3.4 | 3.2 |
+| Gemma-3-1B pure Q4_0 | 21.5 (21.5) | 11.4 | 6.2 (6.1) | 5.9 |
+| Gemma-3-1B Q4_K_M | 16.2 (8.2) | 9.4 | 4.5 (4.2) | 4.3 |
+| LFM2-1.2B Q4_0 | 15.5 (15.4) | 8.0 | 5.2 (5.2) | 4.9 |
+| Gemma-4-E2B Q4_0 | 7.1 (6.9) | 3.7 | 2.2 (2.2) | 2.1 |
+
+Generation is at the bandwidth ceiling on both engines and brisk is 2-9% ahead on every file (the half-precision cache changed nothing measurable at these context lengths). Prompt processing: brisk is 1.2-1.9x llama.cpp on every file but BitNet (0.83x, the ternary kernel being compute-bound on the A72 with no batched layout) — the Q4_0 files at 1.7-1.9x, the K-quant files at 1.2x, the Q4_K_M Gemma 3 at 1.7x since its Q5_0/Q8_0 tensors took the banded kernel (8.2 to 16.2). The 3B Llama at 1.9 GB per token is the slowest usable file here (1.8 tokens/s); the 2.8 GB Gemma 4 E2B needs `--ctx 1024` to fit beside the OS.
+
 Same llama.cpp commit `8216c84`, CPU only, 4 threads, 5 repetitions, 20 s cool-down. Speeds in tokens/s.
 
 | Model | Prompt | Generation |
