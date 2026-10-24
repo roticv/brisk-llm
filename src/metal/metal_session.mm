@@ -370,7 +370,7 @@ struct MetalSession::Impl {
         if (c.conv_taps != 0) {
             conv_buf = make(kMaxBatch * 3 * embd * 4);
             for (std::size_t l = 0; l < layers.size(); ++l) {
-                if (c.layer_is_conv(l)) layers[l].conv_cache = make(max_context * embd * 4);
+                if (c.layer_is_conv(l)) layers[l].conv_cache = make(max_context * embd * 2);  // halves
             }
         }
         if (c.ple_dim != 0) {
@@ -406,7 +406,7 @@ struct MetalSession::Impl {
             const auto [bt, hb, heads] = batched_shape(l);
             most_groups = std::max(most_groups, ((kMaxBatch + bt - 1) / bt) * c.kv_head_count_of(l) * hb);
         }
-        scores = make(most_groups * 16 * max_context * 4);
+        scores = make(most_groups * 16 * max_context * 6);  // float scores plus half probabilities per entry
         // Partials: kSmallBatch tokens x heads x splits, each head_dim + 2 floats.
         partial = make(kSmallBatch * c.head_count * ((max_context + kSmallChunk - 1) / kSmallChunk) * (c.head_dim + 2) * 4);
         logits = make(Engine::kMaxScoredTokens * c.vocab_size * 4);
@@ -415,7 +415,7 @@ struct MetalSession::Impl {
         for (std::size_t l = 0; l < layers.size(); ++l) {
             if (layers[l].own_kv) {
                 layers[l].cache_offset = cache;
-                cache += std::size_t{c.kv_head_count_of(l)} * max_context * c.head_dim_of(l) * 4;
+                cache += std::size_t{c.kv_head_count_of(l)} * max_context * c.head_dim_of(l) * 2;  // halves
             }
         }
         for (std::size_t l = 0; l < layers.size(); ++l) {

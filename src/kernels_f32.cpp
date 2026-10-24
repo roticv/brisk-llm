@@ -2,6 +2,9 @@
 
 #include <algorithm>
 #include <cmath>
+#include <vector>
+
+#include "quant.h"
 
 #if defined(__aarch64__)
 #include <arm_neon.h>
@@ -91,14 +94,16 @@ void softmax_f32(std::span<float> x) {
 namespace {
 
 // 4 queries x 4 keys: 16 vector accumulators, each reduced once at the end.
-inline void score_block_4x4(const float* const q[4], const float* const k[4], std::size_t dim, float scale, float* out[4],
+inline float32x4_t load_half4(const std::uint16_t* p) { return vcvt_f32_f16(vreinterpret_f16_u16(vld1_u16(p))); }
+
+inline void score_block_4x4(const float* const q[4], const std::uint16_t* const k[4], std::size_t dim, float scale, float* out[4],
                             std::size_t nq, std::size_t np) {
     float32x4_t acc[4][4];
     for (int i = 0; i < 4; ++i) {
         for (int j = 0; j < 4; ++j) acc[i][j] = vdupq_n_f32(0.0f);
     }
     for (std::size_t d = 0; d < dim; d += 4) {
-        const float32x4_t kv[4] = {vld1q_f32(k[0] + d), vld1q_f32(k[1] + d), vld1q_f32(k[2] + d), vld1q_f32(k[3] + d)};
+        const float32x4_t kv[4] = {load_half4(k[0] + d), load_half4(k[1] + d), load_half4(k[2] + d), load_half4(k[3] + d)};
         for (int i = 0; i < 4; ++i) {
             const float32x4_t qv = vld1q_f32(q[i] + d);
             for (int j = 0; j < 4; ++j) acc[i][j] = vmlaq_f32(acc[i][j], qv, kv[j]);
@@ -111,7 +116,19 @@ inline void score_block_4x4(const float* const q[4], const float* const k[4], st
 
 }  // namespace
 
-void scores_f32(const float* const* queries, std::size_t nq, const float* keys, std::size_t key_stride, std::size_t np,
+void store_f16(const float* x, std::uint16_t* out, std::size_t n) {
+    std::size_t i = 0;
+    for (; i + 4 <= n; i += 4) vst1_u16(out + i, vreinterpret_u16_f16(vcvt_f16_f32(vld1q_f32(x + i))));
+    for (; i < n; ++i) out[i] = float_to_half(x[i]);
+}
+
+void load_f16(const std::uint16_t* x, float* out, std::size_t n) {
+    std::size_t i = 0;
+    for (; i + 4 <= n; i += 4) vst1q_f32(out + i, load_half4(x + i));
+    for (; i < n; ++i) out[i] = half_to_float(x[i]);
+}
+
+void scores_f32(const float* const* queries, std::size_t nq, const std::uint16_t* keys, std::size_t key_stride, std::size_t np,
                 std::size_t dim, float scale, float* const* scores) {
     for (std::size_t q0 = 0; q0 < nq; q0 += 4) {
         const std::size_t qn = std::min<std::size_t>(4, nq - q0);
@@ -124,7 +141,7 @@ void scores_f32(const float* const* queries, std::size_t nq, const float* keys, 
         }
         for (std::size_t p0 = 0; p0 < np; p0 += 4) {
             const std::size_t pn = std::min<std::size_t>(4, np - p0);
-            const float* k[4];
+            const std::uint16_t* k[4];
             for (std::size_t j = 0; j < 4; ++j) k[j] = keys + (p0 + std::min(j, pn - 1)) * key_stride;
             float* o[4];
             for (std::size_t i = 0; i < 4; ++i) o[i] = out[i] + p0;
@@ -138,7 +155,7 @@ void scores_f32(const float* const* queries, std::size_t nq, const float* keys, 
 // over 500 positions would otherwise re-fetch every row from L2). Within a
 // pass, 8 accumulator vectors per head, two heads at a time, live in
 // registers; they are saved to `out` between chunks.
-void weighted_sum_f32(const float* values, std::size_t value_stride, std::size_t count, const float* weights,
+void weighted_sum_f32(const std::uint16_t* values, std::size_t value_stride, std::size_t count, const float* weights,
                       std::size_t stride, std::size_t heads, std::size_t dim, float* out) {
     constexpr std::size_t kPositionChunk = 32;
     std::fill_n(out, heads * dim, 0.0f);
@@ -157,11 +174,11 @@ void weighted_sum_f32(const float* values, std::size_t value_stride, std::size_t
                     b[i] = nh == 2 ? vld1q_f32(o1 + d + 4 * static_cast<std::size_t>(i)) : vdupq_n_f32(0.0f);
                 }
                 for (std::size_t p = p0; p < p1; ++p) {
-                    const float* v = values + p * value_stride + d;
+                    const std::uint16_t* v = values + p * value_stride + d;
                     const float32x4_t s0 = vdupq_n_f32(w0[p]);
                     const float32x4_t s1 = vdupq_n_f32(w1[p]);
                     for (int i = 0; i < 8; ++i) {
-                        const float32x4_t vv = vld1q_f32(v + 4 * i);
+                        const float32x4_t vv = load_half4(v + 4 * i);
                         a[i] = vmlaq_f32(a[i], s0, vv);
                         b[i] = vmlaq_f32(b[i], s1, vv);
                     }
@@ -228,19 +245,30 @@ void axpy_f32(float scale, const float* x, float* out, std::size_t n) {
     for (std::size_t i = 0; i < n; ++i) out[i] += scale * x[i];
 }
 
-void scores_f32(const float* const* queries, std::size_t nq, const float* keys, std::size_t key_stride, std::size_t np,
+void store_f16(const float* x, std::uint16_t* out, std::size_t n) {
+    for (std::size_t i = 0; i < n; ++i) out[i] = float_to_half(x[i]);
+}
+
+void load_f16(const std::uint16_t* x, float* out, std::size_t n) {
+    for (std::size_t i = 0; i < n; ++i) out[i] = half_to_float(x[i]);
+}
+
+void scores_f32(const float* const* queries, std::size_t nq, const std::uint16_t* keys, std::size_t key_stride, std::size_t np,
                 std::size_t dim, float scale, float* const* scores) {
-    for (std::size_t i = 0; i < nq; ++i) {
-        for (std::size_t p = 0; p < np; ++p) scores[i][p] = dot_f32(queries[i], keys + p * key_stride, dim) * scale;
+    std::vector<float> key(dim);
+    for (std::size_t p = 0; p < np; ++p) {
+        load_f16(keys + p * key_stride, key.data(), dim);
+        for (std::size_t i = 0; i < nq; ++i) scores[i][p] = dot_f32(queries[i], key.data(), dim) * scale;
     }
 }
 
-void weighted_sum_f32(const float* values, std::size_t value_stride, std::size_t count, const float* weights,
+void weighted_sum_f32(const std::uint16_t* values, std::size_t value_stride, std::size_t count, const float* weights,
                       std::size_t stride, std::size_t heads, std::size_t dim, float* out) {
     std::fill_n(out, heads * dim, 0.0f);
+    std::vector<float> v(dim);
     for (std::size_t p = 0; p < count; ++p) {
-        const float* v = values + p * value_stride;
-        for (std::size_t h = 0; h < heads; ++h) axpy_f32(weights[h * stride + p], v, out + h * dim, dim);
+        load_f16(values + p * value_stride, v.data(), dim);
+        for (std::size_t h = 0; h < heads; ++h) axpy_f32(weights[h * stride + p], v.data(), out + h * dim, dim);
     }
 }
 

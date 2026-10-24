@@ -58,10 +58,11 @@ MemoryEstimate estimate_memory(const GgufFile& file, const ModelConfig& c, bool 
     }
     const std::size_t context = std::min<std::size_t>(max_context == 0 ? c.context_length : max_context, c.context_length);
     for (std::size_t l = 0; l < c.layer_count; ++l) {
+        // The caches hold halves.
         if (c.layer_is_conv(l)) {
-            e.cache += context * c.embedding_dim * sizeof(float);
+            e.cache += context * c.embedding_dim * 2;
         } else if (c.kv_layer_of(l) == l) {
-            e.cache += 2 * std::size_t{c.kv_head_count_of(l)} * c.head_dim_of(l) * context * sizeof(float);
+            e.cache += 2 * std::size_t{c.kv_head_count_of(l)} * c.head_dim_of(l) * context * 2;
         }
     }
     // Scratch: the session's activation rows for a batch of kMaxBatch (256) tokens, the

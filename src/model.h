@@ -249,9 +249,11 @@ private:
     // are contiguous and stream well. Allocated for max_context_ positions on
     // a layer's first use.
     std::size_t max_context_ = 0;
-    std::vector<std::vector<float>> key_cache_;
-    std::vector<std::vector<float>> value_cache_;
-    std::vector<std::vector<float>> conv_cache_;  // LFM2: per conv layer, b*x per position (the conv's state)
+    // The caches hold half-precision values: half the bytes of float, and the
+    // attention kernels widen as they read (llama.cpp's default too).
+    std::vector<std::vector<std::uint16_t>> key_cache_;
+    std::vector<std::vector<std::uint16_t>> value_cache_;
+    std::vector<std::vector<std::uint16_t>> conv_cache_;  // LFM2: per conv layer, b*x per position (the conv's state)
     std::vector<float> conv_;                     // [token][3 * embd]: the in_proj output
     std::vector<float> kv_staging_;  // this batch's new keys or values, [token][kv_dim], before copying in
 

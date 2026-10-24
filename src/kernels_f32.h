@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <span>
 
 // Float vector routines used by attention and the norms: NEON on AArch64,
@@ -20,18 +21,23 @@ void softmax_f32(std::span<float> x);
 void silu_mul_f32(float* gate, const float* up, std::size_t n);
 void gelu_mul_f32(float* gate, const float* up, std::size_t n);
 
+// The K/V cache holds half-precision values (IEEE binary16 bits); the
+// attention kernels widen them as they read. Writes `n` floats as halves.
+void store_f16(const float* x, std::uint16_t* out, std::size_t n);
+void load_f16(const std::uint16_t* x, float* out, std::size_t n);
+
 // Attention's score step: scores[q][p] = scale * dot(queries[q], keys[p]) for
-// `nq` query vectors against `np` key rows (stride key_stride), all of `dim`
-// floats (a multiple of 4). Query q's row of scores is written to scores[q].
-// Register-blocked 4x4 on NEON.
-void scores_f32(const float* const* queries, std::size_t nq, const float* keys, std::size_t key_stride, std::size_t np,
+// `nq` query vectors against `np` half-precision key rows (stride key_stride
+// elements), all of `dim` values (a multiple of 4). Query q's row of scores is
+// written to scores[q]. Register-blocked 4x4 on NEON.
+void scores_f32(const float* const* queries, std::size_t nq, const std::uint16_t* keys, std::size_t key_stride, std::size_t np,
                 std::size_t dim, float scale, float* const* scores);
 
 // Attention's value step for `heads` query heads sharing one cached value
 // head: out[h] = sum over p < count of weights[h * stride + p] * v[p], where
-// v[p] is at values + p * value_stride and all vectors have `dim` floats
-// (a multiple of 32). `out` is overwritten.
-void weighted_sum_f32(const float* values, std::size_t value_stride, std::size_t count, const float* weights,
+// v[p] is at values + p * value_stride (half precision) and all vectors have
+// `dim` values (a multiple of 32). `out` is overwritten.
+void weighted_sum_f32(const std::uint16_t* values, std::size_t value_stride, std::size_t count, const float* weights,
                       std::size_t stride, std::size_t heads, std::size_t dim, float* out);
 
 }  // namespace brisk::kernels

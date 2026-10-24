@@ -721,7 +721,7 @@ void Session::eval_batch(std::span<const Token> tokens, bool all_logits) {
             // conv's state, kept per position; out = c * conv(bx) over the last
             // conv_taps positions (kernel w[d][k], oldest first), then out_proj.
             const std::size_t taps = c.conv_taps;
-            std::vector<float>& bx_cache = conv_cache_[l];
+            std::vector<std::uint16_t>& bx_cache = conv_cache_[l];
             if (bx_cache.empty()) bx_cache.resize(max_context_ * embd);
             {
                 const Timed timed(profile_.norm_rope);
@@ -734,24 +734,22 @@ void Session::eval_batch(std::span<const Token> tokens, bool all_logits) {
                 const Timed timed(profile_.attention);
                 pool_.run(n, [&](std::size_t t) {  // the state first, every token's bx before any reads it
                     const float* b = conv_.data() + t * 3 * embd;
-                    const float* x = b + 2 * embd;
-                    float* bx = bx_cache.data() + (position_ + t) * embd;
-                    for (std::size_t d = 0; d < embd; ++d) bx[d] = b[d] * x[d];
+                    float* x = conv_.data() + t * 3 * embd + 2 * embd;  // x is overwritten with b * x
+                    for (std::size_t d = 0; d < embd; ++d) x[d] *= b[d];
+                    kernels::store_f16(x, bx_cache.data() + (position_ + t) * embd, embd);
                 });
                 pool_.run(n, [&](std::size_t t) {
                     const float* gate = conv_.data() + t * 3 * embd + embd;  // c
                     const std::size_t pos = position_ + t;
-                    float* y = projected_.data() + t * embd;  // in_proj's output is still needed; attended_ is free
                     float* out = attended_.data() + t * embd;
-                    for (std::size_t d = 0; d < embd; ++d) {
-                        float sum = 0.0f;
-                        for (std::size_t k = 0; k < taps; ++k) {
-                            if (pos + k + 1 < taps) continue;  // before the start: zero state
-                            sum += layer.conv_weight[d * taps + k] * bx_cache[(pos + k + 1 - taps) * embd + d];
-                        }
-                        out[d] = gate[d] * sum;
+                    std::fill_n(out, embd, 0.0f);
+                    std::vector<float> row(embd);
+                    for (std::size_t k = 0; k < taps; ++k) {
+                        if (pos + k + 1 < taps) continue;  // before the start: zero state
+                        kernels::load_f16(bx_cache.data() + (pos + k + 1 - taps) * embd, row.data(), embd);
+                        for (std::size_t d = 0; d < embd; ++d) out[d] += layer.conv_weight[d * taps + k] * row[d];
                     }
-                    (void)y;
+                    for (std::size_t d = 0; d < embd; ++d) out[d] *= gate[d];
                 });
             }
             multiply(layer.conv_out, attended_.data(), n, projected_.data());
@@ -765,14 +763,14 @@ void Session::eval_batch(std::span<const Token> tokens, bool all_logits) {
             // A layer without its own K/V reads the cache of an earlier layer of its kind (Gemma 4).
             const std::size_t kv_layer = c.kv_layer_of(l);
             const bool own_kv = kv_layer == l;
-            std::vector<float>& keys = key_cache_[kv_layer];
-            std::vector<float>& values = value_cache_[kv_layer];
+            std::vector<std::uint16_t>& keys = key_cache_[kv_layer];
+            std::vector<std::uint16_t>& values = value_cache_[kv_layer];
             if (keys.empty()) {
                 keys.resize(kv_head_count * max_context_ * head_dim);
                 values.resize(keys.size());
             }
             // Row p of key/value head kv in this layer's cache.
-            auto cache_row = [&](std::vector<float>& cache, std::size_t kv, std::size_t p) {
+            auto cache_row = [&](std::vector<std::uint16_t>& cache, std::size_t kv, std::size_t p) {
                 return cache.data() + (kv * max_context_ + p) * head_dim;
             };
             // New keys and values are produced as [token][kv_dim] rows, then copied into the head-major cache.
@@ -815,8 +813,8 @@ void Session::eval_batch(std::span<const Token> tokens, bool all_logits) {
                     if (!layer.key_norm.empty()) rms_norm(k, layer.key_norm, c.rms_epsilon, k);
                     if (c.value_norm) rms_norm(v, {}, c.rms_epsilon, v);  // Gemma 4: V normalised, no weight
                     apply_rope(k, rope, c.rope_neox);
-                    std::copy_n(k.data(), head_dim, cache_row(keys, h, position_ + t));
-                    std::copy_n(v.data(), head_dim, cache_row(values, h, position_ + t));
+                    kernels::store_f16(k.data(), cache_row(keys, h, position_ + t), head_dim);
+                    kernels::store_f16(v.data(), cache_row(values, h, position_ + t), head_dim);
                 }
             });
 

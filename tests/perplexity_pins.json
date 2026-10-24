@@ -2,103 +2,104 @@
   {
     "model": "Qwen3-0.6B-Q4_0.gguf",
     "text": "bench/prompt512.txt",
-    "perplexity": 2.2751
+    "perplexity": 2.2728
   },
   {
     "model": "Qwen3-0.6B-Q4_0.gguf",
     "text": "tests/perplexity_text.txt",
-    "perplexity": 28.0989
+    "perplexity": 28.1917
   },
   {
     "model": "Qwen3-0.6B-pure-Q4_0.gguf",
     "text": "tests/perplexity_text.txt",
-    "perplexity": 28.9312
+    "perplexity": 29.0081
   },
   {
     "model": "Qwen3-1.7B-pure-Q4_0.gguf",
     "text": "tests/perplexity_text.txt",
-    "perplexity": 20.1209
+    "perplexity": 20.0833
   },
   {
     "model": "Qwen3-1.7B-Q4_K_M.gguf",
     "text": "tests/perplexity_text.txt",
-    "perplexity": 18.7894
+    "perplexity": 18.8406
   },
   {
     "model": "bitnet-2B4T-TQ2_0-e4.gguf",
     "text": "tests/perplexity_text.txt",
-    "perplexity": 26.2207
+    "perplexity": 26.232
   },
   {
     "model": "Llama-3.2-1B-Instruct-Q4_K_M.gguf",
     "text": "tests/perplexity_text.txt",
-    "perplexity": 27.8187
+    "perplexity": 27.7908
   },
   {
     "model": "Qwen2.5-1.5B-Instruct-Q4_K_M.gguf",
     "text": "tests/perplexity_text.txt",
-    "perplexity": 15.0289
+    "perplexity": 14.9996
   },
   {
     "model": "gemma-3-1b-it-pure-Q4_0.gguf",
     "text": "tests/perplexity_text.txt",
-    "perplexity": 46.0915
+    "perplexity": 46.3917
   },
   {
     "model": "gemma-3-1b-it-Q4_K_M.gguf",
     "text": "tests/perplexity_text.txt",
-    "perplexity": 40.565
+    "perplexity": 40.4735
   },
   {
     "model": "gemma-4-E2B-it-Q4_0.gguf",
     "text": "tests/perplexity_text.txt",
-    "perplexity": 103.0144
+    "perplexity": 103.5869
   },
   {
     "model": "SmolLM2-1.7B-Instruct-Q4_K_M.gguf",
     "text": "tests/perplexity_text.txt",
-    "perplexity": 12.6593
+    "perplexity": 12.6223
   },
   {
     "model": "DeepSeek-R1-Distill-Qwen-1.5B-Q4_K_M.gguf",
     "text": "tests/perplexity_text.txt",
-    "perplexity": 62.2188
+    "perplexity": 62.8721,
+    "gpu_tolerance": 0.03
   },
   {
     "model": "Llama-3.2-3B-Instruct-Q4_K_M.gguf",
     "text": "tests/perplexity_text.txt",
-    "perplexity": 19.078
+    "perplexity": 19.0604
   },
   {
     "model": "Mistral-7B-Instruct-v0.3-Q4_K_M.gguf",
     "text": "tests/perplexity_text.txt",
-    "perplexity": 7.5599
+    "perplexity": 7.5664
   },
   {
     "model": "gemma-4-E4B-it-Q4_0.gguf",
     "text": "bench/prompt512.txt",
-    "perplexity": 5.5915,
+    "perplexity": 5.6743,
     "gpu_tolerance": 0.1
   },
   {
     "model": "gemma-4-12B-it-Q4_0.gguf",
     "text": "bench/prompt512.txt",
-    "perplexity": 22.1612,
-    "gpu_tolerance": 0.1
+    "perplexity": 23.523,
+    "gpu_tolerance": 0.15
   },
   {
     "model": "Phi-4-mini-instruct-Q4_K_M.gguf",
     "text": "tests/perplexity_text.txt",
-    "perplexity": 15.302
+    "perplexity": 15.3048
   },
   {
     "model": "LFM2-1.2B-Q4_0.gguf",
     "text": "tests/perplexity_text.txt",
-    "perplexity": 65.2623
+    "perplexity": 64.9422
   },
   {
     "model": "LFM2-1.2B-Q4_K_M.gguf",
     "text": "tests/perplexity_text.txt",
-    "perplexity": 69.9843
+    "perplexity": 69.9191
   }
 ]

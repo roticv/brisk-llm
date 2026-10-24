@@ -9,15 +9,17 @@
 #include <vector>
 
 #include "kernels_f32.h"
+#include "quant.h"
 
 int main(int argc, char** argv) {
     const std::size_t positions = argc > 1 ? std::strtoull(argv[1], nullptr, 10) : 497;
     const std::size_t dim = 128, kv_dim = dim, heads = 2, tile = 16;  // head-major cache: rows are contiguous
     std::mt19937 rng(1);
     std::normal_distribution<float> normal;
-    std::vector<float> keys(positions * kv_dim), values(positions * kv_dim), queries(tile * heads * dim);
-    for (float& v : keys) v = normal(rng);
-    for (float& v : values) v = normal(rng);
+    std::vector<std::uint16_t> keys(positions * kv_dim), values(positions * kv_dim);  // the cache holds halves
+    std::vector<float> queries(tile * heads * dim);
+    for (std::uint16_t& v : keys) v = brisk::float_to_half(normal(rng));
+    for (std::uint16_t& v : values) v = brisk::float_to_half(normal(rng));
     for (float& v : queries) v = normal(rng);
     std::vector<float> scores(tile * heads * positions), out(tile * heads * dim);
     std::vector<const float*> q(tile * heads);
