@@ -1,7 +1,12 @@
 #include "server.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <csignal>
+#include <thread>
+
+#include <unistd.h>
 #include <cstdio>
 #include <memory>
 #include <mutex>
@@ -35,6 +40,16 @@ namespace brisk {
 using json = nlohmann::json;
 
 namespace {
+
+// Set by SIGINT/SIGTERM: the generation in flight ends at its next token, the
+// listener closes, and the process exits once the request has been answered.
+std::atomic<bool> g_stopping{false};
+
+void on_signal(int) {
+    g_stopping.store(true);
+    const char msg[] = "brisk serve: stopping after the request in flight\n";
+    (void)!::write(2, msg, sizeof(msg) - 1);
+}
 
 double seconds_since(std::chrono::steady_clock::time_point start) {
     return std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
@@ -154,9 +169,22 @@ public:
         });
         std::fprintf(stderr, "brisk serve: %s on http://%s:%d (context %zu tokens, %s)\n", name_.c_str(),
                      options_.host.c_str(), options_.port, context_, options_.gpu ? "GPU" : "CPU");
-        if (!http.listen(options_.host, options_.port)) {
+        std::signal(SIGINT, on_signal);
+        std::signal(SIGTERM, on_signal);
+        // The listener is stopped from another thread once a signal arrives; httplib
+        // then lets the request in flight finish (its generation stops at the next
+        // token, see generate) and returns from listen.
+        std::thread stopper([&http] {
+            while (!g_stopping.load()) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            http.stop();
+        });
+        const bool ok = http.listen(options_.host, options_.port);
+        g_stopping.store(true);
+        stopper.join();
+        if (!ok && !g_stopping.load()) {
             throw std::runtime_error("cannot listen on " + options_.host + ":" + std::to_string(options_.port));
         }
+        std::fprintf(stderr, "brisk serve: stopped\n");
         return 0;
     }
 
@@ -272,6 +300,10 @@ private:
         for (const std::string& s : r.stop) longest_stop = std::max(longest_stop, s.size());
         bool stopped_by_string = false;
         while (g.tokens < r.max_tokens) {
+            if (g_stopping.load()) {  // shutting down: end this answer here, as a truncation
+                g.finish_reason = "length";
+                break;
+            }
             const Token next = sampler.sample(logits);
             if (tokenizer_.is_end_of_generation(next)) break;
             ++g.tokens;
@@ -306,7 +338,9 @@ private:
             g.text += pending;
             emit(pending);
         }
-        if (g.finish_reason != "abort") g.finish_reason = stopped_by_string || g.tokens < r.max_tokens ? "stop" : "length";
+        if (g.finish_reason != "abort" && !g_stopping.load()) {
+            g.finish_reason = stopped_by_string || g.tokens < r.max_tokens ? "stop" : "length";
+        }
         gen_seconds = seconds_since(gen_start);
         return g;
     }

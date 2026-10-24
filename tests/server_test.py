@@ -77,10 +77,27 @@ def main():
             assert False, "expected 400"
         except urllib.error.HTTPError as e:
             assert e.code == 400 and "error" in json.load(e)
+        # SIGTERM during a streamed answer: the stream still ends with a finish chunk
+        # and [DONE], and the process exits cleanly within a few seconds.
+        import signal, threading
+        got = []
+        def stream():
+            got.extend(post("/v1/chat/completions", {"messages": [{"role": "user", "content": "Count slowly from one to two hundred in words."}],
+                                                     "temperature": 0, "enable_thinking": False, "max_tokens": 600, "stream": True}, stream=True))
+        t = threading.Thread(target=stream)
+        t.start()
+        time.sleep(0.7)
+        proc.send_signal(signal.SIGTERM)
+        code = proc.wait(timeout=10)
+        t.join(timeout=10)
+        assert code == 0, code
+        assert got and got[-1] == "[DONE]", got[-2:]
+        assert json.loads(got[-2])["choices"][0]["finish_reason"] == "length", got[-2]
         print("server_test: ok")
         return 0
     finally:
-        proc.terminate()
-        proc.wait()
+        if proc.poll() is None:
+            proc.terminate()
+            proc.wait()
 
 sys.exit(main())
