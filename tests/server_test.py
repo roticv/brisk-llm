@@ -81,12 +81,22 @@ def main():
         # and [DONE], and the process exits cleanly within a few seconds.
         import signal, threading
         got = []
-        def stream():
-            got.extend(post("/v1/chat/completions", {"messages": [{"role": "user", "content": "Count slowly from one to two hundred in words."}],
-                                                     "temperature": 0, "enable_thinking": False, "max_tokens": 600, "stream": True}, stream=True))
+        def stream():  # appends each event as it arrives, so the signal can wait for the first
+            body = {"messages": [{"role": "user", "content": "Count slowly from one to two hundred in words."}],
+                    "temperature": 0, "enable_thinking": False, "max_tokens": 600, "stream": True}
+            req = urllib.request.Request(URL + "/v1/chat/completions", data=json.dumps(body).encode(),
+                                         headers={"Content-Type": "application/json"})
+            for line in urllib.request.urlopen(req, timeout=120):
+                line = line.decode().strip()
+                if line.startswith("data: "):
+                    got.append(line[6:])
         t = threading.Thread(target=stream)
         t.start()
-        time.sleep(0.7)
+        for _ in range(300):  # until a few tokens have streamed (a slow runner may take a while to start)
+            if len(got) >= 4:
+                break
+            time.sleep(0.1)
+        assert len(got) >= 4, got
         proc.send_signal(signal.SIGTERM)
         code = proc.wait(timeout=10)
         t.join(timeout=10)
