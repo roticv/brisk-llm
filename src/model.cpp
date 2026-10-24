@@ -144,122 +144,139 @@ Architecture architecture_of(const GgufFile& file) {
          "'; qwen3, qwen2, llama, gemma3, gemma4, bitnet, phi3 and lfm2 are supported");
 }
 
-Model::Model(const GgufFile& file, bool repack) : repack_(repack) {
-    config_.architecture = architecture_of(file);
+// A float32 tensor of the file, in place (the config's rope factors).
+std::span<const float> f32_tensor(const GgufFile& file, std::string_view name, std::size_t count) {
+    const TensorInfo* info = file.tensor(name);
+    if (info == nullptr) fail("missing tensor '" + std::string(name) + "'");
+    if (info->type != TensorType::F32 || info->n_elements() != count) fail("tensor '" + std::string(name) + "' is not float32 of the expected size");
+    return {reinterpret_cast<const float*>(info->data.data()), count};
+}
+
+ModelConfig Model::parse_config(const GgufFile& file) {
+    ModelConfig config;
+    config.architecture = architecture_of(file);
     const auto architecture = file.get<std::string_view>("general.architecture");
     const std::string prefix = std::string(*architecture) + ".";
-    const bool bitnet = config_.architecture == Architecture::BitNet;
-    config_.rope_neox = config_.architecture != Architecture::Llama;
-    const bool gemma = config_.architecture == Architecture::Gemma3 || config_.architecture == Architecture::Gemma4;
+    const bool bitnet = config.architecture == Architecture::BitNet;
+    config.rope_neox = config.architecture != Architecture::Llama;
+    const bool gemma = config.architecture == Architecture::Gemma3 || config.architecture == Architecture::Gemma4;
     if (gemma) {
-        config_.sliding_window = file.get<std::uint32_t>(prefix + "attention.sliding_window").value_or(0);
-        config_.rope_base_local = file.get<float>(prefix + "rope.freq_base_swa").value_or(10000.0f);
-        config_.rope_scale = 1.0f / file.get<float>(prefix + "rope.scaling.factor").value_or(1.0f);
-        config_.final_softcap = file.get<float>(prefix + "final_logit_softcapping").value_or(0.0f);
-        config_.gelu = true;
+        config.sliding_window = file.get<std::uint32_t>(prefix + "attention.sliding_window").value_or(0);
+        config.rope_base_local = file.get<float>(prefix + "rope.freq_base_swa").value_or(10000.0f);
+        config.rope_scale = 1.0f / file.get<float>(prefix + "rope.scaling.factor").value_or(1.0f);
+        config.final_softcap = file.get<float>(prefix + "final_logit_softcapping").value_or(0.0f);
+        config.gelu = true;
     }
-    if (config_.architecture == Architecture::Phi3) {
-        config_.rope_dim = file.get<std::uint32_t>(prefix + "rope.dimension_count").value_or(0);
-        config_.rope_attn_factor = file.get<float>(prefix + "rope.scaling.attn_factor").value_or(1.0f);
-        config_.rope_original_context = file.get<std::uint32_t>(prefix + "rope.scaling.original_context_length").value_or(0);
+    if (config.architecture == Architecture::Phi3) {
+        config.rope_dim = file.get<std::uint32_t>(prefix + "rope.dimension_count").value_or(0);
+        config.rope_attn_factor = file.get<float>(prefix + "rope.scaling.attn_factor").value_or(1.0f);
+        config.rope_original_context = file.get<std::uint32_t>(prefix + "rope.scaling.original_context_length").value_or(0);
         if (file.tensor("rope_factors_short.weight") != nullptr) {
-            const std::span<const float> fs = load(file, "rope_factors_short.weight", config_.rope_dim / 2);
-            const std::span<const float> fl = load(file, "rope_factors_long.weight", config_.rope_dim / 2);
-            config_.rope_factors_short.assign(fs.begin(), fs.end());
-            config_.rope_factors_long.assign(fl.begin(), fl.end());
-            config_.rope_factors = config_.rope_factors_short;  // a session with a longer context swaps in the long ones
+            const std::span<const float> fs = f32_tensor(file, "rope_factors_short.weight", config.rope_dim / 2);
+            const std::span<const float> fl = f32_tensor(file, "rope_factors_long.weight", config.rope_dim / 2);
+            config.rope_factors_short.assign(fs.begin(), fs.end());
+            config.rope_factors_long.assign(fl.begin(), fl.end());
+            config.rope_factors = config.rope_factors_short;  // a session with a longer context swaps in the long ones
         }
     }
-    if (config_.architecture == Architecture::Gemma4) {
+    if (config.architecture == Architecture::Gemma4) {
         if (const auto pattern = file.get<GgufArray>(prefix + "attention.sliding_window_pattern")) {
             // A bool array: one byte per entry.
             if (pattern->elem_type != GgufType::Bool) fail("sliding_window_pattern is not a bool array");
             for (const std::byte b : pattern->data.subspan(0, static_cast<std::size_t>(pattern->count))) {
-                config_.sliding_pattern.push_back(b != std::byte{0} ? 1 : 0);
+                config.sliding_pattern.push_back(b != std::byte{0} ? 1 : 0);
             }
         }
-        config_.head_dim_local = file.get<std::uint32_t>(prefix + "attention.key_length_swa").value_or(0);
+        config.head_dim_local = file.get<std::uint32_t>(prefix + "attention.key_length_swa").value_or(0);
         const std::uint32_t shared = file.get<std::uint32_t>(prefix + "attention.shared_kv_layers").value_or(0);
-        config_.ple_dim = file.get<std::uint32_t>(prefix + "embedding_length_per_layer_input").value_or(0);
-        config_.attention_scale = 1.0f;
-        config_.value_norm = true;
+        config.ple_dim = file.get<std::uint32_t>(prefix + "embedding_length_per_layer_input").value_or(0);
+        config.attention_scale = 1.0f;
+        config.value_norm = true;
         if (const auto ff = file.get<GgufArray>(prefix + "feed_forward_length")) {
             const auto widths = ff->elem_type == GgufType::I32 ? ff->values<std::int32_t>()
                                                                 : std::vector<std::int32_t>();
             if (widths.empty()) {
-                for (const std::uint32_t w : ff->values<std::uint32_t>()) config_.ff_dims.push_back(w);
+                for (const std::uint32_t w : ff->values<std::uint32_t>()) config.ff_dims.push_back(w);
             } else {
                 for (const std::int32_t w : widths) {
                     if (w <= 0) fail("non-positive feed-forward width");
-                    config_.ff_dims.push_back(static_cast<std::uint32_t>(w));
+                    config.ff_dims.push_back(static_cast<std::uint32_t>(w));
                 }
             }
         }
-        if (shared != 0) config_.kv_from_start = config_.layer_count - shared;  // set below once layer_count is known
+        if (shared != 0) config.kv_from_start = config.layer_count - shared;  // set below once layer_count is known
     }
 
-    config_.embedding_dim = require_u32(file, prefix + "embedding_length");
-    config_.layer_count = require_u32(file, prefix + "block_count");
-    if (config_.architecture == Architecture::Gemma4) {
+    config.embedding_dim = require_u32(file, prefix + "embedding_length");
+    config.layer_count = require_u32(file, prefix + "block_count");
+    if (config.architecture == Architecture::Gemma4) {
         const std::uint32_t shared = file.get<std::uint32_t>(prefix + "attention.shared_kv_layers").value_or(0);
         if (shared != 0) {
-            if (shared + 2 > config_.layer_count) fail("more shared K/V layers than layers");
-            config_.kv_from_start = config_.layer_count - shared;
+            if (shared + 2 > config.layer_count) fail("more shared K/V layers than layers");
+            config.kv_from_start = config.layer_count - shared;
         }
-        if (!config_.sliding_pattern.empty() && config_.sliding_pattern.size() != config_.layer_count) fail("sliding window pattern length");
-        if (!config_.ff_dims.empty() && config_.ff_dims.size() != config_.layer_count) fail("feed_forward_length array length");
+        if (!config.sliding_pattern.empty() && config.sliding_pattern.size() != config.layer_count) fail("sliding window pattern length");
+        if (!config.ff_dims.empty() && config.ff_dims.size() != config.layer_count) fail("feed_forward_length array length");
     }
-    config_.head_count = require_u32(file, prefix + "attention.head_count");
+    config.head_count = require_u32(file, prefix + "attention.head_count");
     if (const auto kv = file.get<GgufArray>(prefix + "attention.head_count_kv")) {  // per layer (Gemma 4 12B)
         if (kv->elem_type == GgufType::I32) {
-            for (const std::int32_t v : kv->values<std::int32_t>()) config_.kv_head_counts.push_back(static_cast<std::uint32_t>(v));
+            for (const std::int32_t v : kv->values<std::int32_t>()) config.kv_head_counts.push_back(static_cast<std::uint32_t>(v));
         } else {
-            config_.kv_head_counts = kv->values<std::uint32_t>();
+            config.kv_head_counts = kv->values<std::uint32_t>();
         }
-        if (config_.kv_head_counts.size() != config_.layer_count) fail("head_count_kv array length");
-        config_.kv_head_count = *std::max_element(config_.kv_head_counts.begin(), config_.kv_head_counts.end());
+        if (config.kv_head_counts.size() != config.layer_count) fail("head_count_kv array length");
+        config.kv_head_count = *std::max_element(config.kv_head_counts.begin(), config.kv_head_counts.end());
     } else {
-        config_.kv_head_count = require_u32(file, prefix + "attention.head_count_kv");
+        config.kv_head_count = require_u32(file, prefix + "attention.head_count_kv");
     }
-    config_.feed_forward_dim = config_.ff_dims.empty() ? require_u32(file, prefix + "feed_forward_length")
-                                                       : *std::max_element(config_.ff_dims.begin(), config_.ff_dims.end());
-    config_.context_length = require_u32(file, prefix + "context_length");
-    config_.rope_base = require_f32(file, prefix + "rope.freq_base");
-    config_.rms_epsilon = require_f32(file, prefix + "attention.layer_norm_rms_epsilon");
+    config.feed_forward_dim = config.ff_dims.empty() ? require_u32(file, prefix + "feed_forward_length")
+                                                       : *std::max_element(config.ff_dims.begin(), config.ff_dims.end());
+    config.context_length = require_u32(file, prefix + "context_length");
+    config.rope_base = require_f32(file, prefix + "rope.freq_base");
+    config.rms_epsilon = require_f32(file, prefix + "attention.layer_norm_rms_epsilon");
 
-    if (config_.embedding_dim == 0 || config_.layer_count == 0 || config_.head_count == 0 ||
-        config_.kv_head_count == 0 || config_.feed_forward_dim == 0 || config_.context_length == 0) {
+    if (config.embedding_dim == 0 || config.layer_count == 0 || config.head_count == 0 ||
+        config.kv_head_count == 0 || config.feed_forward_dim == 0 || config.context_length == 0) {
         fail("a model dimension is zero");
     }
-    if (config_.architecture == Architecture::LFM2) {
-        config_.conv_taps = file.get<std::uint32_t>(prefix + "shortconv.l_cache").value_or(0);
-        if (config_.conv_taps < 2 || config_.conv_taps > 8) fail("unsupported short-convolution width");
+    if (config.architecture == Architecture::LFM2) {
+        config.conv_taps = file.get<std::uint32_t>(prefix + "shortconv.l_cache").value_or(0);
+        if (config.conv_taps < 2 || config.conv_taps > 8) fail("unsupported short-convolution width");
     }
-    for (std::size_t l = 0; l < config_.layer_count; ++l) {
-        const std::uint32_t kv = config_.kv_head_count_of(l);
-        if (kv == 0 && config_.architecture == Architecture::LFM2) continue;  // a convolution layer
-        if (kv == 0 || config_.head_count % kv != 0) fail("head_count is not a multiple of head_count_kv");
-        if (config_.head_count / kv > kMaxHeadsPerKv) fail("more than 16 query heads per key/value head is not supported");
+    for (std::size_t l = 0; l < config.layer_count; ++l) {
+        const std::uint32_t kv = config.kv_head_count_of(l);
+        if (kv == 0 && config.architecture == Architecture::LFM2) continue;  // a convolution layer
+        if (kv == 0 || config.head_count % kv != 0) fail("head_count is not a multiple of head_count_kv");
+        if (config.head_count / kv > kMaxHeadsPerKv) fail("more than 16 query heads per key/value head is not supported");
     }
 
     // Qwen3 sets the head size explicitly; it is not always embedding_dim / head_count.
-    config_.head_dim = file.get<std::uint32_t>(prefix + "attention.key_length")
-                           .value_or(config_.embedding_dim / config_.head_count);
-    if (config_.head_dim == 0 || config_.head_dim % 32 != 0) fail("head size must be a non-zero multiple of 32");
-    if (gemma) config_.embedding_scale = std::sqrt(static_cast<float>(config_.embedding_dim));
-    if (config_.head_dim_local != 0 && (config_.head_dim_local % 32 != 0 || config_.head_dim_local > config_.head_dim)) {
+    config.head_dim = file.get<std::uint32_t>(prefix + "attention.key_length")
+                           .value_or(config.embedding_dim / config.head_count);
+    if (config.head_dim == 0 || config.head_dim % 32 != 0) fail("head size must be a non-zero multiple of 32");
+    if (gemma) config.embedding_scale = std::sqrt(static_cast<float>(config.embedding_dim));
+    if (config.head_dim_local != 0 && (config.head_dim_local % 32 != 0 || config.head_dim_local > config.head_dim)) {
         fail("the sliding layers' head size must be a multiple of 32 no larger than the global one");
     }
-    if (file.get<std::uint32_t>(prefix + "attention.value_length").value_or(config_.head_dim) != config_.head_dim) {
+    if (file.get<std::uint32_t>(prefix + "attention.value_length").value_or(config.head_dim) != config.head_dim) {
         fail("key and value head sizes differ");
     }
 
     const TensorInfo* embedding = file.tensor("token_embd.weight");
-    if (embedding == nullptr || embedding->dims.size() != 2 || embedding->dims[0] != config_.embedding_dim) {
+    if (embedding == nullptr || embedding->dims.size() != 2 || embedding->dims[0] != config.embedding_dim) {
         fail("missing or misshapen token_embd.weight");
     }
     if (embedding->dims[1] == 0 || embedding->dims[1] > 0x7FFFFFFF) fail("invalid vocabulary size");
-    config_.vocab_size = static_cast<std::uint32_t>(embedding->dims[1]);
+    config.vocab_size = static_cast<std::uint32_t>(embedding->dims[1]);
+    return config;
+}
+
+Model::Model(const GgufFile& file, bool repack) : repack_(repack) {
+    config_ = parse_config(file);
+    const std::string prefix = std::string(*file.get<std::string_view>("general.architecture")) + ".";
+    const bool gemma = config_.architecture == Architecture::Gemma3 || config_.architecture == Architecture::Gemma4;
+    const bool bitnet = config_.architecture == Architecture::BitNet;
 
     const std::size_t embd = config_.embedding_dim;
     const std::size_t query_dim = static_cast<std::size_t>(config_.head_count) * config_.head_dim;

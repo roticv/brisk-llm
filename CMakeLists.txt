@@ -32,6 +32,7 @@ add_library(brisk
     src/quant.cpp
     src/sampler.cpp
     src/chat.cpp
+    src/memory.cpp
     src/speculative.cpp
     src/thread_pool.cpp
     src/tokenizer.cpp

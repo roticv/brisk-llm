@@ -14,6 +14,7 @@
 #include "engine.h"
 #include "gguf.h"
 #include "mapped_file.h"
+#include "memory.h"
 #include "model.h"
 #include "sampler.h"
 #include "tokenizer.h"
@@ -80,12 +81,24 @@ struct Request {
 
 class Server {
 public:
+    // The context a session holds: the request, or the model's, capped at 8192.
+    static std::size_t context_for(const ServeOptions& options, const ModelConfig& c) {
+        return options.max_context != 0 ? std::min<std::size_t>(options.max_context, c.context_length)
+                                        : std::min<std::size_t>(c.context_length, 8192);
+    }
+    // Refuses before the weights load when the model would not fit (the check throws).
+    static const GgufFile& checked(const GgufFile& file, const ServeOptions& options) {
+        const ModelConfig c = Model::parse_config(file);
+        const std::size_t context = context_for(options, c);
+        check_memory(estimate_memory(file, c, /*repack=*/!options.gpu, context), context, "serve");
+        return file;
+    }
+
     explicit Server(const ServeOptions& options)
         : options_(options), mapped_(options.model_path), file_(GgufFile::parse(mapped_.bytes())), tokenizer_(file_),
-          model_(file_, /*repack=*/!options.gpu) {
+          model_(checked(file_, options), /*repack=*/!options.gpu) {
         const ModelConfig& c = model_.config();
-        context_ = options.max_context != 0 ? std::min<std::size_t>(options.max_context, c.context_length)
-                                            : std::min<std::size_t>(c.context_length, 8192);
+        context_ = context_for(options, c);
         if (options.gpu) {
 #if BRISK_METAL
             engine_ = std::make_unique<MetalSession>(model_, mapped_.bytes(), context_);

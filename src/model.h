@@ -175,8 +175,12 @@ public:
     std::span<const float> output_norm() const { return output_norm_; }
     const std::vector<Layer>& layers() const { return layers_; }
 
+    // The configuration alone, before any weight is loaded (for the memory estimate).
+    static ModelConfig parse_config(const GgufFile& file);
+
 private:
     std::span<const float> load(const GgufFile& file, std::string_view name, std::size_t expected_elements);
+
     Matrix load_matrix(const GgufFile& file, std::string_view name, std::size_t rows, std::size_t cols);
     // Rows [row0, row0 + rows) of a tensor of total_rows rows (a fused QKV or gate/up tensor).
     Matrix load_matrix_rows(const GgufFile& file, std::string_view name, std::size_t row0, std::size_t rows,

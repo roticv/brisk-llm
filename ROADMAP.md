@@ -153,6 +153,15 @@ Out of scope throughout: the vision and audio encoders of the multimodal familie
 
 `brisk serve`: `/v1/chat/completions` (streamed with SSE or not), `/v1/completions`, `/v1/models`, `/health`, over one model on either backend, with cpp-httplib and nlohmann/json vendored in `third_party/`. Each family's chat template renders a full messages array (`src/chat.cpp`; `tests/compare_chat.py` checks it against `llama_chat_apply_template` on every model present; Gemma 4's and BitNet's templates are outside llama.cpp's built-in list and follow the files' Jinja by hand). The session persists between requests and a request rolls back to the longest common token prefix with what the session holds, so a conversation's next turn evaluates only the new message and the previous answer; one request at a time. Streaming holds back incomplete UTF-8 sequences and possible stop-string prefixes. `tests/server_test.py` runs the API end to end and is in CI. Not done: tool calls, `logprobs`, `n > 1`, parallel requests, a separate `reasoning_content` field for Qwen3's thinking (it is passed through in the content, which the common front-ends render).
 
+## Phase 9: Running well on the Pi — started
+
+From a comparison with other Pi-targeted runtimes (2026-10-23): what they get right is around the engine, not in it.
+
+1. **Memory preflight** — done. `estimate_memory` sums the weights, the repacked copies the CPU kernels make, the K/V and convolution caches for the session's context and the scratch buffers, from the file and the config before anything loads; `check_memory` compares it with the available memory (MemAvailable on Linux, free plus reclaimable on macOS) and refuses with the breakdown and a fix. On the Pi, `brisk serve` with Gemma 4 E2B at the default 8192-token context is now an error with the numbers rather than a swapping board; `--ctx 1024` runs. `brisk info --memory` prints the estimate. The estimate also quantifies the open K/V-cache item: Qwen3-0.6B's float32 cache at 8192 tokens is 1.75 GB, five times its weights; a half-precision cache would halve the largest term on the Pi.
+2. **Weights paged in at start** (`serve`): the first request on the Pi pays 14 s of SD-card page-in that users read as a broken server. Not done.
+3. **Release binaries** for aarch64 Linux from CI, so the Pi needs no toolchain. Not done.
+4. **`brisk pull <name>`** for the known files. Not done.
+
 ## Later, if wanted
 
 - Sparsity experiments (skipping inactive neurons).

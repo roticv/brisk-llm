@@ -24,6 +24,7 @@
 #include "metal/metal_session.h"
 #endif
 #include "chat.h"
+#include "memory.h"
 #include "server.h"
 #include "sampler.h"
 #include "speculative.h"
@@ -174,8 +175,6 @@ int cmd_generate(const GenerateOptions& options) {
     const brisk::MappedFile mapped(options.model_path);
     const brisk::GgufFile file = brisk::GgufFile::parse(mapped.bytes());
     const brisk::Tokenizer tokenizer(file);
-    const brisk::Model model(file, /*repack=*/!options.gpu);
-    const double load_seconds = seconds_since(load_start);
 
     std::string text = options.prompt;
     if (options.chat) {
@@ -186,13 +185,17 @@ int cmd_generate(const GenerateOptions& options) {
     std::vector<brisk::Token> prompt = tokenizer.encode(text);
     if (tokenizer.bos() >= 0) prompt.insert(prompt.begin(), tokenizer.bos());
     if (prompt.empty()) throw std::runtime_error("the prompt is empty");
-    if (prompt.size() + options.max_tokens > model.config().context_length) {
+    const brisk::ModelConfig config = brisk::Model::parse_config(file);
+    if (prompt.size() + options.max_tokens > config.context_length) {
         throw std::runtime_error("prompt plus generated tokens exceed the model's context length");
     }
     if (options.print_ids) print_ids(prompt);
 
     // Room for the prompt, the answer, and a round of speculative guesses.
     const std::size_t max_context = prompt.size() + options.max_tokens + options.draft_tokens + 1;
+    brisk::check_memory(brisk::estimate_memory(file, config, /*repack=*/!options.gpu, max_context), max_context, "generate");
+    const brisk::Model model(file, /*repack=*/!options.gpu);
+    const double load_seconds = seconds_since(load_start);
     std::unique_ptr<brisk::Engine> engine;
     if (options.gpu) {
 #if BRISK_METAL
@@ -318,10 +321,12 @@ int cmd_perplexity(const std::string& model_path, const std::string& text, std::
     const brisk::MappedFile mapped(model_path);
     const brisk::GgufFile file = brisk::GgufFile::parse(mapped.bytes());
     const brisk::Tokenizer tokenizer(file);
-    const brisk::Model model(file, /*repack=*/!gpu);
     const std::vector<brisk::Token> tokens = tokenizer.encode(text);
     if (tokens.size() < 2) throw std::runtime_error("the text is too short to score");
-    if (tokens.size() > model.config().context_length) throw std::runtime_error("the text exceeds the context length");
+    const brisk::ModelConfig config = brisk::Model::parse_config(file);
+    if (tokens.size() > config.context_length) throw std::runtime_error("the text exceeds the context length");
+    brisk::check_memory(brisk::estimate_memory(file, config, /*repack=*/!gpu, tokens.size()), tokens.size(), "perplexity");
+    const brisk::Model model(file, /*repack=*/!gpu);
 
     std::unique_ptr<brisk::Engine> engine;
     if (gpu) {
@@ -343,7 +348,7 @@ int cmd_perplexity(const std::string& model_path, const std::string& text, std::
 
 int usage() {
     std::fprintf(stderr,
-                 "usage: brisk info [--tensors] <model.gguf>\n"
+                 "usage: brisk info [--tensors | --memory [<context>]] <model.gguf>   (--memory: what a session needs)\n"
                  "       brisk tokenize <model.gguf> [--no-special] (--batch <strings.bin> | <text>)\n"
                  "       brisk generate <model.gguf> (-p <prompt> | -f <prompt-file>) [options]\n"
                  "       brisk perplexity <model.gguf> -f <text-file> [-t <threads>] [--gpu]\n"
@@ -403,6 +408,20 @@ int run(const std::vector<std::string>& args) {
 
     if (command == "info") {
         const bool list_tensors = args.size() > 1 && args[1] == "--tensors";
+        const bool memory = args.size() > 1 && args[1] == "--memory";
+        if (memory) {
+            // brisk info --memory <model> [<context>]: what a session needs, CPU and GPU, against what is free.
+            if (args.size() < 3 || args.size() > 4) return usage();
+            const brisk::MappedFile mapped(args[2]);
+            const brisk::GgufFile file = brisk::GgufFile::parse(mapped.bytes());
+            const brisk::ModelConfig config = brisk::Model::parse_config(file);
+            const std::size_t context = args.size() == 4 ? std::stoul(args[3]) : std::min<std::size_t>(config.context_length, 8192);
+            std::printf("context %zu tokens\nCPU: %s\nGPU: %s\navailable now: %.2f GB\n", context,
+                        brisk::estimate_memory(file, config, true, context).describe().c_str(),
+                        brisk::estimate_memory(file, config, false, context).describe().c_str(),
+                        static_cast<double>(brisk::available_memory()) / (1024.0 * 1024.0 * 1024.0));
+            return 0;
+        }
         if (args.size() != (list_tensors ? 3u : 2u)) return usage();
         return cmd_info(args.back(), list_tensors);
     }
