@@ -65,14 +65,30 @@ MemoryEstimate estimate_memory(const GgufFile& file, const ModelConfig& c, bool 
             e.cache += 2 * std::size_t{c.kv_head_count_of(l)} * c.head_dim_of(l) * context * 2;
         }
     }
-    // Scratch: the session's activation rows for a batch of kMaxBatch (256) tokens, the
-    // attention scores for a batch over the context, and the logits.
-    constexpr std::size_t batch = 256;
+    // Scratch, following each backend's allocations (Session and MetalSession).
     const std::size_t qdim = std::size_t{c.head_count} * c.head_dim;
-    e.scratch += batch * (4 * c.embedding_dim + 2 * qdim + 2 * c.feed_forward_dim + 3 * c.embedding_dim) * sizeof(float);
-    e.scratch += batch * c.head_count * std::min<std::size_t>(context, 8192) * sizeof(float);  // scores
-    e.scratch += 64 * c.vocab_size * sizeof(float);  // logits for scored tokens
-    if (c.ple_dim != 0) e.scratch += batch * std::size_t{c.ple_dim} * c.layer_count * sizeof(float) * 2;
+    const std::size_t kvdim = std::size_t{c.kv_head_count} * c.head_dim;
+    if (repack) {
+        // CPU Session: a batch of 256 tokens; the scores are allocated per batch over the context.
+        constexpr std::size_t batch = 256;
+        e.scratch += batch * (4 * c.embedding_dim + 2 * qdim + kvdim + 2 * c.feed_forward_dim) * sizeof(float);
+        e.scratch += batch * c.head_count * context * sizeof(float);  // scores
+        e.scratch += 64 * c.vocab_size * sizeof(float);              // logits for scored tokens
+        if (c.ple_dim != 0) e.scratch += batch * std::size_t{c.ple_dim} * c.layer_count * sizeof(float) * 2;
+        if (c.conv_taps != 0) e.scratch += batch * 3 * c.embedding_dim * sizeof(float);
+    } else {
+        // MetalSession: a batch of 512 tokens with float and half copies of the activations,
+        // the batched attention's scores (float) and probabilities (half) for the batch over
+        // the context, the small kernel's partials, and the logits.
+        constexpr std::size_t batch = 512;
+        e.scratch += batch * (4 * c.embedding_dim + 2 * qdim + 2 * kvdim + c.feed_forward_dim) * sizeof(float);
+        e.scratch += batch * (c.embedding_dim + qdim + c.feed_forward_dim) * 2;  // half copies
+        e.scratch += batch * c.head_count * context * 6;                         // scores + probabilities
+        e.scratch += 8 * c.head_count * ((context + 127) / 128) * (c.head_dim + 2) * sizeof(float);  // partials
+        e.scratch += 64 * c.vocab_size * sizeof(float);
+        if (c.ple_dim != 0) e.scratch += batch * std::size_t{c.ple_dim} * c.layer_count * sizeof(float) * 3;
+        if (c.conv_taps != 0) e.scratch += batch * 3 * c.embedding_dim * sizeof(float);
+    }
     return e;
 }
 
