@@ -20,6 +20,12 @@ public:
 
     std::span<const std::byte> bytes() const { return {data_, size_}; }
 
+    // Pages the whole file in now (reading it once, after telling the OS to
+    // read ahead), so the first use does not pay for it; `lock` also pins the
+    // pages (mlock), which fails quietly where the limit forbids it. Returns
+    // the bytes touched.
+    std::size_t prefetch(bool lock = false) const;
+
 private:
     void reset() noexcept;
 

@@ -16,6 +16,8 @@ struct ServeOptions {
     std::size_t max_context = 0; // tokens the session holds (0: the model's limit, capped at 8192)
     std::string name;            // the model name reported by /v1/models (default: the file's basename)
     bool verbose = false;        // log each request's tokens and timings to stderr
+    bool prefetch = true;        // page the weights in at start (the first request would otherwise pay for it)
+    bool lock = false;           // also pin them in memory (mlock)
 };
 
 // Serves until the process is killed. Throws std::runtime_error on failure to load or bind.

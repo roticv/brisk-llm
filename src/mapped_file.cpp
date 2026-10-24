@@ -49,6 +49,22 @@ MappedFile::MappedFile(const std::string& path) {
     size_ = size;
 }
 
+std::size_t MappedFile::prefetch(bool lock) const {
+    if (data_ == nullptr) return 0;
+    void* addr = const_cast<std::byte*>(data_);
+#if defined(MADV_WILLNEED)
+    ::madvise(addr, size_, MADV_WILLNEED);
+#endif
+    // One read per page: volatile so the loop is not optimised away.
+    const long page = ::sysconf(_SC_PAGESIZE);
+    const std::size_t step = page > 0 ? static_cast<std::size_t>(page) : 4096;
+    volatile std::byte sink{};
+    for (std::size_t i = 0; i < size_; i += step) sink = data_[i];
+    (void)sink;
+    if (lock) ::mlock(addr, size_);  // best effort
+    return size_;
+}
+
 MappedFile::~MappedFile() { reset(); }
 
 MappedFile::MappedFile(MappedFile&& other) noexcept

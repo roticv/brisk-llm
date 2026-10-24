@@ -109,6 +109,22 @@ public:
             engine_ = std::make_unique<Session>(model_, options.threads, context_);
         }
         name_ = options.name.empty() ? basename_of(options.model_path) : options.name;
+        if (options.prefetch) {
+            // On a Pi the first request would otherwise spend 10+ seconds paging the
+            // weights in from the SD card, which looks like a broken server.
+            const auto start = std::chrono::steady_clock::now();
+            const std::size_t bytes = mapped_.prefetch(options.lock);
+            std::fprintf(stderr, "brisk serve: %.2f GB of weights paged in%s in %.1f s\n",
+                         static_cast<double>(bytes) / (1024.0 * 1024.0 * 1024.0), options.lock ? " and locked" : "",
+                         seconds_since(start));
+            // One token through the model: the caches and scratch are touched for the
+            // first time here rather than in the first request.
+            const auto warm = std::chrono::steady_clock::now();
+            const Token first = tokenizer_.bos() >= 0 ? tokenizer_.bos() : Token{0};
+            engine_->eval(first);
+            engine_->rollback(0);
+            std::fprintf(stderr, "brisk serve: warm-up pass in %.1f s\n", seconds_since(warm));
+        }
     }
 
     int run() {
