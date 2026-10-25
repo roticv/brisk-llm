@@ -375,6 +375,54 @@ inline void dot_rows_q6_k(const BlockQ6_K* w, const BlockQ8_K* const* xs, std::s
     for (std::size_t t = 0; t < n; ++t) out[t] = sums[t];
 }
 
+// Without a dot instruction: a sub-block's 32 products summed in 16-bit lanes
+// (each lane takes 4 products of at most 15 x 127), widened and scaled once,
+// instead of per 16 values. Three instructions per 16 values instead of four.
+// `mins16` is the block's eight minimums widened to int16 (once per block); d
+// and dmin are its scales as floats, also hoisted out of the token loop.
+inline float q4_k_block_value_wide(const int8x16_t q[16], const std::uint8_t scales[8], int16x8_t mins16, float d, float dmin,
+                                   const BlockQ8_K& x) {
+    int32x4_t acc0 = vdupq_n_s32(0);
+    int32x4_t acc1 = vdupq_n_s32(0);
+    for (int j = 0; j < 8; j += 2) {
+        const int8x16_t xa = vld1q_s8(x.qs + 32 * j), xb = vld1q_s8(x.qs + 32 * j + 16);
+        int16x8_t p = vmull_s8(vget_low_s8(q[2 * j]), vget_low_s8(xa));
+        p = vmlal_s8(p, vget_high_s8(q[2 * j]), vget_high_s8(xa));
+        p = vmlal_s8(p, vget_low_s8(q[2 * j + 1]), vget_low_s8(xb));
+        p = vmlal_s8(p, vget_high_s8(q[2 * j + 1]), vget_high_s8(xb));
+        acc0 = vmlaq_n_s32(acc0, vpaddlq_s16(p), scales[j]);
+        const int8x16_t xc = vld1q_s8(x.qs + 32 * (j + 1)), xd = vld1q_s8(x.qs + 32 * (j + 1) + 16);
+        int16x8_t r = vmull_s8(vget_low_s8(q[2 * j + 2]), vget_low_s8(xc));
+        r = vmlal_s8(r, vget_high_s8(q[2 * j + 2]), vget_high_s8(xc));
+        r = vmlal_s8(r, vget_low_s8(q[2 * j + 3]), vget_low_s8(xd));
+        r = vmlal_s8(r, vget_high_s8(q[2 * j + 3]), vget_high_s8(xd));
+        acc1 = vmlaq_n_s32(acc1, vpaddlq_s16(r), scales[j + 1]);
+    }
+    // The minimums' term: sum over sub-blocks of min * sum(x), the 16 bsums paired into 8.
+    const int16x8_t bsums = vpaddq_s16(vld1q_s16(x.bsums), vld1q_s16(x.bsums + 8));
+    const std::int32_t offsets = vaddvq_s32(vaddq_s32(vmull_s16(vget_low_s16(mins16), vget_low_s16(bsums)),
+                                                      vmull_s16(vget_high_s16(mins16), vget_high_s16(bsums))));
+    const float weighted = static_cast<float>(vaddvq_s32(vaddq_s32(acc0, acc1)));
+    return x.d * (d * weighted - dmin * static_cast<float>(offsets));
+}
+
+constexpr std::size_t kWideTokens = 8;  // tokens per unpacked block in the wide kernels (the unpack and scale decode are the overhead)
+
+template <typename Block, typename Unpack>
+inline void dot_rows_k4_wide(const Block* w, const BlockQ8_K* const* xs, std::size_t n, std::size_t blocks, float* out,
+                             Unpack unpack) {
+    float sums[kWideTokens] = {};
+    for (std::size_t b = 0; b < blocks; ++b) {
+        int8x16_t q[16];
+        std::uint8_t scales[8], mins[8];
+        unpack(w[b], q, scales, mins);
+        const int16x8_t mins16 = vreinterpretq_s16_u16(vmovl_u8(vld1_u8(mins)));
+        const float d = vgetq_lane_f32(half4_to_float(w[b].d), 0), dmin = vgetq_lane_f32(half4_to_float(w[b].dmin), 0);
+        for (std::size_t t = 0; t < n; ++t) sums[t] += q4_k_block_value_wide(q, scales, mins16, d, dmin, xs[t][b]);
+    }
+    for (std::size_t t = 0; t < n; ++t) out[t] = sums[t];
+}
+
 template <typename Dot16>
 inline void dot_rows_q4_k(const BlockQ4_K* w, const BlockQ8_K* const* xs, std::size_t n, std::size_t blocks,
                           float* out, Dot16 dot16) {

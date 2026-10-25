@@ -84,6 +84,9 @@ target_link_libraries(brisk-cli PRIVATE brisk_server)
 add_executable(kernel_bench bench/kernel_bench.cpp)
 target_link_libraries(kernel_bench PRIVATE brisk)
 
+add_executable(kquant_bench bench/kquant_bench.cpp)
+target_link_libraries(kquant_bench PRIVATE brisk)
+
 add_executable(attention_bench bench/attention_bench.cpp)
 target_link_libraries(attention_bench PRIVATE brisk)
 
