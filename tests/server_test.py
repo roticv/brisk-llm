@@ -151,11 +151,37 @@ def main():
         assert code == 0, code
         assert got and got[-1] == "[DONE]", got[-2:]
         assert json.loads(got[-2])["choices"][0]["finish_reason"] == "length", got[-2]
-        print("server_test: ok")
-        return 0
     finally:
         if proc.poll() is None:
             proc.terminate()
             proc.wait()
+
+    # Gemma 4's thought channel (<|channel>thought ... <channel|>), when the file is present:
+    # thinking only on request, returned as reasoning_content.
+    gemma = ROOT / "models" / "gemma-4-E2B-it-Q4_0.gguf"
+    if gemma.exists():
+        proc = subprocess.Popen([str(ROOT / "build-release" / "brisk"), "serve", str(gemma), "--port", str(PORT), "-t", "4"],
+                                stderr=subprocess.DEVNULL)
+        try:
+            for _ in range(200):
+                try:
+                    urllib.request.urlopen(URL + "/health", timeout=1)
+                    break
+                except Exception:
+                    time.sleep(0.2)
+            ask = [{"role": "user", "content": "What is 7 times 8? Answer briefly."}]
+            d = post("/v1/chat/completions", {"messages": ask, "temperature": 0, "max_tokens": 500})
+            m = d["choices"][0]["message"]
+            assert not m.get("reasoning_content") and "<|channel>" not in m["content"], m
+            d = post("/v1/chat/completions", {"messages": ask, "temperature": 0, "max_tokens": 500, "enable_thinking": True})
+            m = d["choices"][0]["message"]
+            assert m.get("reasoning_content") and not m["reasoning_content"].startswith("thought"), m
+            assert "56" in m["content"] and "<channel|>" not in m["content"], m
+        finally:
+            if proc.poll() is None:
+                proc.terminate()
+                proc.wait()
+    print("server_test: ok")
+    return 0
 
 sys.exit(main())

@@ -128,6 +128,12 @@ std::string render_chat_request(const GgufFile& file, const json& body, std::vec
         if (body.contains("reasoning") && body["reasoning"].is_object()) {
             co.think = body["reasoning"].value("effort", "medium") != "none";
         }
+        // Gemma 4 thinks only when asked (its template's default), by any of the three forms.
+        co.think_requested = body.value("enable_thinking", false) ||
+                             (body.contains("chat_template_kwargs") && body["chat_template_kwargs"].is_object() &&
+                              body["chat_template_kwargs"].value("enable_thinking", false)) ||
+                             (body.contains("reasoning") && body["reasoning"].is_object() &&
+                              body["reasoning"].value("effort", "none") != "none");
         return render_chat(file, messages, co);
 }
 
@@ -371,6 +377,7 @@ private:
         bool reasoning = false;     // inside a <think> block (Qwen3, DeepSeek-R1: the tags are single tokens)
         bool call = false;          // inside a <tool_call> block (Qwen: also single tokens)
         bool skip_newlines = false; // the newlines the templates put after the tags are dropped
+        bool skip_channel_name = false;  // Gemma 4: "thought\n" after <|channel>
         auto flush = [&](const std::string& piece) {
             if (call) {
                 g.calls.back() += piece;
@@ -389,7 +396,10 @@ private:
             ++g.tokens;
             cached_.push_back(next);
             const std::string_view piece_text = tokenizer_.piece(next);
-            const bool think_tag = r.separate_reasoning && (piece_text == "<think>" || piece_text == "</think>");
+            // Qwen3/DeepSeek: <think>...</think>. Gemma 4: <|channel>thought\n...<channel|> (the name after the
+            // opening token is dropped up to its newline).
+            const bool think_tag = r.separate_reasoning && (piece_text == "<think>" || piece_text == "</think>" ||
+                                                            piece_text == "<|channel>" || piece_text == "<channel|>");
             const bool call_tag = r.tools && (piece_text == "<tool_call>" || piece_text == "</tool_call>");
             if (think_tag || call_tag) {
                 if (!pending.empty()) {  // whatever was held back belongs to the block that just ended
@@ -399,7 +409,10 @@ private:
                     }
                     pending.clear();
                 }
-                if (think_tag) reasoning = piece_text == "<think>";
+                if (think_tag) {
+                    reasoning = piece_text == "<think>" || piece_text == "<|channel>";
+                    skip_channel_name = piece_text == "<|channel>";
+                }
                 if (call_tag) {
                     call = piece_text == "<tool_call>";
                     if (call) g.calls.emplace_back();
@@ -410,6 +423,15 @@ private:
             }
             if (!tokenizer_.is_control(next)) {
                 std::string_view text = piece_text;
+                if (skip_channel_name) {
+                    const std::size_t nl = text.find('\n');
+                    if (nl == std::string_view::npos) {
+                        text = {};
+                    } else {
+                        text.remove_prefix(nl + 1);
+                        skip_channel_name = false;
+                    }
+                }
                 if (skip_newlines) {
                     while (!text.empty() && text.front() == '\n') text.remove_prefix(1);
                     skip_newlines = text.empty();

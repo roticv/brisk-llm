@@ -157,6 +157,7 @@ struct GenerateOptions {
     std::size_t max_tokens = 128;
     bool chat = false;         // wrap the prompt as a single user turn
     bool think = true;         // with chat: let the model reason before answering
+    bool think_requested = false;  // --think: ask for it where the template's default is off (Gemma 4)
     bool print_ids = false;    // print token ids instead of text
     bool stop_at_end = true;   // stop when the model ends its turn
     std::string logits_path;   // if set, the logits after the prompt are written here
@@ -182,6 +183,7 @@ int cmd_generate(const GenerateOptions& options) {
     if (options.chat) {
         brisk::ChatOptions chat_options;
         chat_options.think = options.think;
+        chat_options.think_requested = options.think_requested;
         text = brisk::render_chat(file, {brisk::ChatMessage{"user", options.prompt, {}}}, chat_options);
     }
     std::vector<brisk::Token> prompt = tokenizer.encode(text);
@@ -367,6 +369,7 @@ int usage() {
                  "  --warmup              evaluate the prompt once untimed first (benchmarking)\n"
                  "  --chat                treat the prompt as a user message\n"
                  "  --no-think            with --chat, answer without a reasoning block\n"
+                 "  --think               with --chat, ask for one where the template's default is off (Gemma 4)\n"
                  "  --temp <t>            sampling temperature; 0 always picks the likeliest token (default 0)\n"
                  "  --top-k <k>           sample from the k likeliest tokens; 0 = all (default 20)\n"
                  "  --top-p <p>           sample from the smallest set reaching probability p (default 0.95)\n"
@@ -554,6 +557,7 @@ int run(const std::vector<std::string>& args) {
             const bool has_value = i + 1 < args.size();
             if (flag == "--chat") options.chat = true;
             else if (flag == "--no-think") options.think = false;
+            else if (flag == "--think") options.think_requested = true;
             else if (flag == "--ids") options.print_ids = true;
             else if (flag == "--no-stop") options.stop_at_end = false;
             else if (flag == "--gpu") options.gpu = true;

@@ -29,6 +29,7 @@ ChatFormat chat_format_of(const GgufFile& file);
 
 struct ChatOptions {
     bool think = true;           // Qwen3: leave the reasoning block to the model (false: an empty one is prefilled)
+    bool think_requested = false;  // Gemma 4: thinking is off in its template unless asked for (<|think|> in the system turn)
     bool generation_prompt = true;  // end with the assistant's turn header
     std::vector<std::string> tools;  // tool definitions as JSON text (OpenAI's {"type": "function", "function": ...})
     std::string default_system;      // ChatML: the system prompt the template supplies when the conversation has none

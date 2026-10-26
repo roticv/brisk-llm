@@ -211,7 +211,17 @@ std::string render_gemma3(const std::vector<ChatMessage>& messages, const ChatOp
 // its own turn. (No thinking: the template's enable_thinking is off by default.)
 std::string render_gemma4(const std::vector<ChatMessage>& messages, const ChatOptions& o) {
     std::string out;
-    for (std::size_t i = 0; i < messages.size(); ++i) {
+    const bool think = o.think && o.think_requested;
+    std::size_t first = 0;
+    if (think) {  // thinking on: a system turn opening with <|think|>, holding the system message if there is one
+        out += "<|turn>system\n<|think|>\n";
+        if (!messages.empty() && messages[0].role == "system") {
+            out += std::string(trim(messages[0].content));
+            first = 1;
+        }
+        out += "<turn|>\n";
+    }
+    for (std::size_t i = first; i < messages.size(); ++i) {
         const ChatMessage& m = messages[i];
         check_role(m);
         if (m.role == "system" && i != 0) throw std::runtime_error("chat: Gemma 4 takes a system message only first");
@@ -221,7 +231,7 @@ std::string render_gemma4(const std::vector<ChatMessage>& messages, const ChatOp
     if (o.generation_prompt) {
         out += "<|turn>model\n";
         // The 12B template prefills an empty thought block when thinking is off (the E2B/E4B ones do not).
-        if (o.empty_thought) out += "<|channel>thought\n<channel|>";
+        if (o.empty_thought && !think) out += "<|channel>thought\n<channel|>";
     }
     return out;
 }

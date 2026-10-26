@@ -7,7 +7,8 @@ models/.
 Known, deliberate differences: brisk refuses tools for a template that has no
 tool format (llama.cpp renders the conversation without them), and brisk does
 not render Gemma 4's, DeepSeek's, Mistral's or Phi's tool formats yet. Gemma 4
-is compared with thinking off (brisk does not render its thinking channel)."""
+thinks only when a request asks (its template's default; llama.cpp's engine
+defaults it on), so its requests carry enable_thinking explicitly."""
 import json, subprocess, sys, tempfile
 from pathlib import Path
 
@@ -25,6 +26,10 @@ REQUESTS = {
     "spaces": {"messages": [{"role": "user", "content": "  spaces and\nnewlines  "}, {"role": "assistant", "content": "ok"},
                             {"role": "user", "content": "again"}]},
     "no-think": {"messages": [{"role": "user", "content": "Hi there"}], "enable_thinking": False},
+    "think": {"messages": [{"role": "user", "content": "Hi there"}], "enable_thinking": True},
+    "think-system": {"messages": [{"role": "system", "content": "Be brief."}, {"role": "user", "content": "Hi"},
+                                  {"role": "assistant", "content": "Hello."}, {"role": "user", "content": "Bye"}],
+                     "enable_thinking": True},
     "tools": {"messages": [{"role": "user", "content": "Weather in Paris?"}], "tools": TOOLS},
     "tools-system": {"messages": [{"role": "system", "content": "Be brief."}, {"role": "user", "content": "Weather in Paris?"}],
                      "tools": TOOLS},
