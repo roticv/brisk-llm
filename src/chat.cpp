@@ -24,19 +24,51 @@ std::string_view after_think(std::string_view content) {
     return rest;
 }
 
-void check_role(const ChatMessage& m) {
+void check_role(const ChatMessage& m, bool tools = false) {
+    if (m.role == "tool" && tools) return;
     if (m.role != "system" && m.role != "user" && m.role != "assistant") {
         throw std::runtime_error("chat: unknown role '" + m.role + "'");
     }
 }
 
+// Qwen's rendering of a call: {"name": "...", "arguments": {...}}
+std::string qwen_tool_call(const ToolCall& c) { return "{\"name\": \"" + c.name + "\", \"arguments\": " + c.arguments + "}"; }
+
 // ChatML (Qwen2.5, Qwen3): every message is <|im_start|>role\ncontent<|im_end|>\n.
 std::string render_chatml(const std::vector<ChatMessage>& messages, const ChatOptions& o, bool qwen3) {
     std::string out;
-    for (const ChatMessage& m : messages) {
-        check_role(m);
+    std::size_t first = 0;
+    if (!o.tools.empty()) {
+        // Qwen's tools block: the system message (if any) then the function signatures and the call format.
+        out += "<|im_start|>system\n";
+        if (!messages.empty() && messages[0].role == "system") {
+            out += messages[0].content + "\n\n";
+            first = 1;
+        }
+        out += "# Tools\n\nYou may call one or more functions to assist with the user query.\n\n"
+               "You are provided with function signatures within <tools></tools> XML tags:\n<tools>";
+        for (const std::string& t : o.tools) out += "\n" + t;
+        out += "\n</tools>\n\nFor each function call, return a json object with function name and arguments within "
+               "<tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n"
+               "</tool_call><|im_end|>\n";
+    }
+    for (std::size_t i = first; i < messages.size(); ++i) {
+        const ChatMessage& m = messages[i];
+        check_role(m, true);
+        if (m.role == "tool") {
+            // Consecutive results share one user turn.
+            if (i == first || messages[i - 1].role != "tool") out += "<|im_start|>user";
+            out += "\n<tool_response>\n" + m.content + "\n</tool_response>";
+            if (i + 1 == messages.size() || messages[i + 1].role != "tool") out += "<|im_end|>\n";
+            continue;
+        }
         out += "<|im_start|>" + m.role + "\n";
-        out += qwen3 && m.role == "assistant" ? std::string(after_think(m.content)) : m.content;
+        const std::string content = qwen3 && m.role == "assistant" ? std::string(after_think(m.content)) : m.content;
+        out += content;
+        for (std::size_t c = 0; c < m.tool_calls.size(); ++c) {
+            if (c > 0 || !content.empty()) out += "\n";
+            out += "<tool_call>\n" + qwen_tool_call(m.tool_calls[c]) + "\n</tool_call>";
+        }
         out += "<|im_end|>\n";
     }
     if (o.generation_prompt) {
@@ -49,9 +81,31 @@ std::string render_chatml(const std::vector<ChatMessage>& messages, const ChatOp
 // Llama 3: <|start_header_id|>role<|end_header_id|>\n\ncontent<|eot_id|>.
 std::string render_llama3(const std::vector<ChatMessage>& messages, const ChatOptions& o) {
     std::string out;
-    for (const ChatMessage& m : messages) {
-        check_role(m);
-        out += "<|start_header_id|>" + m.role + "<|end_header_id|>\n\n" + std::string(trim(m.content)) + "<|eot_id|>";
+    std::size_t first = 0;
+    if (!o.tools.empty()) {
+        // Llama 3's tools in the system message (the template's tools_in_user_message = false form).
+        out += "<|start_header_id|>system<|end_header_id|>\n\nEnvironment: ipython\nCutting Knowledge Date: December 2023\n\n"
+               "You have access to the following functions. To call a function, please respond with JSON for a function call."
+               "Respond in the format {\"name\": function name, \"parameters\": dictionary of argument name and its value}."
+               "Do not use variables.\n\n";
+        for (const std::string& t : o.tools) out += t + "\n\n";
+        if (!messages.empty() && messages[0].role == "system") {
+            out += std::string(trim(messages[0].content));
+            first = 1;
+        }
+        out += "<|eot_id|>";
+    }
+    for (std::size_t i = first; i < messages.size(); ++i) {
+        const ChatMessage& m = messages[i];
+        check_role(m, true);
+        if (!m.tool_calls.empty()) {
+            if (m.tool_calls.size() != 1) throw std::runtime_error("chat: Llama 3 makes one tool call at a time");
+            out += "<|start_header_id|>assistant<|end_header_id|>\n\n{\"name\": \"" + m.tool_calls[0].name + "\", \"parameters\": " +
+                   m.tool_calls[0].arguments + "}<|eot_id|>";
+            continue;
+        }
+        const std::string role = m.role == "tool" ? "ipython" : m.role;
+        out += "<|start_header_id|>" + role + "<|end_header_id|>\n\n" + std::string(trim(m.content)) + "<|eot_id|>";
     }
     if (o.generation_prompt) out += "<|start_header_id|>assistant<|end_header_id|>\n\n";
     return out;
@@ -194,7 +248,19 @@ ChatFormat chat_format_of(const GgufFile& file) {
     throw std::runtime_error("chat: no template for this file");
 }
 
+bool chat_format_has_tools(ChatFormat format) {
+    return format == ChatFormat::ChatML || format == ChatFormat::Qwen3 || format == ChatFormat::Llama3;
+}
+
 std::string render_chat(ChatFormat format, const std::vector<ChatMessage>& messages, const ChatOptions& options) {
+    if (!options.tools.empty() && !chat_format_has_tools(format)) {
+        throw std::runtime_error("chat: tools are not supported for this model's template (Qwen and Llama 3 files take them)");
+    }
+    for (const ChatMessage& m : messages) {
+        if ((m.role == "tool" || !m.tool_calls.empty()) && !chat_format_has_tools(format)) {
+            throw std::runtime_error("chat: tool messages are not supported for this model's template");
+        }
+    }
     switch (format) {
         case ChatFormat::Qwen3: return render_chatml(messages, options, true);
         case ChatFormat::ChatML: return render_chatml(messages, options, false);

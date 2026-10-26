@@ -8,9 +8,16 @@
 
 namespace brisk {
 
+// A function call an assistant message made (OpenAI's tool_calls).
+struct ToolCall {
+    std::string name;
+    std::string arguments;  // JSON text
+};
+
 struct ChatMessage {
-    std::string role;  // "system", "user" or "assistant"
+    std::string role;  // "system", "user", "assistant" or "tool" (a call's result)
     std::string content;
+    std::vector<ToolCall> tool_calls;  // assistant only
 };
 
 // A turn format. Chosen from the file's chat_template (several families
@@ -23,7 +30,11 @@ ChatFormat chat_format_of(const GgufFile& file);
 struct ChatOptions {
     bool think = true;           // Qwen3: leave the reasoning block to the model (false: an empty one is prefilled)
     bool generation_prompt = true;  // end with the assistant's turn header
+    std::vector<std::string> tools;  // tool definitions as JSON text (OpenAI's {"type": "function", "function": ...})
 };
+
+// Whether a format renders tools, tool calls and tool results (ChatML and Llama 3 do).
+bool chat_format_has_tools(ChatFormat format);
 
 // The conversation in the family's format, without the BOS token (the
 // tokenizer adds that). Each family's rendering follows the chat_template of

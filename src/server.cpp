@@ -1,6 +1,7 @@
 #include "server.h"
 
 #include <algorithm>
+#include <cctype>
 #include <atomic>
 #include <chrono>
 #include <csignal>
@@ -85,6 +86,12 @@ std::size_t complete_utf8_prefix(const std::string& s) {
 }
 
 // What a request asks for, after the OpenAI fields are read.
+std::string_view trim(std::string_view s) {
+    while (!s.empty() && std::isspace(static_cast<unsigned char>(s.front()))) s.remove_prefix(1);
+    while (!s.empty() && std::isspace(static_cast<unsigned char>(s.back()))) s.remove_suffix(1);
+    return s;
+}
+
 struct Request {
     std::vector<Token> prompt;
     std::size_t max_tokens = 0;
@@ -93,6 +100,8 @@ struct Request {
     bool stream = false;
     bool echo_prompt_tokens = false;
     bool separate_reasoning = true;  // a <think> block goes to reasoning_content rather than inline in content
+    bool tools = false;              // the request offered tools: <tool_call> blocks (Qwen) are parsed into tool_calls
+    bool hold_content = false;       // Llama 3 with tools: the whole answer may be a call, so content waits for the end
 };
 
 class Server {
@@ -203,7 +212,14 @@ private:
             if (!body.contains("messages") || !body["messages"].is_array()) throw std::invalid_argument("'messages' must be an array");
             std::vector<ChatMessage> messages;
             for (const json& m : body["messages"]) {
-                ChatMessage msg{m.value("role", ""), ""};
+                ChatMessage msg{m.value("role", ""), "", {}};
+                if (m.contains("tool_calls") && m["tool_calls"].is_array()) {
+                    for (const json& c : m["tool_calls"]) {
+                        const json& f = c.contains("function") ? c["function"] : c;
+                        const json& args = f.contains("arguments") ? f["arguments"] : json::object();
+                        msg.tool_calls.push_back({f.value("name", ""), args.is_string() ? args.get<std::string>() : args.dump()});
+                    }
+                }
                 const json& content = m.contains("content") ? m["content"] : json();
                 if (content.is_string()) {
                     msg.content = content.get<std::string>();
@@ -217,6 +233,11 @@ private:
                 messages.push_back(std::move(msg));
             }
             ChatOptions co;
+            if (body.contains("tools") && body["tools"].is_array()) {
+                for (const json& t : body["tools"]) co.tools.push_back(t.dump());
+            }
+            r.tools = !co.tools.empty();
+            r.hold_content = r.tools && chat_format_of(file_) == ChatFormat::Llama3;
             // Qwen3's reasoning: enable_thinking at the top level or in chat_template_kwargs (both are in use).
             if (body.contains("chat_template_kwargs") && body["chat_template_kwargs"].is_object()) {
                 co.think = body["chat_template_kwargs"].value("enable_thinking", true);
@@ -285,13 +306,39 @@ private:
     struct Generated {
         std::string text;       // the answer
         std::string reasoning;  // the <think> block's text, when separated
+        std::vector<std::string> calls;  // the <tool_call> blocks' text (Qwen)
         std::size_t tokens = 0;
         std::string finish_reason = "stop";
     };
 
+    // The tool calls an answer made, as OpenAI's tool_calls; Qwen's come from the <tool_call>
+    // blocks, Llama 3's answer is the call itself ({"name": ..., "parameters": {...}}).
+    // Whatever does not parse stays in the content.
+    static json tool_calls_of(Generated& g, const Request& r, const std::string& id) {
+        json calls = json::array();
+        auto add = [&](const std::string& text, const char* args_key) {
+            json j = json::parse(text, nullptr, false);
+            if (!j.is_object() || !j.contains("name") || !j["name"].is_string()) return false;
+            const json args = j.contains(args_key) ? j[args_key] : json::object();
+            calls.push_back({{"id", id + "-" + std::to_string(calls.size())},
+                             {"type", "function"},
+                             {"function", {{"name", j["name"]}, {"arguments", args.is_string() ? args.get<std::string>() : args.dump()}}}});
+            return true;
+        };
+        for (const std::string& c : g.calls) {
+            if (!add(c, "arguments")) g.text += std::string(g.text.empty() ? "" : "\n") + "<tool_call>\n" + c + "\n</tool_call>";
+        }
+        if (r.hold_content && calls.empty()) {
+            const std::string_view t = trim(g.text);
+            if (t.starts_with("{") && add(std::string(t), "parameters")) g.text.clear();
+        }
+        return calls;
+    }
+
     // Generates for one request, calling emit(text, reasoning) with each piece of
     // decoded text (reasoning: the piece belongs to a <think> block); emit returns
-    // false to stop (client gone). Holds the session lock.
+    // false to stop (client gone). Tool-call blocks are collected, not emitted.
+    // Holds the session lock.
     template <typename Emit>
     Generated generate(const Request& r, Emit emit, double& prompt_seconds, double& gen_seconds, std::size_t& reused) {
         Generated g;
@@ -305,10 +352,15 @@ private:
         for (const std::string& s : r.stop) longest_stop = std::max(longest_stop, s.size());
         bool stopped_by_string = false;
         bool reasoning = false;     // inside a <think> block (Qwen3, DeepSeek-R1: the tags are single tokens)
+        bool call = false;          // inside a <tool_call> block (Qwen: also single tokens)
         bool skip_newlines = false; // the newlines the templates put after the tags are dropped
         auto flush = [&](const std::string& piece) {
+            if (call) {
+                g.calls.back() += piece;
+                return true;
+            }
             (reasoning ? g.reasoning : g.text) += piece;
-            return emit(piece, reasoning);
+            return r.hold_content && !reasoning ? true : emit(piece, reasoning);
         };
         while (g.tokens < r.max_tokens) {
             if (g_stopping.load()) {  // shutting down: end this answer here, as a truncation
@@ -320,7 +372,9 @@ private:
             ++g.tokens;
             cached_.push_back(next);
             const std::string_view piece_text = tokenizer_.piece(next);
-            if (r.separate_reasoning && (piece_text == "<think>" || piece_text == "</think>")) {
+            const bool think_tag = r.separate_reasoning && (piece_text == "<think>" || piece_text == "</think>");
+            const bool call_tag = r.tools && (piece_text == "<tool_call>" || piece_text == "</tool_call>");
+            if (think_tag || call_tag) {
                 if (!pending.empty()) {  // whatever was held back belongs to the block that just ended
                     if (!flush(pending)) {
                         g.finish_reason = "abort";
@@ -328,7 +382,11 @@ private:
                     }
                     pending.clear();
                 }
-                reasoning = piece_text == "<think>";
+                if (think_tag) reasoning = piece_text == "<think>";
+                if (call_tag) {
+                    call = piece_text == "<tool_call>";
+                    if (call) g.calls.emplace_back();
+                }
                 skip_newlines = true;
                 if (g.tokens < r.max_tokens) logits = engine_->eval(next);
                 continue;
@@ -366,6 +424,7 @@ private:
             if (g.tokens < r.max_tokens) logits = engine_->eval(next);
         }
         if (!pending.empty() && g.finish_reason != "abort") flush(pending);
+        for (std::string& c : g.calls) c = std::string(trim(c));
         if (g.finish_reason != "abort" && !g_stopping.load()) {
             g.finish_reason = stopped_by_string || g.tokens < r.max_tokens ? "stop" : "length";
         }
@@ -415,12 +474,15 @@ private:
             std::lock_guard<std::mutex> lock(mutex_);
             double prompt_seconds = 0, gen_seconds = 0;
             std::size_t reused = 0;
-            const Generated g = generate(r, [](const std::string&, bool) { return true; }, prompt_seconds, gen_seconds, reused);
+            Generated g = generate(r, [](const std::string&, bool) { return true; }, prompt_seconds, gen_seconds, reused);
             if (options_.verbose) log(r, g, prompt_seconds, gen_seconds, reused);
+            const json calls = chat ? tool_calls_of(g, r, id) : json::array();
+            if (!calls.empty() && g.finish_reason == "stop") g.finish_reason = "tool_calls";
             json choice = {{"index", 0}, {"finish_reason", g.finish_reason}};
             if (chat) {
                 choice["message"] = {{"role", "assistant"}, {"content", g.text}};
                 if (!g.reasoning.empty()) choice["message"]["reasoning_content"] = g.reasoning;
+                if (!calls.empty()) choice["message"]["tool_calls"] = calls;
             } else {
                 choice["text"] = g.reasoning.empty() ? g.text : g.reasoning + g.text;
             }
@@ -447,7 +509,7 @@ private:
             if (chat) send(chunk(id, chat, json{{"role", "assistant"}, {"content", ""}}, std::nullopt));
             double prompt_seconds = 0, gen_seconds = 0;
             std::size_t reused = 0;
-            const Generated g = generate(
+            Generated g = generate(
                 r,
                 [&](const std::string& piece, bool reasoning) {
                     const json delta = chat ? json{{reasoning ? "reasoning_content" : "content", piece}} : json(piece);
@@ -455,6 +517,17 @@ private:
                 },
                 prompt_seconds, gen_seconds, reused);
             if (options_.verbose) log(r, g, prompt_seconds, gen_seconds, reused);
+            if (chat && g.finish_reason != "abort") {
+                // The calls (and, for Llama 3, the held-back content) go out once the answer is known.
+                const std::size_t streamed = r.hold_content ? 0 : g.text.size();
+                json calls = tool_calls_of(g, r, id);
+                if (g.text.size() > streamed) send(chunk(id, chat, json{{"content", g.text.substr(streamed)}}, std::nullopt));
+                if (!calls.empty()) {
+                    for (std::size_t i = 0; i < calls.size(); ++i) calls[i]["index"] = i;
+                    send(chunk(id, chat, json{{"tool_calls", calls}}, std::nullopt));
+                    if (g.finish_reason == "stop") g.finish_reason = "tool_calls";
+                }
+            }
             if (g.finish_reason != "abort") {
                 json last = chunk(id, chat, chat ? json::object() : json(""), g.finish_reason);
                 last["usage"] = {{"prompt_tokens", r.prompt.size()}, {"completion_tokens", g.tokens},

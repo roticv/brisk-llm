@@ -88,6 +88,30 @@ def main():
                                           "temperature": 0, "max_tokens": 40, "reasoning_format": "inline"})
         assert d["choices"][0]["message"]["content"].startswith("<think>"), d["choices"][0]["message"]
 
+        # Tool calls: a <tool_call> block becomes tool_calls with finish_reason "tool_calls", in both
+        # forms; the result fed back as a tool message gets a plain answer.
+        tools = [{"type": "function", "function": {"name": "get_weather", "description": "Current weather for a city",
+                                                    "parameters": {"type": "object", "properties": {"city": {"type": "string"}},
+                                                                   "required": ["city"]}}}]
+        ask = [{"role": "user", "content": "What is the weather in Paris right now? Use the tool."}]
+        d = post("/v1/chat/completions", {"messages": ask, "tools": tools, "temperature": 0, "max_tokens": 600})
+        c = d["choices"][0]
+        assert c["finish_reason"] == "tool_calls", c
+        call = c["message"]["tool_calls"][0]
+        assert call["function"]["name"] == "get_weather" and json.loads(call["function"]["arguments"])["city"] == "Paris", call
+        events = post("/v1/chat/completions", {"messages": ask, "tools": tools, "temperature": 0, "max_tokens": 600, "stream": True},
+                      stream=True)
+        chunks = [json.loads(e)["choices"][0] for e in events[:-1]]
+        streamed = [x["delta"]["tool_calls"][0] for x in chunks if "tool_calls" in x["delta"]]
+        assert len(streamed) == 1 and streamed[0]["function"] == call["function"], streamed
+        assert chunks[-1]["finish_reason"] == "tool_calls", chunks[-1]
+        d = post("/v1/chat/completions",
+                 {"messages": ask + [{"role": "assistant", "content": "", "tool_calls": [call]},
+                                     {"role": "tool", "tool_call_id": call["id"], "content": '{"temperature_c": 14, "sky": "overcast"}'}],
+                  "tools": tools, "temperature": 0, "max_tokens": 400})
+        c = d["choices"][0]
+        assert c["finish_reason"] == "stop" and "14" in c["message"]["content"] and "tool_calls" not in c["message"], c
+
         # Errors are OpenAI-shaped.
         try:
             post("/v1/chat/completions", {"messages": "no"})
