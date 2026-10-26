@@ -71,6 +71,23 @@ def main():
         text = "".join(json.loads(e)["choices"][0]["delta"].get("content", "") for e in events[:-1])
         assert "ありがとう" in text, text
 
+        # Qwen3 with thinking on: the <think> block arrives as reasoning_content, the answer as content,
+        # in both forms; reasoning_format "inline" keeps the old pass-through.
+        d = post("/v1/chat/completions", {"messages": [{"role": "user", "content": "What is 2+2? Answer briefly."}],
+                                          "temperature": 0, "max_tokens": 400})
+        m = d["choices"][0]["message"]
+        assert m.get("reasoning_content"), m
+        assert "<think>" not in m["content"] and "<think>" not in m["reasoning_content"], m
+        events = post("/v1/chat/completions", {"messages": [{"role": "user", "content": "What is 2+2? Answer briefly."}],
+                                                 "temperature": 0, "max_tokens": 400, "stream": True}, stream=True)
+        deltas = [json.loads(e)["choices"][0]["delta"] for e in events[:-1]]
+        reasoning = "".join(x.get("reasoning_content", "") for x in deltas)
+        content = "".join(x.get("content", "") for x in deltas)
+        assert reasoning == m["reasoning_content"] and content == m["content"], (reasoning[:40], content[:40])
+        d = post("/v1/chat/completions", {"messages": [{"role": "user", "content": "What is 2+2? Answer briefly."}],
+                                          "temperature": 0, "max_tokens": 40, "reasoning_format": "inline"})
+        assert d["choices"][0]["message"]["content"].startswith("<think>"), d["choices"][0]["message"]
+
         # Errors are OpenAI-shaped.
         try:
             post("/v1/chat/completions", {"messages": "no"})

@@ -92,6 +92,7 @@ struct Request {
     std::vector<std::string> stop;
     bool stream = false;
     bool echo_prompt_tokens = false;
+    bool separate_reasoning = true;  // a <think> block goes to reasoning_content rather than inline in content
 };
 
 class Server {
@@ -259,6 +260,8 @@ private:
             }
         }
         r.stream = body.value("stream", false);
+        // reasoning_format: "separate" (the default, as llama-server and the DeepSeek API do) or "inline".
+        r.separate_reasoning = body.value("reasoning_format", "separate") != "inline";
         return r;
     }
 
@@ -280,13 +283,15 @@ private:
     }
 
     struct Generated {
-        std::string text;
+        std::string text;       // the answer
+        std::string reasoning;  // the <think> block's text, when separated
         std::size_t tokens = 0;
         std::string finish_reason = "stop";
     };
 
-    // Generates for one request, calling emit(text) with each piece of decoded
-    // text; emit returns false to stop (client gone). Holds the session lock.
+    // Generates for one request, calling emit(text, reasoning) with each piece of
+    // decoded text (reasoning: the piece belongs to a <think> block); emit returns
+    // false to stop (client gone). Holds the session lock.
     template <typename Emit>
     Generated generate(const Request& r, Emit emit, double& prompt_seconds, double& gen_seconds, std::size_t& reused) {
         Generated g;
@@ -299,6 +304,12 @@ private:
         std::size_t longest_stop = 0;
         for (const std::string& s : r.stop) longest_stop = std::max(longest_stop, s.size());
         bool stopped_by_string = false;
+        bool reasoning = false;     // inside a <think> block (Qwen3, DeepSeek-R1: the tags are single tokens)
+        bool skip_newlines = false; // the newlines the templates put after the tags are dropped
+        auto flush = [&](const std::string& piece) {
+            (reasoning ? g.reasoning : g.text) += piece;
+            return emit(piece, reasoning);
+        };
         while (g.tokens < r.max_tokens) {
             if (g_stopping.load()) {  // shutting down: end this answer here, as a truncation
                 g.finish_reason = "length";
@@ -308,7 +319,28 @@ private:
             if (tokenizer_.is_end_of_generation(next)) break;
             ++g.tokens;
             cached_.push_back(next);
-            if (!tokenizer_.is_control(next)) pending.append(tokenizer_.piece(next));
+            const std::string_view piece_text = tokenizer_.piece(next);
+            if (r.separate_reasoning && (piece_text == "<think>" || piece_text == "</think>")) {
+                if (!pending.empty()) {  // whatever was held back belongs to the block that just ended
+                    if (!flush(pending)) {
+                        g.finish_reason = "abort";
+                        break;
+                    }
+                    pending.clear();
+                }
+                reasoning = piece_text == "<think>";
+                skip_newlines = true;
+                if (g.tokens < r.max_tokens) logits = engine_->eval(next);
+                continue;
+            }
+            if (!tokenizer_.is_control(next)) {
+                std::string_view text = piece_text;
+                if (skip_newlines) {
+                    while (!text.empty() && text.front() == '\n') text.remove_prefix(1);
+                    skip_newlines = text.empty();
+                }
+                pending.append(text);
+            }
             // Stop strings: the last longest_stop - 1 bytes are always held back,
             // so a stop string can only appear within `pending`.
             for (const std::string& s : r.stop) {
@@ -325,8 +357,7 @@ private:
             if (ready > 0) {
                 const std::string piece = pending.substr(0, ready);
                 pending.erase(0, ready);
-                g.text += piece;
-                if (!emit(piece)) {
+                if (!flush(piece)) {
                     g.finish_reason = "abort";
                     break;
                 }
@@ -334,10 +365,7 @@ private:
             if (stopped_by_string) break;
             if (g.tokens < r.max_tokens) logits = engine_->eval(next);
         }
-        if (!pending.empty() && g.finish_reason != "abort") {
-            g.text += pending;
-            emit(pending);
-        }
+        if (!pending.empty() && g.finish_reason != "abort") flush(pending);
         if (g.finish_reason != "abort" && !g_stopping.load()) {
             g.finish_reason = stopped_by_string || g.tokens < r.max_tokens ? "stop" : "length";
         }
@@ -387,11 +415,15 @@ private:
             std::lock_guard<std::mutex> lock(mutex_);
             double prompt_seconds = 0, gen_seconds = 0;
             std::size_t reused = 0;
-            const Generated g = generate(r, [](const std::string&) { return true; }, prompt_seconds, gen_seconds, reused);
+            const Generated g = generate(r, [](const std::string&, bool) { return true; }, prompt_seconds, gen_seconds, reused);
             if (options_.verbose) log(r, g, prompt_seconds, gen_seconds, reused);
             json choice = {{"index", 0}, {"finish_reason", g.finish_reason}};
-            if (chat) choice["message"] = {{"role", "assistant"}, {"content", g.text}};
-            else choice["text"] = g.text;
+            if (chat) {
+                choice["message"] = {{"role", "assistant"}, {"content", g.text}};
+                if (!g.reasoning.empty()) choice["message"]["reasoning_content"] = g.reasoning;
+            } else {
+                choice["text"] = g.reasoning.empty() ? g.text : g.reasoning + g.text;
+            }
             const json out = {{"id", id},
                               {"object", chat ? "chat.completion" : "text_completion"},
                               {"created", std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count()},
@@ -417,8 +449,9 @@ private:
             std::size_t reused = 0;
             const Generated g = generate(
                 r,
-                [&](const std::string& piece) {
-                    return send(chunk(id, chat, chat ? json{{"content", piece}} : json(piece), std::nullopt));
+                [&](const std::string& piece, bool reasoning) {
+                    const json delta = chat ? json{{reasoning ? "reasoning_content" : "content", piece}} : json(piece);
+                    return send(chunk(id, chat, delta, std::nullopt));
                 },
                 prompt_seconds, gen_seconds, reused);
             if (options_.verbose) log(r, g, prompt_seconds, gen_seconds, reused);
