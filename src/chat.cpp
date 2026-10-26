@@ -189,6 +189,7 @@ ChatFormat chat_format_of(const GgufFile& file) {
         case Architecture::Gemma4: return ChatFormat::Gemma4;
         case Architecture::BitNet: return ChatFormat::BitNet;
         case Architecture::Phi3: return ChatFormat::Phi;
+        case Architecture::LFM2: return ChatFormat::ChatML;
     }
     throw std::runtime_error("chat: no template for this file");
 }

@@ -172,6 +172,9 @@ inline void matmul(const BlockQ4_0* w, std::size_t rows, std::size_t cols, const
 // Dot16(w, x) returns the 16 products of two 8-bit vectors as four 32-bit
 // partial sums; the variants differ only in how they compute it.
 
+// Four consecutive halves as floats.
+inline float32x4_t half4_to_float4(const std::uint16_t* h) { return vcvt_f32_f16(vreinterpret_f16_u16(vld1_u16(h))); }
+
 inline float32x4_t half4_to_float(std::uint16_t h) {
     return vcvt_f32_f16(vreinterpret_f16_u16(vdup_n_u16(h)));
 }

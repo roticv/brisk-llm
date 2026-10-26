@@ -24,6 +24,7 @@ std::size_t block_elements(WeightFormat format) {
         case WeightFormat::Q6_K:
         case WeightFormat::TQ2_0:
         case WeightFormat::TQ2_0x4:
+        case WeightFormat::TQ2_0x16:
         case WeightFormat::Q4_Kx4:
         case WeightFormat::Q6_Kx4: return kSuperBlockSize;
     }
@@ -44,6 +45,7 @@ std::size_t block_bytes(WeightFormat format) {
         case WeightFormat::Q6_K: return sizeof(BlockQ6_K);
         case WeightFormat::TQ2_0: return sizeof(BlockTQ2_0);
         case WeightFormat::TQ2_0x4: return sizeof(BlockTQ2_0x4) / 4;  // per row
+        case WeightFormat::TQ2_0x16: return sizeof(BlockTQ2_0x16) / 16;
         case WeightFormat::Q4_Kx4: return sizeof(BlockQ4_Kx4) / 4;
         case WeightFormat::Q6_Kx4: return sizeof(BlockQ6_Kx4) / 4;
     }
@@ -52,7 +54,8 @@ std::size_t block_bytes(WeightFormat format) {
 
 bool takes_q8_k(WeightFormat format) {
     return format == WeightFormat::Q4_K || format == WeightFormat::Q5_K || format == WeightFormat::Q6_K || format == WeightFormat::TQ2_0 ||
-           format == WeightFormat::TQ2_0x4 || format == WeightFormat::Q4_Kx4 || format == WeightFormat::Q6_Kx4;
+           format == WeightFormat::TQ2_0x4 || format == WeightFormat::TQ2_0x16 || format == WeightFormat::Q4_Kx4 ||
+           format == WeightFormat::Q6_Kx4;
 }
 
 float half_to_float(std::uint16_t half) {
@@ -138,7 +141,9 @@ void quantize_q8_0(const float* x, BlockQ8_0* out, std::size_t count) {
     }
 }
 
-void quantize_q8_k(const float* x, BlockQ8_K* out, std::size_t count) {
+int activation_bits(WeightFormat format) { return format == WeightFormat::TQ2_0x16 ? 7 : 8; }
+
+void quantize_q8_k(const float* x, BlockQ8_K* out, std::size_t count, int bits) {
     for (std::size_t b = 0; b < count / kSuperBlockSize; ++b) {
         const float* block = x + b * kSuperBlockSize;
         BlockQ8_K& y = out[b];
@@ -158,11 +163,12 @@ void quantize_q8_k(const float* x, BlockQ8_K* out, std::size_t count) {
             std::memset(y.bsums, 0, sizeof(y.bsums));
             continue;
         }
-        const float inverse = -127.0f / max;
+        const float extreme = bits == 7 ? 63.0f : 127.0f;
+        const float inverse = -extreme / max;
         y.d = 1.0f / inverse;
 #if defined(__aarch64__)
         const float32x4_t vinv = vdupq_n_f32(inverse);
-        const int32x4_t cap = vdupq_n_s32(127);
+        const int32x4_t cap = vdupq_n_s32(static_cast<std::int32_t>(extreme));
         for (std::size_t g = 0; g < kSuperBlockSize / 16; ++g) {
             const float* p = block + g * 16;
             const int32x4_t v0 = vminq_s32(vcvtnq_s32_f32(vmulq_f32(vld1q_f32(p), vinv)), cap);
@@ -623,6 +629,77 @@ void repack_tq2_0x4(const BlockTQ2_0* in, std::size_t rows, std::size_t blocks, 
                 }
             }
         }
+    }
+}
+
+// The 128 pair indices (w0 * 3 + w1) of one TQ2_0 block, in column order.
+void tq2_0_pair_indices(const BlockTQ2_0& block, std::uint8_t idx[128]) {
+    // Bytes j + m (j in {0, 32}) hold elements j * 4 + 32 l + m at bits 2l: 32 consecutive
+    // elements per (j, l), so pairs are adjacent lanes of one decoded vector.
+    for (int j = 0; j < 2; ++j) {
+        for (int l = 0; l < 4; ++l) {
+            std::uint8_t codes[32];
+#if defined(__aarch64__)
+            const uint8x16_t mask = vdupq_n_u8(3);
+            for (int h = 0; h < 2; ++h) {
+                const uint8x16_t v = vld1q_u8(block.qs + 32 * j + 16 * h);
+                const uint8x16_t c = vandq_u8(l == 0 ? v : l == 1 ? vshrq_n_u8(v, 2) : l == 2 ? vshrq_n_u8(v, 4) : vshrq_n_u8(v, 6), mask);
+                vst1q_u8(codes + 16 * h, c);
+            }
+#else
+            for (int m = 0; m < 32; ++m) codes[m] = static_cast<std::uint8_t>((block.qs[32 * j + m] >> (2 * l)) & 3);
+#endif
+            std::uint8_t* out = idx + (j * 128 + 32 * l) / 2;  // these 32 elements start at j * 128 + 32 l
+            for (int m = 0; m < 32; m += 2) out[m / 2] = static_cast<std::uint8_t>(codes[m] * 3 + codes[m + 1]);
+        }
+    }
+}
+
+void repack_tq2_0x16(const BlockTQ2_0* in, std::size_t rows, std::size_t blocks, BlockTQ2_0x16* out) {
+    for (std::size_t g = 0; g < rows / 16; ++g) {
+        for (std::size_t b = 0; b < blocks; ++b) {
+            BlockTQ2_0x16& packed = out[g * blocks + b];
+            std::memset(packed.qs, 0, sizeof(packed.qs));
+            for (std::size_t r = 0; r < 16; ++r) {
+                const BlockTQ2_0& block = in[(g * 16 + r) * blocks + b];
+                packed.d[r] = block.d;
+                std::uint8_t idx[128];
+                tq2_0_pair_indices(block, idx);
+                for (std::size_t p = 0; p < 128; p += 2) packed.qs[(p / 2) * 16 + r] = static_cast<std::uint8_t>(idx[p] | (idx[p + 1] << 4));
+            }
+        }
+    }
+}
+
+namespace {
+inline int tq2_0x16_pair_index(const BlockTQ2_0x16& block, std::size_t r, std::size_t p) {
+    return (block.qs[(p / 2) * 16 + r] >> (4 * (p % 2))) & 0xF;
+}
+}  // namespace
+
+void dequantize_tq2_0x16_row(const BlockTQ2_0x16* group, std::size_t row_in_group, float* out, std::size_t count) {
+    for (std::size_t b = 0; b < count / kSuperBlockSize; ++b) {
+        const float d = half_to_float(group[b].d[row_in_group]);
+        for (std::size_t p = 0; p < 128; ++p) {
+            const int idx = tq2_0x16_pair_index(group[b], row_in_group, p);
+            out[b * kSuperBlockSize + 2 * p] = static_cast<float>(idx / 3 - 1) * d;
+            out[b * kSuperBlockSize + 2 * p + 1] = static_cast<float>(idx % 3 - 1) * d;
+        }
+    }
+}
+
+void dot_tq2_0x16_q8_k(const BlockTQ2_0x16* w, const BlockQ8_K* x, std::size_t blocks, float out[16]) {
+    for (std::size_t r = 0; r < 16; ++r) {
+        float sum = 0.0f;
+        for (std::size_t b = 0; b < blocks; ++b) {
+            std::int32_t acc = 0;
+            for (std::size_t p = 0; p < 128; ++p) {
+                const int idx = tq2_0x16_pair_index(w[b], r, p);
+                acc += (idx / 3 - 1) * x[b].qs[2 * p] + (idx % 3 - 1) * x[b].qs[2 * p + 1];
+            }
+            sum += static_cast<float>(acc) * half_to_float(w[b].d[r]) * x[b].d;
+        }
+        out[r] = sum;
     }
 }
 

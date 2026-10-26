@@ -26,7 +26,7 @@ float bfloat_to_float(std::uint16_t b) {
 
 void embedding_row(const Matrix& m, std::size_t r, std::span<float> out) {
     const bool grouped = m.format == WeightFormat::Q4_0x4 || m.format == WeightFormat::Q5_0x4 || m.format == WeightFormat::TQ2_0x4 ||
-                         m.format == WeightFormat::Q4_Kx4 || m.format == WeightFormat::Q6_Kx4;
+                         m.format == WeightFormat::TQ2_0x16 || m.format == WeightFormat::Q4_Kx4 || m.format == WeightFormat::Q6_Kx4;
     const std::byte* row = m.format == WeightFormat::F32 || grouped ? nullptr : m.row(r);
     switch (m.format) {
         case WeightFormat::F32: {
@@ -50,6 +50,10 @@ void embedding_row(const Matrix& m, std::size_t r, std::span<float> out) {
         case WeightFormat::Q5_K: dequantize_q5_k(reinterpret_cast<const BlockQ5_K*>(row), out.data(), m.cols); break;
         case WeightFormat::Q6_K: dequantize_q6_k(reinterpret_cast<const BlockQ6_K*>(row), out.data(), m.cols); break;
         case WeightFormat::TQ2_0: dequantize_tq2_0(reinterpret_cast<const BlockTQ2_0*>(row), out.data(), m.cols); break;
+        case WeightFormat::TQ2_0x16:
+            dequantize_tq2_0x16_row(reinterpret_cast<const BlockTQ2_0x16*>(m.bytes.data() + (r / 16) * 16 * m.row_bytes()),
+                                    r % 16, out.data(), m.cols);
+            break;
         case WeightFormat::TQ2_0x4:
             dequantize_tq2_0x4_row(reinterpret_cast<const BlockTQ2_0x4*>(m.bytes.data() + (r / 4) * 4 * m.row_bytes()),
                                    r % 4, out.data(), m.cols);
@@ -446,6 +450,14 @@ Matrix Model::load_matrix_rows(const GgufFile& file, std::string_view name, std:
                           reinterpret_cast<BlockQ5_0x4*>(packed.data()));
             m.format = WeightFormat::Q5_0x4;
             m.bytes = packed;
+        } else if (m.format == WeightFormat::TQ2_0 && rows % 16 == 0 && repack_ && !kernels::prefers_q4_0x4()) {
+            // Without i8mm the lookup-table kernel is the fast ternary path: 16-row groups of pair indices.
+            const std::size_t blocks = cols / kSuperBlockSize;
+            std::vector<std::byte>& packed = packed_.emplace_back(rows / 16 * blocks * sizeof(BlockTQ2_0x16));
+            repack_tq2_0x16(reinterpret_cast<const BlockTQ2_0*>(m.bytes.data()), rows, blocks,
+                            reinterpret_cast<BlockTQ2_0x16*>(packed.data()));
+            m.format = WeightFormat::TQ2_0x16;
+            m.bytes = packed;
         } else if (m.format == WeightFormat::TQ2_0 && rows % 4 == 0 && repack_ && kernels::prefers_q4_0x4()) {
             const std::size_t blocks = cols / kSuperBlockSize;
             std::vector<std::byte>& packed = packed_.emplace_back(rows / 4 * blocks * sizeof(BlockTQ2_0x4));
@@ -513,8 +525,10 @@ void Session::multiply(std::span<const Target> targets, const float* x, std::siz
     for (std::size_t i = 0; i < targets.size(); ++i) {
         const Matrix& m = *targets[i].matrix;
         if (m.cols != cols) fail("fused multiply needs matrices with the same input size");
+        // Chunks are multiples of the layout's row group (4, or 16 for the lookup-table ternary layout).
+        const std::size_t group = m.format == WeightFormat::TQ2_0x16 ? 16 : 4;
         plans[i].chunk = (n == 1 ? std::clamp<std::size_t>(m.rows / (pool_.size() * 8), 16, 256)
-                                 : std::clamp<std::size_t>(m.rows / (pool_.size() * 4), 4, 64)) / 4 * 4;
+                                 : std::clamp<std::size_t>(m.rows / (pool_.size() * 4), group, 64)) / group * group;
         plans[i].first_task = total_tasks;
         total_tasks += (m.rows + plans[i].chunk - 1) / plans[i].chunk;
     }
@@ -526,8 +540,15 @@ void Session::multiply(std::span<const Target> targets, const float* x, std::siz
         if (t.matrix->format == WeightFormat::F32) continue;
         const std::size_t blocks = cols / block_elements(t.matrix->format);
         if (takes_q8_k(t.matrix->format) && !have_q8_k) {
+            // The targets sharing this quantisation must want the same width (a BitNet layer's matrices all do).
+            const int bits = activation_bits(t.matrix->format);
+            for (const Target& u : targets) {
+                if (u.matrix->format != WeightFormat::F32 && takes_q8_k(u.matrix->format) && activation_bits(u.matrix->format) != bits) {
+                    fail("fused multiply mixes activation widths");
+                }
+            }
             q8_k_.resize(n * blocks);
-            pool_.run(n, [&](std::size_t r) { quantize_q8_k(x + r * cols, q8_k_.data() + r * blocks, cols); });
+            pool_.run(n, [&](std::size_t r) { quantize_q8_k(x + r * cols, q8_k_.data() + r * blocks, cols, bits); });
             have_q8_k = true;
         } else if (!takes_q8_k(t.matrix->format) && !have_q8_0) {
             q8_0_.resize(n * blocks);
@@ -546,7 +567,7 @@ void Session::multiply(std::span<const Target> targets, const float* x, std::siz
         plans[i].kernels = kernels::kernels_for(m.format);
         plans[i].activations = takes_q8_k(m.format) ? static_cast<const void*>(q8_k_.data())
                                                     : static_cast<const void*>(q8_0_.data());
-        if (n > 1 && plans[i].kernels.prepare != nullptr) {
+        if ((n > 1 || plans[i].kernels.prepared_matvec) && plans[i].kernels.prepare != nullptr) {
             bool shared = false;
             for (std::size_t j = 0; j < i && !shared; ++j) {
                 if (plans[j].kernels.prepare == plans[i].kernels.prepare && targets[j].matrix->format == m.format) {

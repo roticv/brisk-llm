@@ -13,7 +13,7 @@ constexpr std::size_t kBlockSize = 32;  // weights per block for Q4_0 and Q8_0
 
 // Storage formats of weight matrices that the engine can multiply by.
 // Q4_0x4 is Q4_0 repacked at load time (see BlockQ4_0x4); it never appears in files.
-enum class WeightFormat { F32, Q4_0, Q4_1, Q5_0, Q8_0, Q4_K, Q5_K, Q6_K, Q4_0x4, Q5_0x4, TQ2_0, TQ2_0x4, Q4_Kx4, Q6_Kx4 };
+enum class WeightFormat { F32, Q4_0, Q4_1, Q5_0, Q8_0, Q4_K, Q5_K, Q6_K, Q4_0x4, Q5_0x4, TQ2_0, TQ2_0x4, TQ2_0x16, Q4_Kx4, Q6_Kx4 };
 
 // Weights per block and bytes per block of a quantised format.
 std::size_t block_elements(WeightFormat format);
@@ -141,6 +141,21 @@ static_assert(sizeof(BlockTQ2_0x4) == 264);
 
 // Repacks `rows` (a multiple of 4) rows of `blocks` TQ2_0 blocks each.
 void repack_tq2_0x4(const BlockTQ2_0* in, std::size_t rows, std::size_t blocks, BlockTQ2_0x4* out);
+
+// Ternary weights of 16 consecutive rows, one 256-column block each, for the
+// lookup-table kernel: the block's 128 column pairs, taken two at a time, give
+// 64 chunks of 16 bytes; byte i of chunk k holds row i's index for pair 2k in
+// the low nibble and for pair 2k + 1 in the high, the index being w0 * 3 + w1
+// with the codes 0..2. Then the 16 rows' scales. Same bytes per row as TQ2_0.
+struct BlockTQ2_0x16 {
+    std::uint8_t qs[1024];
+    std::uint16_t d[16];
+};
+static_assert(sizeof(BlockTQ2_0x16) == 1056);
+
+void repack_tq2_0x16(const BlockTQ2_0* in, std::size_t rows, std::size_t blocks, BlockTQ2_0x16* out);
+void dequantize_tq2_0x16_row(const BlockTQ2_0x16* group, std::size_t row_in_group, float* out, std::size_t count);
+
 void dequantize_tq2_0x4_row(const BlockTQ2_0x4* group, std::size_t row_in_group, float* out, std::size_t count);
 
 // One Q4_K block from each of four consecutive rows, interleaved for the
@@ -192,7 +207,7 @@ std::uint16_t float_to_half(float f);  // round to nearest, ties to even
 
 // `count` must be a multiple of the format's block size.
 void quantize_q8_0(const float* x, BlockQ8_0* out, std::size_t count);
-void quantize_q8_k(const float* x, BlockQ8_K* out, std::size_t count);
+void quantize_q8_k(const float* x, BlockQ8_K* out, std::size_t count, int bits = 8);
 void dequantize_q4_0(const BlockQ4_0* blocks, float* out, std::size_t count);
 void dequantize_q4_1(const BlockQ4_1* blocks, float* out, std::size_t count);
 void dequantize_q5_0(const BlockQ5_0* blocks, float* out, std::size_t count);
@@ -227,6 +242,12 @@ float dot_q6_k_q8_k(const BlockQ6_K* w, const BlockQ8_K* x, std::size_t blocks);
 float dot_tq2_0_q8_k(const BlockTQ2_0* w, const BlockQ8_K* x, std::size_t blocks);
 // All four rows of a packed ternary group at once: out[0..3].
 void dot_tq2_0x4_q8_k(const BlockTQ2_0x4* w, const BlockQ8_K* x, std::size_t blocks, float out[4]);
+// The 16 rows of a lookup-layout group against one activation row (exact, any activation width).
+void dot_tq2_0x16_q8_k(const BlockTQ2_0x16* w, const BlockQ8_K* x, std::size_t blocks, float out[16]);
+
+// Activation bits a format's kernels take: 8, or 7 for the lookup-table ternary
+// layout (a pair's partial sum must fit a byte; it costs BitNet 0.08% perplexity).
+int activation_bits(WeightFormat format);
 void dot_q4_kx4_q8_k(const BlockQ4_Kx4* w, const BlockQ8_K* x, std::size_t blocks, float out[4]);
 void dot_q6_kx4_q8_k(const BlockQ6_Kx4* w, const BlockQ8_K* x, std::size_t blocks, float out[4]);
 

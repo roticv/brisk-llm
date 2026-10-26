@@ -35,6 +35,7 @@ struct KernelSet {
     Matmul matmul;
     Prepare prepare = nullptr;
     PreparedBytes prepared_bytes = nullptr;
+    bool prepared_matvec = false;  // the matvec takes the prepared form too (the lookup-table ternary kernel)
 };
 
 // The best kernels for `format` on this CPU. Throws std::runtime_error for F32.
@@ -65,6 +66,13 @@ void matmul_q6_kx4_i8mm(const void* w, std::size_t rows, std::size_t cols, const
 // Activation preparation shared by the smmla tiles of all 256-element formats.
 void prepare_k_i8mm(const void* x, std::size_t n, std::size_t blocks, void* out);
 std::size_t prepared_bytes_k_i8mm(std::size_t n, std::size_t blocks);
+// The lookup-table ternary kernel (any NEON; takes 7-bit activations, see
+// activation_bits). Both entries take the prepared tables, not the activations.
+void prepare_tq2_0x16(const void* x, std::size_t n, std::size_t blocks, void* out);
+std::size_t prepared_bytes_tq2_0x16(std::size_t n, std::size_t blocks);
+void matvec_tq2_0x16_neon(const void* w, std::size_t rows, std::size_t cols, const void* x, float* out);
+void matmul_tq2_0x16_neon(const void* w, std::size_t rows, std::size_t cols, const void* x, std::size_t n, float* out,
+                          std::size_t out_stride);
 void matvec_tq2_0x4_dotprod(const void* w, std::size_t rows, std::size_t cols, const void* x, float* out);
 void matmul_tq2_0x4_i8mm(const void* w, std::size_t rows, std::size_t cols, const void* x, std::size_t n, float* out,
                       std::size_t out_stride);

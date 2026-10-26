@@ -107,6 +107,25 @@ void matmul_q4_0x4_generic(const void* w, std::size_t rows, std::size_t cols, co
 
 }  // namespace
 
+void matvec_tq2_0x16_generic(const void* w, std::size_t rows, std::size_t cols, const void* x, float* out) {
+    const auto* weights = static_cast<const BlockTQ2_0x16*>(w);
+    const auto* activations = static_cast<const BlockQ8_K*>(x);
+    const std::size_t blocks = cols / kSuperBlockSize;
+    for (std::size_t g = 0; g < rows / 16; ++g) dot_tq2_0x16_q8_k(weights + g * blocks, activations, blocks, out + 16 * g);
+}
+
+void matmul_tq2_0x16_generic(const void* w, std::size_t rows, std::size_t cols, const void* x, std::size_t n, float* out,
+                             std::size_t out_stride) {
+    const auto* weights = static_cast<const BlockTQ2_0x16*>(w);
+    const auto* activations = static_cast<const BlockQ8_K*>(x);
+    const std::size_t blocks = cols / kSuperBlockSize;
+    for (std::size_t g = 0; g < rows / 16; ++g) {
+        for (std::size_t t = 0; t < n; ++t) {
+            dot_tq2_0x16_q8_k(weights + g * blocks, activations + t * blocks, blocks, out + t * out_stride + 16 * g);
+        }
+    }
+}
+
 KernelSet generic_kernels(WeightFormat format) {
     switch (format) {
         case WeightFormat::Q4_0x4:
@@ -115,6 +134,8 @@ KernelSet generic_kernels(WeightFormat format) {
             return {matvec_q5_0x4_generic, matmul_q5_0x4_generic};
         case WeightFormat::TQ2_0x4:
             return {matvec_tq2_0x4_generic, matmul_tq2_0x4_generic};
+        case WeightFormat::TQ2_0x16:
+            return {matvec_tq2_0x16_generic, matmul_tq2_0x16_generic};
         case WeightFormat::Q4_Kx4:
             return {matvec_grouped_k_generic<BlockQ4_Kx4, dot_q4_kx4_q8_k>, matmul_grouped_k_generic<BlockQ4_Kx4, dot_q4_kx4_q8_k>};
         case WeightFormat::Q6_Kx4:
@@ -177,6 +198,9 @@ std::vector<NamedKernels> neon_kernels(WeightFormat format) {
             if (dotprod && cpu_features().i8mm) {
                 out.push_back({"i8mm", {matvec_tq2_0x4_dotprod, matmul_tq2_0x4_i8mm, prepare_k_i8mm, prepared_bytes_k_i8mm}});
             }
+            break;
+        case WeightFormat::TQ2_0x16:
+            out.push_back({"neon", {matvec_tq2_0x16_neon, matmul_tq2_0x16_neon, prepare_tq2_0x16, prepared_bytes_tq2_0x16, true}});
             break;
         case WeightFormat::Q4_Kx4:
             if (dotprod && cpu_features().i8mm) {

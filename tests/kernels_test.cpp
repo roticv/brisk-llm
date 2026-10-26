@@ -62,6 +62,10 @@ void dequantize_row(brisk::WeightFormat format, const std::uint8_t* w, std::size
         case brisk::WeightFormat::Q5_K: brisk::dequantize_q5_k(reinterpret_cast<const brisk::BlockQ5_K*>(row), out.data(), kCols); break;
         case brisk::WeightFormat::Q6_K: brisk::dequantize_q6_k(reinterpret_cast<const brisk::BlockQ6_K*>(row), out.data(), kCols); break;
         case brisk::WeightFormat::TQ2_0: brisk::dequantize_tq2_0(reinterpret_cast<const brisk::BlockTQ2_0*>(row), out.data(), kCols); break;
+        case brisk::WeightFormat::TQ2_0x16:
+            brisk::dequantize_tq2_0x16_row(reinterpret_cast<const brisk::BlockTQ2_0x16*>(w + (r / 16) * blocks * sizeof(brisk::BlockTQ2_0x16)),
+                                           r % 16, out.data(), kCols);
+            break;
         case brisk::WeightFormat::TQ2_0x4:
             brisk::dequantize_tq2_0x4_row(reinterpret_cast<const brisk::BlockTQ2_0x4*>(w + (r / 4) * blocks * sizeof(brisk::BlockTQ2_0x4)),
                                           r % 4, out.data(), kCols);
@@ -117,7 +121,9 @@ void check_format(brisk::WeightFormat format, std::size_t rows, const std::uint8
     const void* activations = nullptr;
     std::size_t activation_bytes = 0;
     if (brisk::takes_q8_k(format)) {
-        for (std::size_t t = 0; t < kTokens; ++t) brisk::quantize_q8_k(x.data() + t * kCols, q8_k.data() + t * blocks, kCols);
+        for (std::size_t t = 0; t < kTokens; ++t) {
+            brisk::quantize_q8_k(x.data() + t * kCols, q8_k.data() + t * blocks, kCols, brisk::activation_bits(format));
+        }
         activations = q8_k.data();
         activation_bytes = blocks * sizeof(brisk::BlockQ8_K);
     } else {
@@ -149,13 +155,20 @@ void check_format(brisk::WeightFormat format, std::size_t rows, const std::uint8
         for (std::size_t t = 0; t < kTokens; ++t) {
             std::vector<float> single(rows, 12345.0f);
             const auto* xt = static_cast<const std::uint8_t*>(activations) + t * activation_bytes;
-            v.kernels.matvec(w, rows, kCols, xt, single.data());
+            if (v.kernels.prepared_matvec) {  // the lookup kernel's matvec takes one token's prepared form
+                std::vector<std::uint8_t> one(v.kernels.prepared_bytes(1, blocks));
+                v.kernels.prepare(xt, 1, blocks, one.data());
+                v.kernels.matvec(w, rows, kCols, one.data(), single.data());
+            } else {
+                v.kernels.matvec(w, rows, kCols, xt, single.data());
+            }
             for (std::size_t r = 0; r < rows; ++r) {
                 const float ref = reference[t * rows + r];
                 // Each 8-bit activation is off by up to half a step (max|x| / 254); over a
                 // row the errors add like a random walk, so the bound is the row's 2-norm
                 // times that step, with a 4x margin.
-                const float tolerance = 0.02f + 4.0f * row_norm[r] * x_max[t] / 254.0f;
+                const float step = brisk::activation_bits(format) == 7 ? 126.0f : 254.0f;
+                const float tolerance = 0.02f + 4.0f * row_norm[r] * x_max[t] / step;
                 if (std::fabs(single[r] - ref) > tolerance ||
                     std::fabs(batched[t * rows + r] - single[r]) > 1e-4f * (1.0f + std::fabs(ref))) {
                     std::fprintf(stderr, "format %d %.*s token %zu row %zu: single %f batched %f reference %f\n",
@@ -268,6 +281,19 @@ void test_kernels_match_dequantised_reference() {
             CHECK(a == b);
         }
         check_format(brisk::WeightFormat::TQ2_0x4, rows_t, reinterpret_cast<const std::uint8_t*>(packed.data()), x);
+        // ... and the 16-row lookup layout (48 rows: three groups).
+        constexpr std::size_t rows_l = 48;
+        std::vector<brisk::BlockTQ2_0> plain16(rows_l * blocks_t);
+        for (std::size_t i = 0; i < plain16.size(); ++i) plain16[i] = plain[i % plain.size()];
+        std::vector<brisk::BlockTQ2_0x16> packed16(rows_l / 16 * blocks_t);
+        brisk::repack_tq2_0x16(plain16.data(), rows_l, blocks_t, packed16.data());
+        for (std::size_t r = 0; r < rows_l; ++r) {
+            std::vector<float> a(kCols), b(kCols);
+            brisk::dequantize_tq2_0(plain16.data() + r * blocks_t, a.data(), kCols);
+            brisk::dequantize_tq2_0x16_row(packed16.data() + (r / 16) * blocks_t, r % 16, b.data(), kCols);
+            CHECK(a == b);
+        }
+        check_format(brisk::WeightFormat::TQ2_0x16, rows_l, reinterpret_cast<const std::uint8_t*>(packed16.data()), x);
     }
 
     // Q4_0x4 is built by repacking random Q4_0 rows (a multiple of 4 of them); the
