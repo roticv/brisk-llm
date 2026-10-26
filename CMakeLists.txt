@@ -47,6 +47,7 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")
     set_source_files_properties(src/kernels_i8mm.cpp PROPERTIES COMPILE_OPTIONS "-march=armv8.2-a+dotprod+i8mm")
 endif()
 target_include_directories(brisk PUBLIC src)
+target_include_directories(brisk PRIVATE third_party/nlohmann)  # chat.cpp formats tool JSON
 target_link_libraries(brisk PUBLIC Threads::Threads)
 
 if(APPLE)

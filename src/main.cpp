@@ -182,7 +182,7 @@ int cmd_generate(const GenerateOptions& options) {
     if (options.chat) {
         brisk::ChatOptions chat_options;
         chat_options.think = options.think;
-        text = brisk::render_chat(brisk::chat_format_of(file), {{"user", options.prompt}}, chat_options);
+        text = brisk::render_chat(file, {brisk::ChatMessage{"user", options.prompt, {}}}, chat_options);
     }
     std::vector<brisk::Token> prompt = tokenizer.encode(text);
     if (tokenizer.bos() >= 0) prompt.insert(prompt.begin(), tokenizer.bos());
@@ -487,12 +487,24 @@ int run(const std::vector<std::string>& args) {
 
     if (command == "template") {
         // brisk template <model> (<role> <content>)...: the rendered chat prompt, for checks against llama.cpp.
+        // brisk template <model> --json <request.json>: the same from an OpenAI chat request (tools, thinking).
+        if (args.size() == 4 && args[2] == "--json") {
+            const brisk::MappedFile mapped(args[1]);
+            const brisk::GgufFile file = brisk::GgufFile::parse(mapped.bytes());
+            std::ifstream in(args[3]);
+            const nlohmann::ordered_json body = nlohmann::ordered_json::parse(in);
+            std::vector<brisk::ChatMessage> messages;
+            brisk::ChatOptions co;
+            const std::string text = brisk::render_chat_request(file, body, messages, co);
+            std::fwrite(text.data(), 1, text.size(), stdout);
+            return 0;
+        }
         if (args.size() < 4 || args.size() % 2 != 0) return usage();
         const brisk::MappedFile mapped(args[1]);
         const brisk::GgufFile file = brisk::GgufFile::parse(mapped.bytes());
         std::vector<brisk::ChatMessage> messages;
-        for (std::size_t i = 2; i + 1 < args.size(); i += 2) messages.push_back({args[i], args[i + 1]});
-        const std::string text = brisk::render_chat(brisk::chat_format_of(file), messages);
+        for (std::size_t i = 2; i + 1 < args.size(); i += 2) messages.push_back({args[i], args[i + 1], {}});
+        const std::string text = brisk::render_chat(file, messages);
         std::fwrite(text.data(), 1, text.size(), stdout);
         return 0;
     }

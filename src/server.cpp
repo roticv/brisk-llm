@@ -38,7 +38,7 @@
 
 namespace brisk {
 
-using json = nlohmann::json;
+using json = nlohmann::ordered_json;  // ordered: tool JSON is re-rendered into prompts as given
 
 namespace {
 
@@ -91,6 +91,47 @@ std::string_view trim(std::string_view s) {
     while (!s.empty() && std::isspace(static_cast<unsigned char>(s.back()))) s.remove_suffix(1);
     return s;
 }
+
+}  // namespace
+
+std::string render_chat_request(const GgufFile& file, const json& body, std::vector<ChatMessage>& messages, ChatOptions& co) {
+    if (!body.contains("messages") || !body["messages"].is_array()) throw std::invalid_argument("'messages' must be an array");
+        for (const json& m : body["messages"]) {
+            ChatMessage msg{m.value("role", ""), "", {}};
+            if (m.contains("tool_calls") && m["tool_calls"].is_array()) {
+                for (const json& c : m["tool_calls"]) {
+                    const json& f = c.contains("function") ? c["function"] : c;
+                    const json& args = f.contains("arguments") ? f["arguments"] : json::object();
+                    msg.tool_calls.push_back({f.value("name", ""), args.is_string() ? args.get<std::string>() : args.dump()});
+                }
+            }
+            const json& content = m.contains("content") ? m["content"] : json();
+            if (content.is_string()) {
+                msg.content = content.get<std::string>();
+            } else if (content.is_array()) {  // content parts: the text ones are joined
+                for (const json& part : content) {
+                    if (part.value("type", "") == "text") msg.content += part.value("text", "");
+                }
+            } else if (!content.is_null()) {
+                throw std::invalid_argument("message content must be a string or an array of parts");
+            }
+            messages.push_back(std::move(msg));
+        }
+        if (body.contains("tools") && body["tools"].is_array()) {
+            for (const json& t : body["tools"]) co.tools.push_back(t.dump());
+        }
+        // Qwen3's reasoning: enable_thinking at the top level or in chat_template_kwargs (both are in use).
+        if (body.contains("chat_template_kwargs") && body["chat_template_kwargs"].is_object()) {
+            co.think = body["chat_template_kwargs"].value("enable_thinking", true);
+        }
+        co.think = body.value("enable_thinking", co.think);
+        if (body.contains("reasoning") && body["reasoning"].is_object()) {
+            co.think = body["reasoning"].value("effort", "medium") != "none";
+        }
+        return render_chat(file, messages, co);
+}
+
+namespace {
 
 struct Request {
     std::vector<Token> prompt;
@@ -210,48 +251,16 @@ private:
         Request r;
         std::string text;
         if (chat) {
-            if (!body.contains("messages") || !body["messages"].is_array()) throw std::invalid_argument("'messages' must be an array");
-            std::vector<ChatMessage> messages;
-            for (const json& m : body["messages"]) {
-                ChatMessage msg{m.value("role", ""), "", {}};
-                if (m.contains("tool_calls") && m["tool_calls"].is_array()) {
-                    for (const json& c : m["tool_calls"]) {
-                        const json& f = c.contains("function") ? c["function"] : c;
-                        const json& args = f.contains("arguments") ? f["arguments"] : json::object();
-                        msg.tool_calls.push_back({f.value("name", ""), args.is_string() ? args.get<std::string>() : args.dump()});
-                    }
-                }
-                const json& content = m.contains("content") ? m["content"] : json();
-                if (content.is_string()) {
-                    msg.content = content.get<std::string>();
-                } else if (content.is_array()) {  // content parts: the text ones are joined
-                    for (const json& part : content) {
-                        if (part.value("type", "") == "text") msg.content += part.value("text", "");
-                    }
-                } else if (!content.is_null()) {
-                    throw std::invalid_argument("message content must be a string or an array of parts");
-                }
-                messages.push_back(std::move(msg));
-            }
             ChatOptions co;
-            if (body.contains("tools") && body["tools"].is_array()) {
-                for (const json& t : body["tools"]) {
-                    co.tools.push_back(t.dump());
-                    const json& f = t.contains("function") ? t["function"] : t;
-                    if (f.contains("name") && f["name"].is_string()) r.tool_names.push_back(f["name"].get<std::string>());
-                }
-            }
+            std::vector<ChatMessage> messages;
+            text = render_chat_request(file_, body, messages, co);
             r.tools = !co.tools.empty();
+            for (const std::string& t : co.tools) {
+                const json tj = json::parse(t);
+                const json& f = tj.contains("function") ? tj["function"] : tj;
+                if (f.contains("name") && f["name"].is_string()) r.tool_names.push_back(f["name"].get<std::string>());
+            }
             r.hold_content = r.tools && chat_format_of(file_) == ChatFormat::Llama3;
-            // Qwen3's reasoning: enable_thinking at the top level or in chat_template_kwargs (both are in use).
-            if (body.contains("chat_template_kwargs") && body["chat_template_kwargs"].is_object()) {
-                co.think = body["chat_template_kwargs"].value("enable_thinking", true);
-            }
-            co.think = body.value("enable_thinking", co.think);
-            if (body.contains("reasoning") && body["reasoning"].is_object()) {
-                co.think = body["reasoning"].value("effort", "medium") != "none";
-            }
-            text = render_chat(chat_format_of(file_), messages, co);
         } else {
             if (!body.contains("prompt") || !body["prompt"].is_string()) throw std::invalid_argument("'prompt' must be a string");
             text = body["prompt"].get<std::string>();
@@ -259,6 +268,7 @@ private:
         r.prompt = tokenizer_.encode(text);
         if (tokenizer_.bos() >= 0) r.prompt.insert(r.prompt.begin(), tokenizer_.bos());
         if (r.prompt.empty()) throw std::invalid_argument("the prompt is empty");
+
         if (r.prompt.size() + 1 > context_) {
             throw std::invalid_argument("the prompt has " + std::to_string(r.prompt.size()) + " tokens; the context holds " +
                                         std::to_string(context_));

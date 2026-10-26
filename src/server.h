@@ -4,6 +4,11 @@
 // front-ends and the OpenAI SDKs can use brisk as they would the API.
 #include <cstddef>
 #include <string>
+#include <vector>
+
+#include "chat.h"
+#include "gguf.h"
+#include "json.hpp"
 
 namespace brisk {
 
@@ -22,5 +27,9 @@ struct ServeOptions {
 
 // Serves until the process is killed. Throws std::runtime_error on failure to load or bind.
 int serve(const ServeOptions& options);
+
+// Renders an OpenAI chat request (messages, tools, enable_thinking, ...) into the
+// model's prompt; the parsed messages and options are returned for the caller.
+std::string render_chat_request(const GgufFile& file, const nlohmann::ordered_json& body, std::vector<ChatMessage>& messages, ChatOptions& co);
 
 }  // namespace brisk

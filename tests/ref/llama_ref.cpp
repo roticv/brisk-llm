@@ -25,6 +25,8 @@
 #include <vector>
 
 #include "llama.h"
+#include "chat.h"
+#include "json.h"
 
 namespace {
 
@@ -66,11 +68,12 @@ void quiet_log(ggml_log_level level, const char* text, void*) {
 int main(int argc, char** argv) {
     const std::string mode = argc > 1 ? argv[1] : "";
     if (!((mode == "tokenize" && argc == 4) || (mode == "eval" && argc == 6) || (mode == "perplexity" && argc == 4) ||
-          (mode == "template" && argc >= 5 && argc % 2 == 1))) {
+          (mode == "template" && argc >= 5 && argc % 2 == 1) || (mode == "jinja" && argc == 4))) {
         std::fprintf(stderr, "usage: llama_ref tokenize <model> <strings.bin>\n"
                              "       llama_ref eval <model> <prompt.txt> <n_generate> <logits.bin>\n"
                              "       llama_ref perplexity <model> <text.txt>\n"
-                             "       llama_ref template <model> (<role> <content>)...   (prints the rendered prompt)\n");
+                             "       llama_ref template <model> (<role> <content>)...   (prints the rendered prompt)\n"
+                             "       llama_ref jinja <model> <request.json>   (an OpenAI chat request through the Jinja engine)\n");
         return 2;
     }
 
@@ -79,13 +82,34 @@ int main(int argc, char** argv) {
 
     llama_model_params model_params = llama_model_default_params();
     model_params.n_gpu_layers = 0;
-    model_params.vocab_only = mode == "tokenize" || mode == "template";
+    model_params.vocab_only = mode == "tokenize" || mode == "template" || mode == "jinja";
     llama_model* model = llama_model_load_from_file(argv[2], model_params);
     if (model == nullptr) {
         std::fprintf(stderr, "cannot load %s\n", argv[2]);
         return 1;
     }
     const llama_vocab* vocab = llama_model_get_vocab(model);
+
+    if (mode == "jinja") {
+        // The model's template through llama.cpp's Jinja engine (what llama-server
+        // does with --jinja), from an OpenAI chat request: messages, tools,
+        // enable_thinking / chat_template_kwargs.
+        const std::string text = read_file(argv[3]);
+        const common_json body = common_json::parse(text);
+        common_chat_templates_ptr tmpls = common_chat_templates_init(model, "");
+        common_chat_templates_inputs inputs;
+        inputs.messages = common_chat_msgs_parse_oaicompat(body.at("messages"));
+        if (body.contains("tools")) inputs.tools = common_chat_tools_parse_oaicompat(body.at("tools"));
+        if (body.contains("enable_thinking")) inputs.enable_thinking = body.at("enable_thinking").get<bool>();
+        if (body.contains("chat_template_kwargs")) {
+            for (const auto& kv : body.at("chat_template_kwargs").items()) inputs.chat_template_kwargs[kv.key()] = kv.value().dump();
+        }
+        inputs.add_bos = false;
+        const common_chat_params params = common_chat_templates_apply(tmpls.get(), inputs);
+        std::fwrite(params.prompt.data(), 1, params.prompt.size(), stdout);
+        llama_model_free(model);
+        return 0;
+    }
 
     if (mode == "template") {
         // The model's own template through llama.cpp's built-in renderer, with the
