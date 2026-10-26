@@ -101,6 +101,7 @@ struct Request {
     bool echo_prompt_tokens = false;
     bool separate_reasoning = true;  // a <think> block goes to reasoning_content rather than inline in content
     bool tools = false;              // the request offered tools: <tool_call> blocks (Qwen) are parsed into tool_calls
+    std::vector<std::string> tool_names;  // a call is only a call when it names one of these
     bool hold_content = false;       // Llama 3 with tools: the whole answer may be a call, so content waits for the end
 };
 
@@ -234,7 +235,11 @@ private:
             }
             ChatOptions co;
             if (body.contains("tools") && body["tools"].is_array()) {
-                for (const json& t : body["tools"]) co.tools.push_back(t.dump());
+                for (const json& t : body["tools"]) {
+                    co.tools.push_back(t.dump());
+                    const json& f = t.contains("function") ? t["function"] : t;
+                    if (f.contains("name") && f["name"].is_string()) r.tool_names.push_back(f["name"].get<std::string>());
+                }
             }
             r.tools = !co.tools.empty();
             r.hold_content = r.tools && chat_format_of(file_) == ChatFormat::Llama3;
@@ -313,13 +318,15 @@ private:
 
     // The tool calls an answer made, as OpenAI's tool_calls; Qwen's come from the <tool_call>
     // blocks, Llama 3's answer is the call itself ({"name": ..., "parameters": {...}}).
-    // Whatever does not parse stays in the content.
+    // Whatever does not parse, or names a function that was not offered, stays in the content.
     static json tool_calls_of(Generated& g, const Request& r, const std::string& id) {
         json calls = json::array();
         auto add = [&](const std::string& text, const char* args_key) {
             json j = json::parse(text, nullptr, false);
             if (!j.is_object() || !j.contains("name") || !j["name"].is_string()) return false;
+            if (std::find(r.tool_names.begin(), r.tool_names.end(), j["name"].get<std::string>()) == r.tool_names.end()) return false;
             const json args = j.contains(args_key) ? j[args_key] : json::object();
+            if (!args.is_object() && !args.is_string()) return false;
             calls.push_back({{"id", id + "-" + std::to_string(calls.size())},
                              {"type", "function"},
                              {"function", {{"name", j["name"]}, {"arguments", args.is_string() ? args.get<std::string>() : args.dump()}}}});

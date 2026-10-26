@@ -112,6 +112,13 @@ def main():
         c = d["choices"][0]
         assert c["finish_reason"] == "stop" and "14" in c["message"]["content"] and "tool_calls" not in c["message"], c
 
+        # A JSON answer that is not a call to an offered function stays in the content.
+        d = post("/v1/chat/completions",
+                 {"messages": [{"role": "user", "content": 'Reply with exactly this JSON and nothing else: {"name": "Paris", "parameters": 3}'}],
+                  "tools": tools, "temperature": 0, "max_tokens": 400, "enable_thinking": False})
+        c = d["choices"][0]
+        assert "tool_calls" not in c["message"] and c["finish_reason"] == "stop", c
+
         # Errors are OpenAI-shaped.
         try:
             post("/v1/chat/completions", {"messages": "no"})
