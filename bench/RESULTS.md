@@ -1,6 +1,52 @@
 # Benchmark results
 
-Raw output is in `bench/results/`. Reproduce with `bench/run_llama_bench.sh` and `build/membw`.
+Raw output is in `bench/results/`. Reproduce with `bench/run_brisk_bench.sh`, `bench/run_llama_bench.sh`, `bench/run_mac_sweep.sh` and `build/membw`.
+
+## Summary (2026-10-26)
+
+Every family brisk runs, against llama.cpp `8216c84` on the same files. Tokens/s, prompt (~500 tokens) / generation. The later sections are the history.
+
+### MacBook Air M4
+
+The first seven rows are one sweep (`bench/run_mac_sweep.sh`, single runs with `--warmup`, llama-bench alongside) taken on battery power, which held both engines about 10% below the plugged-in figures elsewhere in this file; the rows below the line are the plugged-in measurements of 23-24 October (the Phase 7 and Gemma sections), after the same kernels. Mistral 7B is omitted: its llama-bench CPU run did not finish.
+
+| File | brisk CPU 4t | llama.cpp CPU 4t | brisk GPU | llama.cpp Metal |
+|---|---:|---:|---:|---:|
+| Qwen3-0.6B Q4_0 | 818 / 169 | 935 / 172 | 2453 / 157 | 2665 / 174 |
+| Qwen3-1.7B pure Q4_0 | 337 / 69 | 298 / 71 | 880 / 79 | 944 / 81 |
+| Qwen3-1.7B Q4_K_M | 266 / 60 | 206 / 61 | 884 / 73 | 882 / 74 |
+| Qwen2.5-1.5B Q4_K_M | 278 / 67 | 218 / 69 | 943 / 78 | 959 / 81 |
+| DeepSeek-R1-Distill-Qwen 1.5B Q4_K_M | 277 / 63 | 257 / 62 | 935 / 85 | 953 / 78 |
+| Llama-3.2-1B Q4_K_M | 374 / 83 | 383 / 85 | 1263 / 101 | 1314 / 98 |
+| Llama-3.2-3B Q4_K_M | 106 / 33 | 118 / 33 | 415 / 40 | 420 / 40 |
+| SmolLM2-1.7B Q4_K_M | 207 / 62 | 199 / 63 | 759 / 84 | 816 / 82 |
+| Gemma-3-1B pure Q4_0 | 657 / 124 | 684 / 117 | 1814 / 128 | 1924 / 127 |
+| Gemma-3-1B Q4_K_M | 408-482 / 81 | 596 / 73 | 1620-1673 / 74-83 | 1763 / 97 |
+| Gemma-4-E2B Q4_0 | 194 / 43 | 182 / 42 | 620 / 57 | 719 / 55 |
+| Phi-4-mini Q4_K_M | 93 / 28 | 89 / 29 | 401 / 35-36 | 398 / 36 |
+| LFM2-1.2B Q4_0 | 405 / 100 | 462 / 100 | 1283 / 128 | 1372 / 128 |
+| BitNet 2B4T TQ2_0 | — / 102 (10 threads) | — / 55 (10 threads) | 634 / 93 | 655 / 84 |
+
+Reading: generation is at the memory-bandwidth ceiling for both engines on both backends, so the two are within a few percent either way (brisk ahead on the K-quant files on the GPU since the Q4_K gemv rewrite, on BitNet by 11% on the GPU and 2x on the CPU, behind by 10% on Qwen3-0.6B's GPU generation and on the Q4_K_M Gemma 3, whose Q5_0/Q8_0 tensors have no tuned GPU gemv). Prompt processing on the GPU is 3-9% behind llama.cpp's tile on the small models and level on the rest; on the CPU at 4 threads brisk is 10-30% ahead on the K-quant files, level on Llama and Phi, and 6-12% behind on the Q4_0 and LFM2 files.
+
+### Raspberry Pi 4 (4 threads, medians of 3)
+
+| File | brisk | llama.cpp |
+|---|---:|---:|
+| Qwen3-0.6B pure Q4_0 | 30.6 / 10.6 | 18.0 / 9.8 |
+| Qwen3-1.7B pure Q4_0 | 11.0 / 3.6 | 5.7 / 3.4 |
+| BitNet 2B4T TQ2_0 | 8.5 / 4.6 | 7.2 / 4.4 |
+| Llama-3.2-1B Q4_K_M | 12.6 / 4.6 | 8.6 / 4.3 |
+| Llama-3.2-3B Q4_K_M | 3.8 / 1.8 | 2.8 / 1.7 |
+| Qwen2.5-1.5B Q4_K_M | 9.1 / 3.7 | 6.0 / 3.4 |
+| DeepSeek-R1-Distill-Qwen 1.5B Q4_K_M | 9.0 / 3.7 | 6.0 / 3.4 |
+| SmolLM2-1.7B Q4_K_M | 7.0 / 3.4 | 4.9 / 3.2 |
+| Gemma-3-1B pure Q4_0 | 21.5 / 6.2 | 11.4 / 5.9 |
+| Gemma-3-1B Q4_K_M | 16.0 / 4.4 | 9.4 / 4.3 |
+| LFM2-1.2B Q4_0 | 15.5 / 5.2 | 8.0 / 4.9 |
+| Gemma-4-E2B Q4_0 | 7.1 / 2.2 | 3.7 / 2.1 |
+
+Reading: brisk is ahead on every file for both prompts (1.2-1.9x; the Q4_0 files 1.7-1.9x, the K-quant files 1.3-1.5x, BitNet 1.2x through the lookup-table kernel) and generation (2-9%, both engines at the bandwidth ceiling).
 
 ## MacBook Air M4 (4 performance + 6 efficiency cores, 32 GB)
 

@@ -163,6 +163,10 @@ From a comparison with other Pi-targeted runtimes (2026-10-23): what they get ri
 4. **Release binaries** for aarch64 Linux from CI, so the Pi needs no toolchain. Not done.
 5. **`brisk pull <name>`** — done (2026-10-24). A catalogue (`src/catalog.cpp`) of the fifteen verified files by short name, with the published size; `brisk pull` lists them (marking the ones present), `brisk pull <name>...` downloads through the system's curl into `models/` (resumable: a `.part` file is continued), checks the size, and prints the path. The locally quantised files (the pure Q4_0s, the BitNet variants) are not in it.
 
+## Housekeeping notes
+
+- `bench/run_mac_sweep.sh` produces the Summary table in one run; the 2026-10-26 run was on battery (both engines ~10% low) and stopped at Mistral 7B, whose llama-bench CPU run did not finish in two hours. Rerun plugged in.
+
 ## Later, if wanted
 
 - Sparsity experiments (skipping inactive neurons).
