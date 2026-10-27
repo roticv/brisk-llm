@@ -177,6 +177,19 @@ def main():
             m = d["choices"][0]["message"]
             assert m.get("reasoning_content") and not m["reasoning_content"].startswith("thought"), m
             assert "56" in m["content"] and "<channel|>" not in m["content"], m
+            # Its tool format: <|tool_call>call:name{key:<|"|>value<|"|>}<tool_call|>, parsed back to JSON arguments.
+            ask = [{"role": "user", "content": "What is the weather in Paris right now? Use the tool."}]
+            d = post("/v1/chat/completions", {"messages": ask, "tools": tools, "temperature": 0, "max_tokens": 300})
+            c = d["choices"][0]
+            assert c["finish_reason"] == "tool_calls" and c["message"]["content"] == "", c
+            call = c["message"]["tool_calls"][0]
+            assert call["function"]["name"] == "get_weather" and json.loads(call["function"]["arguments"])["city"] == "Paris", call
+            d = post("/v1/chat/completions",
+                     {"messages": ask + [{"role": "assistant", "content": "", "tool_calls": [call]},
+                                         {"role": "tool", "tool_call_id": call["id"], "content": '{"temperature_c": 14, "sky": "overcast"}'}],
+                      "tools": tools, "temperature": 0, "max_tokens": 300})
+            c = d["choices"][0]
+            assert c["finish_reason"] == "stop" and "14" in c["message"]["content"] and "tool_calls" not in c["message"], c
         finally:
             if proc.poll() is None:
                 proc.terminate()

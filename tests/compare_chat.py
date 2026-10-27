@@ -5,8 +5,8 @@ plain conversations, thinking on and off, and tool calls, for every model in
 models/.
 
 Known, deliberate differences: brisk refuses tools for a template that has no
-tool format (llama.cpp renders the conversation without them), and brisk does
-not render Gemma 4's, DeepSeek's, Mistral's or Phi's tool formats yet. Gemma 4
+tool format (llama.cpp renders the conversation without them: SmolLM2, LFM2,
+Gemma 3, BitNet, Mistral v0.3, Phi-4-mini and DeepSeek-R1 files). Gemma 4
 thinks only when a request asks (its template's default; llama.cpp's engine
 defaults it on), so its requests carry enable_thinking explicitly."""
 import json, subprocess, sys, tempfile
@@ -18,6 +18,15 @@ TOOLS = [{"type": "function", "function": {
     "parameters": {"type": "object", "properties": {"city": {"type": "string", "description": "City name"}},
                    "required": ["city"]}}}]
 CALL = {"id": "c0", "type": "function", "function": {"name": "get_weather", "arguments": '{"city": "Paris"}'}}
+RICH_TOOLS = TOOLS + [{"type": "function", "function": {
+    "name": "forecast", "description": "Forecast",
+    "parameters": {"type": "object", "properties": {
+        "city": {"type": "string", "description": "City name"}, "units": {"type": "string", "enum": ["c", "f"]},
+        "days": {"type": "integer", "description": "Days ahead"}, "tags": {"type": "array", "items": {"type": "string"}},
+        "opts": {"type": "object", "properties": {"verbose": {"type": "boolean"}}, "required": ["verbose"]}},
+        "required": ["city"]}}}, {"type": "function", "function": {"name": "noop", "description": "Does nothing"}}]
+RICH_CALL = {"id": "c1", "type": "function", "function": {"name": "forecast", "arguments":
+             '{"city": "Paris", "days": 3, "opts": {"verbose": true}, "tags": ["a", "b"], "units": "c"}'}}
 REQUESTS = {
     "plain": {"messages": [{"role": "user", "content": "Hi there"}]},
     "system": {"messages": [{"role": "system", "content": "Be brief."}, {"role": "user", "content": "Hi there"}]},
@@ -36,6 +45,17 @@ REQUESTS = {
     "tool-round": {"messages": [{"role": "user", "content": "Weather in Paris?"},
                                 {"role": "assistant", "content": "", "tool_calls": [CALL]},
                                 {"role": "tool", "tool_call_id": "c0", "content": '{"temperature_c": 14}'}], "tools": TOOLS},
+    "rich-tools": {"messages": [{"role": "user", "content": "Forecast for Paris?"}], "tools": RICH_TOOLS},
+    "rich-round-think": {"messages": [{"role": "user", "content": "Forecast for Paris?"},
+                                      {"role": "assistant", "content": "", "reasoning_content": "I should call the tool.",
+                                       "tool_calls": [RICH_CALL]},
+                                      {"role": "tool", "tool_call_id": "c1", "content": "sunny"}],
+                         "tools": RICH_TOOLS, "enable_thinking": True},
+    "tool-then-user": {"messages": [{"role": "user", "content": "Weather in Paris?"},
+                                    {"role": "assistant", "content": "", "tool_calls": [CALL]},
+                                    {"role": "tool", "tool_call_id": "c0", "content": "14C"},
+                                    {"role": "assistant", "content": "It is 14C."}, {"role": "user", "content": "Thanks"}],
+                       "tools": TOOLS},
 }
 # Which of brisk's formats take tools, by a marker in the file's template.
 TOOL_TEMPLATES = ("<|im_start|>", "<|start_header_id|>")

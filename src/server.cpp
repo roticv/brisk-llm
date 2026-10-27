@@ -97,12 +97,15 @@ std::string_view trim(std::string_view s) {
 std::string render_chat_request(const GgufFile& file, const json& body, std::vector<ChatMessage>& messages, ChatOptions& co) {
     if (!body.contains("messages") || !body["messages"].is_array()) throw std::invalid_argument("'messages' must be an array");
         for (const json& m : body["messages"]) {
-            ChatMessage msg{m.value("role", ""), "", {}};
+            ChatMessage msg;
+            msg.role = m.value("role", "");
+            msg.tool_call_id = m.value("tool_call_id", "");
+            if (m.contains("reasoning_content") && m["reasoning_content"].is_string()) msg.reasoning = m["reasoning_content"];
             if (m.contains("tool_calls") && m["tool_calls"].is_array()) {
                 for (const json& c : m["tool_calls"]) {
                     const json& f = c.contains("function") ? c["function"] : c;
                     const json& args = f.contains("arguments") ? f["arguments"] : json::object();
-                    msg.tool_calls.push_back({f.value("name", ""), args.is_string() ? args.get<std::string>() : args.dump()});
+                    msg.tool_calls.push_back({f.value("name", ""), args.is_string() ? args.get<std::string>() : args.dump(), c.value("id", "")});
                 }
             }
             const json& content = m.contains("content") ? m["content"] : json();
@@ -118,7 +121,17 @@ std::string render_chat_request(const GgufFile& file, const json& body, std::vec
             messages.push_back(std::move(msg));
         }
         if (body.contains("tools") && body["tools"].is_array()) {
-            for (const json& t : body["tools"]) co.tools.push_back(t.dump());
+            // Normalised as llama.cpp does before rendering: type, then name, description and
+            // parameters (an empty object when missing); other keys dropped.
+            for (const json& t : body["tools"]) {
+                const json& f = t.contains("function") ? t["function"] : t;
+                if (!f.is_object() || !f.contains("name")) throw std::invalid_argument("each tool needs a function name");
+                json tool = {{"type", "function"},
+                             {"function", {{"name", f["name"]},
+                                           {"description", f.value("description", "")},
+                                           {"parameters", f.contains("parameters") ? f["parameters"] : json::object()}}}};
+                co.tools.push_back(tool.dump());
+            }
         }
         // Qwen3's reasoning: enable_thinking at the top level or in chat_template_kwargs (both are in use).
         if (body.contains("chat_template_kwargs") && body["chat_template_kwargs"].is_object()) {
@@ -349,6 +362,13 @@ private:
             return true;
         };
         for (const std::string& c : g.calls) {
+            if (c.starts_with("call:")) {  // Gemma 4: call:name{key:<|"|>value<|"|>,...}
+                const std::size_t brace = c.find('{');
+                const std::string args = brace == std::string::npos ? "" : gemma4_arguments_to_json(std::string_view(c).substr(brace));
+                if (!args.empty() && add("{\"name\": " + json(c.substr(5, brace - 5)).dump() + ", \"arguments\": " + args + "}", "arguments")) continue;
+                g.text += std::string(g.text.empty() ? "" : "\n") + "<|tool_call>" + c + "<tool_call|>";
+                continue;
+            }
             if (!add(c, "arguments")) g.text += std::string(g.text.empty() ? "" : "\n") + "<tool_call>\n" + c + "\n</tool_call>";
         }
         if (r.hold_content && calls.empty()) {
@@ -393,6 +413,8 @@ private:
             }
             const Token next = sampler.sample(logits);
             if (tokenizer_.is_end_of_generation(next)) break;
+            // Gemma 4 asks for the result after a call: its turn is over.
+            if (!g.calls.empty() && !call && tokenizer_.piece(next) == "<|tool_response>") break;
             ++g.tokens;
             cached_.push_back(next);
             const std::string_view piece_text = tokenizer_.piece(next);
@@ -400,7 +422,8 @@ private:
             // opening token is dropped up to its newline).
             const bool think_tag = r.separate_reasoning && (piece_text == "<think>" || piece_text == "</think>" ||
                                                             piece_text == "<|channel>" || piece_text == "<channel|>");
-            const bool call_tag = r.tools && (piece_text == "<tool_call>" || piece_text == "</tool_call>");
+            const bool call_tag = r.tools && (piece_text == "<tool_call>" || piece_text == "</tool_call>" ||
+                                              piece_text == "<|tool_call>" || piece_text == "<tool_call|>");
             if (think_tag || call_tag) {
                 if (!pending.empty()) {  // whatever was held back belongs to the block that just ended
                     if (!flush(pending)) {
@@ -414,14 +437,14 @@ private:
                     skip_channel_name = piece_text == "<|channel>";
                 }
                 if (call_tag) {
-                    call = piece_text == "<tool_call>";
+                    call = piece_text == "<tool_call>" || piece_text == "<|tool_call>";
                     if (call) g.calls.emplace_back();
                 }
                 skip_newlines = true;
                 if (g.tokens < r.max_tokens) logits = engine_->eval(next);
                 continue;
             }
-            if (!tokenizer_.is_control(next)) {
+            if (!tokenizer_.is_control(next) || call) {  // a call keeps its control tokens (Gemma 4's <|"|> string marks)
                 std::string_view text = piece_text;
                 if (skip_channel_name) {
                     const std::size_t nl = text.find('\n');

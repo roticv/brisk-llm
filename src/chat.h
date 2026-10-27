@@ -1,6 +1,7 @@
 #pragma once
 // Chat prompts: a conversation rendered in a model family's turn format.
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "gguf.h"
@@ -12,13 +13,23 @@ namespace brisk {
 struct ToolCall {
     std::string name;
     std::string arguments;  // JSON text
+    std::string id;
 };
 
 struct ChatMessage {
+    ChatMessage() = default;
+    ChatMessage(std::string role_, std::string content_) : role(std::move(role_)), content(std::move(content_)) {}
+
     std::string role;  // "system", "user", "assistant" or "tool" (a call's result)
     std::string content;
     std::vector<ToolCall> tool_calls;  // assistant only
+    std::string tool_call_id;          // tool only: which call this answers
+    std::string reasoning;             // assistant only: reasoning_content sent back (Gemma 4 renders it after the last user turn)
 };
+
+// Gemma 4's tool-call argument syntax ({key:<|"|>text<|"|>,n:3}) as JSON text, or
+// empty when it does not parse.
+std::string gemma4_arguments_to_json(std::string_view text);
 
 // A turn format. Chosen from the file's chat_template (several families
 // share one: SmolLM2 is a Llama that speaks ChatML), with the architecture
