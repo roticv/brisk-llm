@@ -45,6 +45,7 @@ Reading: generation is at the memory-bandwidth ceiling for both engines on both 
 | Gemma-3-1B Q4_K_M | 16.0 / 4.4 | 9.4 / 4.3 |
 | LFM2-1.2B Q4_0 | 15.5 / 5.2 | 8.0 / 4.9 |
 | Gemma-4-E2B Q4_0 | 7.1 / 2.2 | 3.7 / 2.1 |
+| SmolLM3-3B Q4_K_M | 3.9 / 1.9 | 3.1 / 1.8 |
 
 Reading: brisk is ahead on every file for both prompts (1.2-1.9x; the Q4_0 files 1.7-1.9x, the K-quant files 1.3-1.5x, BitNet 1.2x through the lookup-table kernel) and generation (2-9%, both engines at the bandwidth ceiling).
 
@@ -249,6 +250,7 @@ Every file brisk runs on the Pi, with the current engine (half-precision K/V cac
 | Gemma-3-1B Q4_K_M | 16.0 (8.2) | 9.4 | 4.4 (4.2) | 4.3 |
 | LFM2-1.2B Q4_0 | 15.5 (15.4) | 8.0 | 5.2 (5.2) | 4.9 |
 | Gemma-4-E2B Q4_0 | 7.1 (6.9) | 3.7 | 2.2 (2.2) | 2.1 |
+| SmolLM3-3B Q4_K_M | 3.9 | 3.1 | 1.9 | 1.8 |
 
 Generation is at the bandwidth ceiling on both engines and brisk is 2-9% ahead on every file (the half-precision cache changed nothing measurable at these context lengths). Prompt processing: brisk is 1.2-1.9x llama.cpp on every file, BitNet included since 2026-10-25 (8.5 against 7.2, from 6.0 with the vmull kernel) through a lookup-table ternary kernel with 7-bit activations — see the roadmap's note; its bracketed figure is the vmull kernel's — the Q4_0 files at 1.7-1.9x, the K-quant files at 1.2x, the Q4_K_M Gemma 3 at 1.7x since its Q5_0/Q8_0 tensors took the banded kernel (8.2 to 16.2). The Q4_K_M files' prompt rates rose 20-25% the same day from a rewrite of the baseline-NEON Q4_K kernel (a sub-block's 32 products summed in 16-bit lanes and scaled once, the block's scales hoisted out of the token loop, the minimums term vectorised): `bench/kquant_bench` puts it at 3.73 GMAC/s per core, from 2.79, against Q4_0's 4.56 and Q6_K's 3.0; the K-quant files are now 1.3-1.5x llama.cpp on prompts. The 3B Llama at 1.9 GB per token is the slowest usable file here (1.8 tokens/s); the 2.8 GB Gemma 4 E2B needs `--ctx 1024` to fit beside the OS.
 
