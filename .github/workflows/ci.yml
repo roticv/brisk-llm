@@ -52,12 +52,25 @@ jobs:
           curl -sfL -o models/Qwen3-0.6B-Q4_0.gguf \
             https://huggingface.co/unsloth/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q4_0.gguf
 
+      - name: Cache the Gemma 4 model (thinking channel and tool format in the server test)
+        id: gemma
+        uses: actions/cache@v4
+        with:
+          path: models/gemma-4-E2B-it-Q4_0.gguf
+          key: gemma-4-e2b-q4_0-ggml-org
+
+      - name: Download the Gemma 4 model
+        if: steps.gemma.outputs.cache-hit != 'true'
+        run: |
+          curl -sfL -o models/gemma-4-E2B-it-Q4_0.gguf \
+            https://huggingface.co/ggml-org/gemma-4-E2B-it-GGUF/resolve/main/gemma-4-E2B-it-Q4_0.gguf
+
       - name: Perplexity against pinned values
-        run: python3 tests/check_perplexity.py build-release/brisk
+        run: python3 tests/check_perplexity.py build-release/brisk --only=Qwen3-0.6B-Q4_0.gguf
 
       - name: Perplexity against pinned values on the GPU
         if: runner.os == 'macOS'
-        run: python3 tests/check_perplexity.py build-release/brisk --gpu
+        run: python3 tests/check_perplexity.py build-release/brisk --gpu --only=Qwen3-0.6B-Q4_0.gguf
 
       - name: Smoke test generation
         run: |

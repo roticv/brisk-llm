@@ -7,7 +7,7 @@ Each pin names a model file (under models/) and a text (repo-relative) with
 the perplexity brisk produced when the pin was recorded. A kernel or model
 regression raises the score well beyond the 1% allowed here; the pins were
 themselves verified against llama.cpp with tests/compare_perplexity.py.
-Models that are not present are skipped. --update rewrites the pins.
+Models that are not present are skipped; --only=<file> restricts the run. --update rewrites the pins.
 """
 
 import json
@@ -40,7 +40,8 @@ def perplexity(brisk, model, text, gpu):
 
 
 def main():
-    args = [a for a in sys.argv[1:] if a not in ("--update", "--gpu")]
+    only = [a[7:] for a in sys.argv[1:] if a.startswith("--only=")]  # --only=<file name>, repeatable
+    args = [a for a in sys.argv[1:] if a not in ("--update", "--gpu") and not a.startswith("--only=")]
     update = "--update" in sys.argv
     gpu = "--gpu" in sys.argv  # check the Metal backend against the same pins (Q4_0 files only)
     brisk = args[0] if args else str(ROOT / "build-release" / "brisk")
@@ -50,6 +51,8 @@ def main():
     checked = 0
     for pin in pins:
         model = ROOT / "models" / pin["model"]
+        if only and pin["model"] not in only:
+            continue
         if not model.exists():
             print(f"{pin['model']}: not present, skipped")
             continue
