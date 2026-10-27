@@ -103,3 +103,7 @@ Against llama.cpp on the same files (`bench/RESULTS.md`, Summary):
 - **Raspberry Pi 4:** ahead on every file. Prompt processing 1.2-1.9x (Q4_0 files 1.7-1.9x, K-quant files 1.3-1.5x, BitNet 1.2x), generation 2-9% ahead with both engines at the memory-bandwidth ceiling.
 - **M4 CPU (4 threads):** level on generation everywhere (bandwidth-bound); prompts 10-30% ahead on the K-quant files, level on Llama and Phi, 6-12% behind on the Q4_0 and LFM2 files. With all ten cores brisk's generation is 40% ahead because the pool uses the efficiency cores.
 - **M4 GPU:** generation within a few percent either way (ahead on the K-quant files and BitNet, 10% behind on Qwen3-0.6B); prompts 3-9% behind on the small models, level on the rest. The batched matmul runs at 85-90% of the GPU's measured matrix peak.
+
+## License
+
+MIT (`LICENSE`). The vendored cpp-httplib and nlohmann/json in `third_party/` are MIT as well.

@@ -50,7 +50,7 @@ jobs:
           # The archive name carries no version, so releases/latest/download/<name> always works.
           dir=brisk-${{ github.ref_name }}-${{ matrix.name }}
           mkdir "$dir"
-          cp build-release/brisk README.md "$dir"/
+          cp build-release/brisk README.md LICENSE "$dir"/
           tar czf "brisk-${{ matrix.name }}.tar.gz" "$dir"
           shasum -a 256 "brisk-${{ matrix.name }}.tar.gz" > "brisk-${{ matrix.name }}.tar.gz.sha256"
 
