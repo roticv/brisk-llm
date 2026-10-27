@@ -12,6 +12,7 @@ endif()
 
 option(BRISK_SANITIZE "Build with AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
 option(BRISK_FUZZ "Build the libFuzzer targets (needs clang)" OFF)
+option(BRISK_STATIC "Link the brisk binary statically (Linux release builds: one file that runs on any aarch64 glibc or musl box)" OFF)
 
 add_compile_options(-Wall -Wextra -Wpedantic -Wshadow -Wconversion)
 if(BRISK_SANITIZE)
@@ -81,6 +82,9 @@ target_link_libraries(brisk_server PUBLIC brisk Threads::Threads)
 add_executable(brisk-cli src/main.cpp)
 set_target_properties(brisk-cli PROPERTIES OUTPUT_NAME brisk)
 target_link_libraries(brisk-cli PRIVATE brisk_server)
+if(BRISK_STATIC AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    target_link_options(brisk-cli PRIVATE -static)
+endif()
 
 add_executable(kernel_bench bench/kernel_bench.cpp)
 target_link_libraries(kernel_bench PRIVATE brisk)

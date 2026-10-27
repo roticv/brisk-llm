@@ -39,12 +39,16 @@ build-release/brisk serve models/gemma-4-E2B-it-Q4_0.gguf --gpu --port 8080
 
 ### On a Raspberry Pi 4
 
+A release binary (static, runs on any 64-bit Arm Linux; `curl` is the only thing it needs, for `pull`):
+
 ```
-sudo apt install cmake ninja-build g++ curl          # Debian 13 / Raspberry Pi OS 64-bit
-cmake -B build-release -G Ninja -DCMAKE_BUILD_TYPE=Release && cmake --build build-release
-build-release/brisk pull lfm2-1.2b                   # 0.7 GB; or qwen3-0.6b, gemma-3-1b, llama-3.2-1b
-build-release/brisk serve models/LFM2-1.2B-Q4_0.gguf --host 0.0.0.0 --ctx 2048
+sudo apt install curl
+curl -sL https://github.com/roticv/brisk-llm/releases/latest/download/brisk-linux-aarch64.tar.gz | tar xz --strip-components=1
+./brisk pull lfm2-1.2b                               # 0.7 GB; or qwen3-0.6b, gemma-3-1b, llama-3.2-1b
+./brisk serve models/LFM2-1.2B-Q4_0.gguf --host 0.0.0.0 --ctx 2048
 ```
+
+Or from source (`sudo apt install cmake ninja-build g++`, then `cmake -B build-release -G Ninja -DCMAKE_BUILD_TYPE=Release && cmake --build build-release`; `-DBRISK_STATIC=ON` makes the same static binary). Releases also carry a macOS arm64 build with the Metal backend.
 
 Then point a chat front-end on another machine at `http://raspberrypi.local:8080/v1`. The 1B-2B files answer at 4-10 tokens/s (`bench/RESULTS.md` has every file); a 4 GB Pi holds the 1B-2B files comfortably and Gemma 4 E2B with `--ctx 1024`. Before loading, `generate`, `perplexity` and `serve` estimate what the session needs against the memory available and refuse with the breakdown and a fix (`--ctx`, a smaller file) when it would not fit, since a model that does not fit swaps rather than fails and a Pi swapping to its SD card is unusable (`BRISK_NO_MEMORY_CHECK=1` skips the check). The server pages the weights in and runs a warm-up token before it listens, so the first request does not wait for the SD card.
 
@@ -92,7 +96,7 @@ Benchmarks on the Air are only meaningful with nothing else running; the fanless
 
 ## Status
 
-Phases 0-6 of the roadmap are done on both machines (the CPU engine, the Metal backend, the model families), Phase 7's first two tiers (Phi-4-mini, LFM2 and the verified downloads), Phase 8 (the server) and most of Phase 9 (the Pi: memory preflight, half-precision cache, prefetch, `pull`, the lookup-table ternary kernel). Open: SmolLM3 and the hybrid-attention families, aarch64 release binaries, and the tuning items the roadmap lists.
+Phases 0-6 of the roadmap are done on both machines (the CPU engine, the Metal backend, the model families), Phase 7's first two tiers (Phi-4-mini, LFM2 and the verified downloads), Phase 8 (the server) and most of Phase 9 (the Pi: memory preflight, half-precision cache, prefetch, `pull`, the lookup-table ternary kernel). Open: SmolLM3 and the hybrid-attention families, and the tuning items the roadmap lists.
 
 Against llama.cpp on the same files (`bench/RESULTS.md`, Summary):
 
