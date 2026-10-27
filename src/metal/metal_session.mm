@@ -773,7 +773,7 @@ struct MetalSession::Impl {
                                     g.q_norm.buffer != nil ? 1u : 0u, c.rope_neox ? 1u : 0u,
                                     g.q_bias.buffer != nil ? 1u : 0u, rope_factors.buffer != nil && !slides ? 1u : 0u,
                                     g.own_kv ? 1u : 0u, c.value_norm ? 1u : 0u,
-                                    static_cast<uint32_t>(slides ? head_dim : std::min<std::size_t>(c.rope_dim_of(), head_dim)),
+                                    static_cast<uint32_t>(!c.layer_has_rope(l) ? 0 : slides ? head_dim : std::min<std::size_t>(c.rope_dim_of(), head_dim)),
                                     c.rope_attn_factor};
                 bytes(enc, rp, 7);
                 set(enc, g.q_bias.buffer != nil ? g.q_bias : g.attn_norm, 8);  // unused when has_bias is 0

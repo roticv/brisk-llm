@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstring>
 #include <ctime>
 #include <stdexcept>
 #include <string_view>
@@ -524,6 +525,63 @@ std::string render_gemma4(const std::vector<ChatMessage>& messages, const ChatOp
     return out;
 }
 
+// SmolLM3: ChatML with a system turn the template composes (a metadata block
+// with the knowledge cutoff, today's date and the reasoning mode, then custom
+// instructions or the default persona). The file's template leaves that turn
+// without <|im_end|> when there are no tools, and it is followed as written.
+// "/think" and "/no_think" in the system message set the mode; "/system_override"
+// passes the system message through unchanged.
+std::string render_smollm3(const std::vector<ChatMessage>& messages, const ChatOptions& o) {
+    std::string out = "<|im_start|>system\n";
+    bool think = o.think;
+    std::string custom;
+    std::size_t first = 0;
+    bool override_system = false;
+    if (!messages.empty() && messages[0].role == "system") {
+        const std::string& sys = messages[0].content;
+        if (sys.find("/no_think") != std::string::npos) think = false;
+        else if (sys.find("/think") != std::string::npos) think = true;
+        custom = sys;
+        for (const char* tag : {"/no_think", "/think"}) {
+            for (std::size_t at = custom.find(tag); at != std::string::npos; at = custom.find(tag)) custom.erase(at, std::strlen(tag));
+        }
+        while (!custom.empty() && std::isspace(static_cast<unsigned char>(custom.back()))) custom.pop_back();
+        override_system = sys.find("/system_override") != std::string::npos;
+        first = 1;
+    }
+    if (override_system) {
+        for (std::size_t at = custom.find("/system_override"); at != std::string::npos; at = custom.find("/system_override")) custom.erase(at, 16);
+        while (!custom.empty() && std::isspace(static_cast<unsigned char>(custom.back()))) custom.pop_back();
+        out += custom + "<|im_end|>\n";
+    } else {
+        const std::time_t now = std::time(nullptr);
+        char date[40];
+        std::strftime(date, sizeof date, "%d %B %Y", std::localtime(&now));
+        out += "## Metadata\n\nKnowledge Cutoff Date: June 2025\nToday Date: " + std::string(date) + "\nReasoning Mode: " +
+               (think ? "/think" : "/no_think") + "\n\n## Custom Instructions\n\n";
+        if (!custom.empty()) {
+            out += custom + "\n\n";
+        } else if (think) {
+            out += "You are a helpful AI assistant named SmolLM, trained by Hugging Face. Your role as an assistant involves thoroughly exploring questions through a systematic thinking process before providing the final precise and accurate solutions. This requires engaging in a comprehensive cycle of analysis, summarizing, exploration, reassessment, reflection, backtracking, and iteration to develop well-considered thinking process. Please structure your response into two main sections: Thought and Solution using the specified format: <think> Thought section </think> Solution section. In the Thought section, detail your reasoning process in steps. Each step should include detailed considerations such as analysing questions, summarizing relevant findings, brainstorming new ideas, verifying the accuracy of the current steps, refining any errors, and revisiting previous steps. In the Solution section, based on various attempts, explorations, and reflections from the Thought section, systematically present the final solution that you deem correct. The Solution section should be logical, accurate, and concise and detail necessary steps needed to reach the conclusion.\n\n";
+        } else {
+            out += "You are a helpful AI assistant named SmolLM, trained by Hugging Face.\n\n";
+        }
+    }
+    for (std::size_t i = first; i < messages.size(); ++i) {
+        const ChatMessage& m = messages[i];
+        check_role(m, true);
+        if (m.role == "system") throw std::runtime_error("chat: SmolLM3 takes a system message only first");
+        if (m.role == "assistant") {
+            out += "<|im_start|>assistant\n" + std::string(think ? "" : "<think>\n\n</think>\n") +
+                   std::string(strip_newlines(m.content, true, false)) + "<|im_end|>\n";
+        } else {  // user, and tool results as user turns
+            out += "<|im_start|>user\n" + m.content + "<|im_end|>\n";
+        }
+    }
+    if (o.generation_prompt) out += std::string("<|im_start|>assistant\n") + (think ? "" : "<think>\n\n</think>\n");
+    return out;
+}
+
 // BitNet b1.58 2B4T: "Role: content<|eot_id|>" per message, "Assistant: " to prompt.
 std::string render_bitnet(const std::vector<ChatMessage>& messages, const ChatOptions& o) {
     std::string out;
@@ -600,6 +658,7 @@ std::string render_phi(const std::vector<ChatMessage>& messages, const ChatOptio
 ChatFormat chat_format_of(const GgufFile& file) {
     const std::string_view tmpl = file.get<std::string_view>("tokenizer.chat_template").value_or("");
     if (tmpl.find("<|im_start|>") != std::string_view::npos) {
+        if (tmpl.find("Reasoning Mode:") != std::string_view::npos) return ChatFormat::SmolLM3;
         return tmpl.find("<think>") != std::string_view::npos ? ChatFormat::Qwen3 : ChatFormat::ChatML;
     }
     if (tmpl.find("<|start_header_id|>") != std::string_view::npos) return ChatFormat::Llama3;
@@ -618,6 +677,7 @@ ChatFormat chat_format_of(const GgufFile& file) {
         case Architecture::BitNet: return ChatFormat::BitNet;
         case Architecture::Phi3: return ChatFormat::Phi;
         case Architecture::LFM2: return ChatFormat::ChatML;
+        case Architecture::SmolLM3: return ChatFormat::SmolLM3;
     }
     throw std::runtime_error("chat: no template for this file");
 }
@@ -645,6 +705,7 @@ std::string default_system_of(const GgufFile& file) {
 
 bool chat_template_has_tools(const GgufFile& file) {
     const std::string_view tmpl = file.get<std::string_view>("tokenizer.chat_template").value_or("");
+    // SmolLM3's template takes xml_tools / python_tools variables, not the OpenAI tools list.
     return chat_format_has_tools(chat_format_of(file)) && tmpl.find("tools") != std::string_view::npos;
 }
 
@@ -772,6 +833,7 @@ std::string render_chat(ChatFormat format, const std::vector<ChatMessage>& messa
         case ChatFormat::DeepSeek: return render_deepseek(messages, options);
         case ChatFormat::Phi: return render_phi(messages, options);
         case ChatFormat::BitNet: return render_bitnet(messages, options);
+        case ChatFormat::SmolLM3: return render_smollm3(messages, options);
     }
     throw std::runtime_error("chat: unknown format");
 }

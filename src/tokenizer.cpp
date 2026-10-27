@@ -405,7 +405,7 @@ Tokenizer::Tokenizer(const GgufFile& file) {
         fail("unsupported tokenizer model '" + std::string(model.value_or("(none)")) + "'");
     } else if (pre == "qwen2") {
         pre_ = PreTokenizer::Qwen2;
-    } else if (pre == "llama-bpe" || pre == "lfm2") {  // LFM2 reuses Llama 3's pattern
+    } else if (pre == "llama-bpe" || pre == "lfm2" || pre == "smaug-bpe") {  // LFM2 and SmolLM3 reuse Llama 3's pattern
         pre_ = PreTokenizer::Llama3;
     } else if (pre == "smollm") {
         pre_ = PreTokenizer::SmolLM;

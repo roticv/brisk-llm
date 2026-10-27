@@ -101,5 +101,10 @@
     "model": "LFM2-1.2B-Q4_K_M.gguf",
     "text": "tests/perplexity_text.txt",
     "perplexity": 69.9191
+  },
+  {
+    "model": "SmolLM3-3B-Q4_K_M.gguf",
+    "text": "tests/perplexity_text.txt",
+    "perplexity": 16.8871
   }
 ]

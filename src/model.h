@@ -26,6 +26,7 @@ enum class Architecture {
     BitNet,  // ternary weights, extra norms before the output projections, squared-ReLU feed-forward
     Phi3,    // Phi-3/4-mini: fused QKV and gate/up tensors, partial rotary with LongRoPE factors
     LFM2,    // Liquid LFM2: short-convolution layers (gated 3-tap causal conv) between attention layers
+    SmolLM3, // Llama-shaped, with every fourth layer attending without RoPE (NoPE)
 };
 
 // Query heads per key/value head, at most (the attention tiles size their query arrays by it).
@@ -92,6 +93,9 @@ struct ModelConfig {
     // LFM2: a layer with no key/value heads is a short-convolution layer.
     bool layer_is_conv(std::size_t layer) const { return kv_head_count_of(layer) == 0; }
     std::uint32_t conv_taps = 0;  // LFM2's shortconv.l_cache: the conv kernel's width in tokens
+    // SmolLM3: every fourth layer (the 4th, 8th, ...) has no positional rotation.
+    std::uint32_t no_rope_step = 0;
+    bool layer_has_rope(std::size_t layer) const { return no_rope_step == 0 || (layer + 1) % no_rope_step != 0; }
     std::uint32_t head_dim_of(std::size_t layer) const {
         return head_dim_local != 0 && layer_slides(layer) ? head_dim_local : head_dim;
     }

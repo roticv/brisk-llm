@@ -144,8 +144,9 @@ Architecture architecture_of(const GgufFile& file) {
     if (architecture == "bitnet" || architecture == "bitnet-b1.58") return Architecture::BitNet;
     if (architecture == "phi3") return Architecture::Phi3;
     if (architecture == "lfm2") return Architecture::LFM2;
+    if (architecture == "smollm3") return Architecture::SmolLM3;
     fail("unsupported architecture '" + std::string(architecture.value_or("(none)")) +
-         "'; qwen3, qwen2, llama, gemma3, gemma4, bitnet, phi3 and lfm2 are supported");
+         "'; qwen3, qwen2, llama, gemma3, gemma4, bitnet, phi3, lfm2 and smollm3 are supported");
 }
 
 // A float32 tensor of the file, in place (the config's rope factors).
@@ -162,7 +163,8 @@ ModelConfig Model::parse_config(const GgufFile& file) {
     const auto architecture = file.get<std::string_view>("general.architecture");
     const std::string prefix = std::string(*architecture) + ".";
     const bool bitnet = config.architecture == Architecture::BitNet;
-    config.rope_neox = config.architecture != Architecture::Llama;
+    config.rope_neox = config.architecture != Architecture::Llama && config.architecture != Architecture::SmolLM3;
+    if (config.architecture == Architecture::SmolLM3) config.no_rope_step = 4;  // llama.cpp's n_no_rope_layer_step
     const bool gemma = config.architecture == Architecture::Gemma3 || config.architecture == Architecture::Gemma4;
     if (gemma) {
         config.sliding_window = file.get<std::uint32_t>(prefix + "attention.sliding_window").value_or(0);
@@ -815,7 +817,7 @@ void Session::eval_batch(std::span<const Token> tokens, bool all_logits) {
             const bool slides = c.layer_slides(l);
             pool_.run(n, [&](std::size_t t) {
                 // The rotated width: the layer's head size, or the model's partial rotary dimension.
-                const std::size_t rope_dim = slides ? head_dim : std::min<std::size_t>(c.rope_dim_of(), head_dim);
+                const std::size_t rope_dim = !c.layer_has_rope(l) ? 0 : slides ? head_dim : std::min<std::size_t>(c.rope_dim_of(), head_dim);
                 const std::span<const float> rope((slides ? rope_local_ : rope_).data() + t * rope_dim, rope_dim);
                 if (!layer.query_bias.empty()) {
                     add_bias({query_.data() + t * query_dim, query_dim}, layer.query_bias);
@@ -919,7 +921,7 @@ void Session::eval_batch(std::span<const Token> tokens, bool all_logits) {
                 float* g = gate_.data() + t * ff_l;
                 const float* u = up_.data() + t * ff_l;
                 if (c.architecture == Architecture::BitNet) {
-                    for (std::size_t i = 0; i < ff_l; ++i) {
+                    for (std::size_t i = 0; i < c.ff_dim_of(l); ++i) {
                         const float r = std::max(g[i], 0.0f);
                         g[i] = r * r * u[i];
                     }
@@ -969,8 +971,12 @@ void Session::eval_batch(std::span<const Token> tokens, bool all_logits) {
         }
         if (std::getenv("BRISK_CPU_DEBUG") != nullptr) {  // the last token's residual after each layer
             double sum = 0.0;
-            for (const float v : rows(hidden_, n - 1, embd)) sum += std::fabs(v);
-            std::fprintf(stderr, "layer %zu pos %zu: mean|h| %.6f  h[0..3] %.5f %.5f %.5f %.5f\n", l, position_ + n - 1, sum / embd,
+            float peak = 0.0f;
+            for (const float v : rows(hidden_, n - 1, embd)) {
+                sum += std::fabs(v);
+                peak = std::max(peak, std::fabs(v));
+            }
+            std::fprintf(stderr, "layer %zu pos %zu: max|h| %.4f mean|h| %.6f  h[0..3] %.5f %.5f %.5f %.5f\n", l, position_ + n - 1, peak, sum / embd,
                          hidden_[(n - 1) * embd], hidden_[(n - 1) * embd + 1], hidden_[(n - 1) * embd + 2], hidden_[(n - 1) * embd + 3]);
         }
     }

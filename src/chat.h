@@ -34,7 +34,7 @@ std::string gemma4_arguments_to_json(std::string_view text);
 // A turn format. Chosen from the file's chat_template (several families
 // share one: SmolLM2 is a Llama that speaks ChatML), with the architecture
 // as the fallback.
-enum class ChatFormat { ChatML, Qwen3, Llama3, Gemma3, Gemma4, Mistral, DeepSeek, Phi, BitNet };
+enum class ChatFormat { ChatML, Qwen3, Llama3, Gemma3, Gemma4, Mistral, DeepSeek, Phi, BitNet, SmolLM3 };
 
 ChatFormat chat_format_of(const GgufFile& file);
 

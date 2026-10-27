@@ -48,6 +48,8 @@ constexpr CatalogEntry kCatalog[] = {
      "Phi-4-mini 3.8B instruct, Q4_K_M (2.5 GB)"},
     {"lfm2-1.2b", "LFM2-1.2B-Q4_0.gguf", "LiquidAI/LFM2-1.2B-GGUF/resolve/main/LFM2-1.2B-Q4_0.gguf", 695749568,
      "LFM2 1.2B, Q4_0: Liquid's edge model, the pick for the Pi"},
+    {"smollm3-3b", "SmolLM3-3B-Q4_K_M.gguf", "ggml-org/SmolLM3-3B-GGUF/resolve/main/SmolLM3-Q4_K_M.gguf", 1915305312,
+     "SmolLM3 3B, Q4_K_M: Hugging Face's reasoning model (every fourth layer without RoPE)"},
 };
 
 }  // namespace

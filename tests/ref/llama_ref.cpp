@@ -13,6 +13,8 @@
 //       With LLAMA_REF_ONE_BY_ONE=1 in the environment the prompt is fed one
 //       token at a time instead of as a batch, which exercises llama.cpp's
 //       other kernel path and shows how much its own results vary.
+//       With LLAMA_REF_GPU=1 every mode runs on llama.cpp's Metal backend
+//       (float activations, like brisk's GPU; the CPU backends quantise them).
 
 #include <algorithm>
 #include <cmath>
@@ -81,7 +83,7 @@ int main(int argc, char** argv) {
     llama_backend_init();
 
     llama_model_params model_params = llama_model_default_params();
-    model_params.n_gpu_layers = 0;
+    model_params.n_gpu_layers = std::getenv("LLAMA_REF_GPU") != nullptr ? 99 : 0;  // LLAMA_REF_GPU: llama.cpp's Metal backend
     model_params.vocab_only = mode == "tokenize" || mode == "template" || mode == "jinja";
     llama_model* model = llama_model_load_from_file(argv[2], model_params);
     if (model == nullptr) {
