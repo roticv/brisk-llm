@@ -154,6 +154,7 @@ struct BlockTQ2_0x16 {
 static_assert(sizeof(BlockTQ2_0x16) == 1056);
 
 void repack_tq2_0x16(const BlockTQ2_0* in, std::size_t rows, std::size_t blocks, BlockTQ2_0x16* out);
+void repack_tq2_0x16_scalar(const BlockTQ2_0* in, std::size_t rows, std::size_t blocks, BlockTQ2_0x16* out);  // the reference
 void dequantize_tq2_0x16_row(const BlockTQ2_0x16* group, std::size_t row_in_group, float* out, std::size_t count);
 
 void dequantize_tq2_0x4_row(const BlockTQ2_0x4* group, std::size_t row_in_group, float* out, std::size_t count);

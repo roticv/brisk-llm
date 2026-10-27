@@ -287,6 +287,14 @@ void test_kernels_match_dequantised_reference() {
         for (std::size_t i = 0; i < plain16.size(); ++i) plain16[i] = plain[i % plain.size()];
         std::vector<brisk::BlockTQ2_0x16> packed16(rows_l / 16 * blocks_t);
         brisk::repack_tq2_0x16(plain16.data(), rows_l, blocks_t, packed16.data());
+        {   // the vector repack is byte-identical to the scalar one
+            std::vector<brisk::BlockTQ2_0x16> reference(packed16.size());
+            brisk::repack_tq2_0x16_scalar(plain16.data(), rows_l, blocks_t, reference.data());
+            if (std::memcmp(packed16.data(), reference.data(), packed16.size() * sizeof(brisk::BlockTQ2_0x16)) != 0) {
+                std::printf("repack_tq2_0x16 differs from the scalar reference\n");
+                std::exit(1);
+            }
+        }
         for (std::size_t r = 0; r < rows_l; ++r) {
             std::vector<float> a(kCols), b(kCols);
             brisk::dequantize_tq2_0(plain16.data() + r * blocks_t, a.data(), kCols);

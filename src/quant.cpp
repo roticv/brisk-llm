@@ -655,7 +655,7 @@ void tq2_0_pair_indices(const BlockTQ2_0& block, std::uint8_t idx[128]) {
     }
 }
 
-void repack_tq2_0x16(const BlockTQ2_0* in, std::size_t rows, std::size_t blocks, BlockTQ2_0x16* out) {
+void repack_tq2_0x16_scalar(const BlockTQ2_0* in, std::size_t rows, std::size_t blocks, BlockTQ2_0x16* out) {
     for (std::size_t g = 0; g < rows / 16; ++g) {
         for (std::size_t b = 0; b < blocks; ++b) {
             BlockTQ2_0x16& packed = out[g * blocks + b];
@@ -669,6 +669,104 @@ void repack_tq2_0x16(const BlockTQ2_0* in, std::size_t rows, std::size_t blocks,
             }
         }
     }
+}
+
+#if defined(__aarch64__)
+namespace {
+
+// A row's 64 nibble-packed pair indices (byte k = pair 2k | pair 2k+1 << 4) from
+// its TQ2_0 block, 16 pairs per (j, l) group of 32 elements, in vectors.
+inline void tq2_0_packed_row(const BlockTQ2_0& block, std::uint8_t out[64]) {
+    const uint8x16_t mask = vdupq_n_u8(3), three = vdupq_n_u8(3);
+    for (int j = 0; j < 2; ++j) {
+        const uint8x16_t v0 = vld1q_u8(block.qs + 32 * j), v1 = vld1q_u8(block.qs + 32 * j + 16);
+        for (int l = 0; l < 4; ++l) {
+            const uint8x16_t c0 = vandq_u8(l == 0 ? v0 : l == 1 ? vshrq_n_u8(v0, 2) : l == 2 ? vshrq_n_u8(v0, 4) : vshrq_n_u8(v0, 6), mask);
+            const uint8x16_t c1 = vandq_u8(l == 0 ? v1 : l == 1 ? vshrq_n_u8(v1, 2) : l == 2 ? vshrq_n_u8(v1, 4) : vshrq_n_u8(v1, 6), mask);
+            const uint8x16_t pair = vmlaq_u8(vuzp2q_u8(c0, c1), vuzp1q_u8(c0, c1), three);  // even * 3 + odd: 16 pair indices
+            const uint8x8_t even = vget_low_u8(vuzp1q_u8(pair, pair)), odd = vget_low_u8(vuzp2q_u8(pair, pair));
+            vst1_u8(out + (j * 4 + l) * 8, vorr_u8(even, vshl_n_u8(odd, 4)));
+        }
+    }
+}
+
+// Transposes 16 rows of 16 bytes: out[c][r] = in[r][c]. The trn stages leave
+// the result's vectors in a fixed permutation of the columns, found once by
+// transposing the pattern in[r][c] = c.
+struct Transpose16 {
+    int column_of[16];
+    Transpose16() {
+        std::uint8_t pattern[16][16];
+        for (int r = 0; r < 16; ++r) for (int c = 0; c < 16; ++c) pattern[r][c] = static_cast<std::uint8_t>(c);
+        uint8x16_t v[16];
+        raw(pattern, v);
+        for (int k = 0; k < 16; ++k) column_of[k] = vgetq_lane_u8(v[k], 0);
+    }
+    static void raw(const std::uint8_t in[16][16], uint8x16_t v[16]) {
+        uint8x16_t r[16];
+        for (int i = 0; i < 16; ++i) r[i] = vld1q_u8(in[i]);
+        uint8x16_t a[16];
+        for (int i = 0; i < 16; i += 2) {
+            const uint8x16x2_t t = vtrnq_u8(r[i], r[i + 1]);
+            a[i] = t.val[0];
+            a[i + 1] = t.val[1];
+        }
+        uint8x16_t b[16];
+        for (int i = 0; i < 16; i += 4) {
+            for (int k = 0; k < 2; ++k) {
+                const uint16x8x2_t t = vtrnq_u16(vreinterpretq_u16_u8(a[i + k]), vreinterpretq_u16_u8(a[i + 2 + k]));
+                b[i + k] = vreinterpretq_u8_u16(t.val[0]);
+                b[i + 2 + k] = vreinterpretq_u8_u16(t.val[1]);
+            }
+        }
+        uint8x16_t c[16];
+        for (int i = 0; i < 16; i += 8) {
+            for (int k = 0; k < 4; ++k) {
+                const uint32x4x2_t t = vtrnq_u32(vreinterpretq_u32_u8(b[i + k]), vreinterpretq_u32_u8(b[i + 4 + k]));
+                c[i + k] = vreinterpretq_u8_u32(t.val[0]);
+                c[i + 4 + k] = vreinterpretq_u8_u32(t.val[1]);
+            }
+        }
+        for (int k = 0; k < 8; ++k) {
+            v[k] = vcombine_u8(vget_low_u8(c[k]), vget_low_u8(c[8 + k]));
+            v[8 + k] = vcombine_u8(vget_high_u8(c[k]), vget_high_u8(c[8 + k]));
+        }
+    }
+    void apply(const std::uint8_t in[16][16], std::uint8_t* out /* 16 columns of 16 */) const {
+        uint8x16_t v[16];
+        raw(in, v);
+        for (int k = 0; k < 16; ++k) vst1q_u8(out + column_of[k] * 16, v[k]);
+    }
+};
+
+}  // namespace
+#endif
+
+void repack_tq2_0x16(const BlockTQ2_0* in, std::size_t rows, std::size_t blocks, BlockTQ2_0x16* out) {
+#if defined(__aarch64__)
+    // Each row's packed bytes are built in vectors, then the 16 x 64 bytes of a
+    // group's block are transposed into the column-major qs with four 16 x 16
+    // transposes: no scattered byte stores.
+    static const Transpose16 transpose;
+    for (std::size_t g = 0; g < rows / 16; ++g) {
+        for (std::size_t b = 0; b < blocks; ++b) {
+            BlockTQ2_0x16& packed = out[g * blocks + b];
+            alignas(16) std::uint8_t rowbytes[16][64];
+            for (std::size_t r = 0; r < 16; ++r) {
+                const BlockTQ2_0& block = in[(g * 16 + r) * blocks + b];
+                packed.d[r] = block.d;
+                tq2_0_packed_row(block, rowbytes[r]);
+            }
+            for (int chunk = 0; chunk < 4; ++chunk) {
+                alignas(16) std::uint8_t tile[16][16];
+                for (int r = 0; r < 16; ++r) std::memcpy(tile[r], rowbytes[r] + chunk * 16, 16);
+                transpose.apply(tile, packed.qs + chunk * 256);
+            }
+        }
+    }
+#else
+    repack_tq2_0x16_scalar(in, rows, blocks, out);
+#endif
 }
 
 namespace {
