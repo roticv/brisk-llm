@@ -23,6 +23,7 @@ struct ServeOptions {
     bool verbose = false;        // log each request's tokens and timings to stderr
     bool prefetch = true;        // page the weights in at start (the first request would otherwise pay for it)
     bool lock = false;           // also pin them in memory (mlock)
+    std::size_t max_queue = 8;   // requests that may wait for the session; beyond that a 503 with Retry-After
 };
 
 // Serves until the process is killed. Throws std::runtime_error on failure to load or bind.

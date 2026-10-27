@@ -2,7 +2,7 @@
 """Starts brisk serve on a small model and checks the OpenAI-compatible API:
 /v1/models, chat completions (plain and streamed), prefix reuse across turns,
 stop strings, UTF-8 across token boundaries, and error responses."""
-import json, subprocess, sys, time, urllib.request, urllib.error
+import json, subprocess, sys, threading, time, urllib.request, urllib.error
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -26,7 +26,7 @@ def main():
     if not MODEL.exists():
         print("server_test: model missing, skipped")
         return 0
-    proc = subprocess.Popen([str(ROOT / "build-release" / "brisk"), "serve", str(MODEL), "--port", str(PORT), "-t", "4"],
+    proc = subprocess.Popen([str(ROOT / "build-release" / "brisk"), "serve", str(MODEL), "--port", str(PORT), "-t", "4", "--queue", "1"],
                             stderr=subprocess.DEVNULL)
     try:
         for _ in range(100):
@@ -119,6 +119,31 @@ def main():
         c = d["choices"][0]
         assert "tool_calls" not in c["message"] and c["finish_reason"] == "stop", c
 
+        # Requests take turns in arrival order; /health shows the queue. With --queue 1 a third
+        # concurrent request gets a 503 with Retry-After while two are held.
+        results = {}
+        def slow(name):
+            try:
+                results[name] = post("/v1/chat/completions", {"messages": [{"role": "user", "content": "Count to one hundred."}],
+                                                               "max_tokens": 300, "temperature": 0, "stream": True}, stream=True)
+            except urllib.error.HTTPError as e:
+                results[name] = e.code
+        threads = [threading.Thread(target=slow, args=(i,)) for i in range(3)]
+        for t in threads:
+            t.start()
+            time.sleep(0.1)
+        health = json.load(urllib.request.urlopen(URL + "/health"))
+        assert health["busy"] and health["queue_limit"] == 1, health
+        for t in threads:
+            t.join()
+        codes = sorted(v if isinstance(v, int) else 200 for v in results.values())
+        assert codes == [200, 200, 503], codes
+        for v in results.values():
+            if not isinstance(v, int):
+                assert v[-1] == "[DONE]", v[-3:]
+        health = json.load(urllib.request.urlopen(URL + "/health"))
+        assert not health["busy"] and health["queued"] == 0, health
+
         # Errors are OpenAI-shaped.
         try:
             post("/v1/chat/completions", {"messages": "no"})
@@ -127,7 +152,7 @@ def main():
             assert e.code == 400 and "error" in json.load(e)
         # SIGTERM during a streamed answer: the stream still ends with a finish chunk
         # and [DONE], and the process exits cleanly within a few seconds.
-        import signal, threading
+        import signal
         got = []
         def stream():  # appends each event as it arrives, so the signal can wait for the first
             body = {"messages": [{"role": "user", "content": "Count slowly from one to two hundred in words."}],

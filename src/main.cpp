@@ -357,7 +357,7 @@ int usage() {
                  "       brisk generate <model.gguf> (-p <prompt> | -f <prompt-file>) [options]\n"
                  "       brisk perplexity <model.gguf> -f <text-file> [-t <threads>] [--gpu]\n"
                  "       brisk serve <model.gguf> [--host <addr>] [--port <n>] [-t <threads>] [--gpu] [--ctx <tokens>]\n"
-                 "                  [--name <id>] [-v] [--no-prefetch] [--mlock]\n"
+                 "                  [--name <id>] [-v] [--no-prefetch] [--mlock] [--queue <n>]\n"
                  "                  OpenAI-compatible API (/v1/chat/completions, /v1/models); the weights are paged in at start\n"
                  "       brisk template <model.gguf> (<role> <content>)...   the rendered chat prompt\n"
                  "       brisk pull [<name>...] [--dir <dir>]   download a verified model file (no name: list them)\n"
@@ -483,6 +483,7 @@ int run(const std::vector<std::string>& args) {
             else if (flag == "-v" || flag == "--verbose") o.verbose = true;
             else if (flag == "--no-prefetch") o.prefetch = false;
             else if (flag == "--mlock") o.lock = true;
+            else if (flag == "--queue") o.max_queue = std::stoul(value());  // requests that may wait (default 8); more get a 503
             else return usage();
         }
         return brisk::serve(o);

@@ -4,6 +4,8 @@
 #include <cctype>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <cstdint>
 #include <csignal>
 #include <thread>
 
@@ -152,6 +154,56 @@ std::string render_chat_request(const GgufFile& file, const json& body, std::vec
 
 namespace {
 
+// A first-come, first-served queue for the one session: a request takes a
+// ticket on arrival (or is refused when `limit` are already waiting), waits for
+// its number, and releases the session when its generation is done.
+class Queue {
+public:
+    explicit Queue(std::size_t limit) : limit_(limit) {}
+
+    // A ticket, or nullopt when the queue is full.
+    std::optional<std::uint64_t> enter() {
+        std::lock_guard<std::mutex> lock(m_);
+        if (next_ - serving_ > limit_) return std::nullopt;  // one running plus `limit_` waiting
+        return next_++;
+    }
+    // Waits for the ticket's turn; false when the server is stopping first.
+    bool wait(std::uint64_t ticket) {
+        std::unique_lock<std::mutex> lock(m_);
+        while (serving_ != ticket) {
+            if (g_stopping.load()) return false;
+            cv_.wait_for(lock, std::chrono::milliseconds(200));
+        }
+        return true;
+    }
+    void leave() {
+        {
+            std::lock_guard<std::mutex> lock(m_);
+            ++serving_;
+        }
+        cv_.notify_all();
+    }
+    // Requests holding a ticket: the running one and the waiting ones.
+    std::size_t held() const {
+        std::lock_guard<std::mutex> lock(m_);
+        return static_cast<std::size_t>(next_ - serving_);
+    }
+
+private:
+    const std::size_t limit_;
+    mutable std::mutex m_;
+    std::condition_variable cv_;
+    std::uint64_t next_ = 0, serving_ = 0;
+};
+
+// Holds a ticket's turn for a scope; leaves the queue on destruction.
+struct Turn {
+    Queue& queue;
+    const bool ok;
+    Turn(Queue& q, std::uint64_t ticket) : queue(q), ok(q.wait(ticket)) {}
+    ~Turn() { queue.leave(); }
+};
+
 struct Request {
     std::vector<Token> prompt;
     std::size_t max_tokens = 0;
@@ -181,7 +233,7 @@ public:
     }
 
     explicit Server(const ServeOptions& options)
-        : options_(options), mapped_(options.model_path), file_(GgufFile::parse(mapped_.bytes())), tokenizer_(file_),
+        : options_(options), queue_(options.max_queue), mapped_(options.model_path), file_(GgufFile::parse(mapped_.bytes())), tokenizer_(file_),
           model_(checked(file_, options), /*repack=*/!options.gpu) {
         const ModelConfig& c = model_.config();
         context_ = context_for(options, c);
@@ -215,8 +267,10 @@ public:
 
     int run() {
         httplib::Server http;
-        http.Get("/health", [](const httplib::Request&, httplib::Response& res) {
-            res.set_content(R"({"status":"ok"})", "application/json");
+        http.Get("/health", [this](const httplib::Request&, httplib::Response& res) {
+            const std::size_t held = queue_.held();
+            const json body = {{"status", "ok"}, {"busy", held > 0}, {"queued", held > 0 ? held - 1 : 0}, {"queue_limit", options_.max_queue}};
+            res.set_content(body.dump(), "application/json");
         });
         http.Get("/v1/models", [this](const httplib::Request&, httplib::Response& res) {
             const json body = {{"object", "list"},
@@ -260,9 +314,9 @@ public:
     }
 
 private:
-    static void error(httplib::Response& res, int status, const std::string& message) {
+    static void error(httplib::Response& res, int status, const std::string& message, const char* type = nullptr) {
         res.status = status;
-        res.set_content(json{{"error", {{"message", message}, {"type", status == 400 ? "invalid_request_error" : "server_error"}}}}.dump(),
+        res.set_content(json{{"error", {{"message", message}, {"type", type != nullptr ? type : status == 400 ? "invalid_request_error" : "server_error"}}}}.dump(),
                         "application/json");
     }
 
@@ -531,9 +585,15 @@ private:
             return error(res, 400, e.what());
         }
         const std::string id = new_id(chat);
+        const std::optional<std::uint64_t> ticket = queue_.enter();
+        if (!ticket) {
+            res.set_header("Retry-After", "2");
+            return error(res, 503, "the server is busy: " + std::to_string(options_.max_queue) + " requests are already waiting", "server_busy");
+        }
 
         if (!r.stream) {
-            std::lock_guard<std::mutex> lock(mutex_);
+            const Turn turn(queue_, *ticket);
+            if (!turn.ok) return error(res, 503, "the server is shutting down", "server_stopping");
             double prompt_seconds = 0, gen_seconds = 0;
             std::size_t reused = 0;
             Generated g = generate(r, [](const std::string&, bool) { return true; }, prompt_seconds, gen_seconds, reused);
@@ -562,12 +622,17 @@ private:
         // Streaming: the whole generation runs inside the content provider, one
         // SSE event per decoded piece, then the finish chunk and [DONE].
         res.set_header("Cache-Control", "no-cache");
-        res.set_chunked_content_provider("text/event-stream", [this, r, id, chat](std::size_t, httplib::DataSink& sink) {
-            std::lock_guard<std::mutex> lock(mutex_);
+        res.set_chunked_content_provider("text/event-stream", [this, r, id, chat, ticket](std::size_t, httplib::DataSink& sink) {
+            const Turn turn(queue_, *ticket);
             auto send = [&](const json& j) {
                 const std::string line = "data: " + j.dump() + "\n\n";
                 return sink.write(line.data(), line.size());
             };
+            if (!turn.ok) {  // stopping before its turn came: an error event, then the end
+                send(json{{"error", {{"message", "the server is shutting down"}, {"type", "server_stopping"}}}});
+                sink.done();
+                return true;
+            }
             if (chat) send(chunk(id, chat, json{{"role", "assistant"}, {"content", ""}}, std::nullopt));
             double prompt_seconds = 0, gen_seconds = 0;
             std::size_t reused = 0;
@@ -604,6 +669,7 @@ private:
     }
 
     ServeOptions options_;
+    Queue queue_;  // one generation at a time: the session is shared, requests take turns
     MappedFile mapped_;
     GgufFile file_;
     Tokenizer tokenizer_;
@@ -611,7 +677,6 @@ private:
     std::unique_ptr<Engine> engine_;
     std::size_t context_ = 0;
     std::string name_;
-    std::mutex mutex_;           // one generation at a time: the session is shared
     std::vector<Token> cached_;  // the tokens the session currently holds
 };
 
