@@ -232,6 +232,8 @@ Measured along the way: a 128x64 tile with 8 simdgroups ran 3x slower (register 
 
 ## Raspberry Pi 4 Model B (4 GB, Cortex-A72 x4, Debian 13, 64-bit)
 
+Thermal note: the board got a heat sink on 2026-11-03. Since then four minutes of 4-thread generation plateau at 74-76 C with the clock steady at 1500 MHz and no throttling (idle 44 C); before it, long runs reached 80-83 C and throttled, so the numbers below taken over several minutes (llama-bench passes in particular) may be a few percent low.
+
 ### Pi, all families (2026-10-24, brisk `03a337a`)
 
 Every file brisk runs on the Pi, with the current engine (half-precision K/V cache, banded Q5_0/Q8_0 kernels, the Phase 7 families): `bench/run_brisk_bench.sh`, 4 threads, medians of 3 (`raspberrypi-brisk-03a337a.md`); llama.cpp `8216c84` by `run_llama_bench.sh` on the same files (`raspberrypi-llama.cpp-8216c84-2026-10-24.md`). Prompt = 492-513 tokens; generation = 128 tokens. Tokens/s; in brackets the earlier number where there is one (18 October, or for the Q4_K_M files the figure before the wide Q4_K kernel the same evening, `raspberrypi-brisk-f18813e-kquant.md`). The Pi reached 77 C and its soft throttle (`0xe0000`) during the brisk run and 57 C during llama-bench, so brisk's prompt numbers are, if anything, pessimistic.
