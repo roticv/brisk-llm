@@ -1,0 +1,18 @@
+bitnet-2B4T-TQ2_0-e4	8.6	4.8	7.96	4.83	63 C 0xe0000
+bitnet-2B4T-TQ2_0	8.6	4.4	7.99	4.36	64 C 0xe0000
+DeepSeek-R1-Distill-Qwen-1.5B-Q4_K_M	9.2	3.7	7.60	3.66	65 C 0xe0000
+gemma-3-1b-it-pure-Q4_0	21.8	6.2	13.10	6.16	64 C 0xe0000
+gemma-3-1b-it-Q4_K_M	16.3	4.5	11.11	4.44	64 C 0xe0000
+gemma-4-E2B-it-Q4_0	7.3	2.3	4.45	2.27	65 C 0xe0000
+LFM2-1.2B-Q4_0	15.6	5.2	9.69	5.12	64 C 0xe0000
+Llama-3.2-1B-Instruct-Q4_K_M	12.7	4.5	10.80	4.47	64 C 0xe0000
+Llama-3.2-3B-Instruct-Q4_K_M	4.3	1.8	3.41	1.78	66 C 0xe0000
+Qwen2.5-1.5B-Instruct-Q4_K_M	9.3	3.7	7.57	3.65	64 C 0xe0000
+Qwen3-0.6B-pure-Q4_0	30.6	10.6	18.87	10.09	62 C 0xe0000
+Qwen3-0.6B-Q4_0	29.8	9.6	18.97	9.35	62 C 0xe0000
+Qwen3-1.7B-pure-Q4_0	11.0	3.7	6.69	3.67	65 C 0xe0000
+Qwen3-1.7B-Q4_0	10.6	3.4	6.73	3.36	66 C 0xe0000
+Qwen3-1.7B-Q4_K_M	8.6	3.3	7.05	3.19	65 C 0xe0000
+SmolLM2-1.7B-Instruct-Q4_K_M	7.5	3.4	6.28	3.31	64 C 0xe0000
+SmolLM3-3B-Q4_K_M	4.3	1.9	3.34	1.87	66 C 0xe0000
+done

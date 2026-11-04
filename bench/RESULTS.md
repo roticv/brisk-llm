@@ -2,9 +2,9 @@
 
 Raw output is in `bench/results/`. Reproduce with `bench/run_brisk_bench.sh`, `bench/run_llama_bench.sh`, `bench/run_mac_sweep.sh` and `build/membw`.
 
-## Summary (2026-10-26)
+## Summary (Mac 2026-10-26, Pi 2026-11-04)
 
-Every family brisk runs, against llama.cpp `8216c84` on the same files. Tokens/s, prompt (~500 tokens) / generation. The later sections are the history.
+Every family brisk runs, against llama.cpp `8216c84` on the same files. Tokens/s, prompt (~500 tokens) / generation. The later sections are the history. The Pi table is the first taken without thermal throttling (heat sink, every run started below 55 C); it moved llama.cpp's numbers up more than brisk's, so the Pi comparison here supersedes every earlier one in this file.
 
 ### MacBook Air M4
 
@@ -29,25 +29,29 @@ The first seven rows are one sweep (`bench/run_mac_sweep.sh`, single runs with `
 
 Reading: generation is at the memory-bandwidth ceiling for both engines on both backends, so the two are within a few percent either way (brisk ahead on the K-quant files on the GPU since the Q4_K gemv rewrite, on BitNet by 11% on the GPU and 2x on the CPU, behind by 10% on Qwen3-0.6B's GPU generation and on the Q4_K_M Gemma 3, whose Q5_0/Q8_0 tensors have no tuned GPU gemv). Prompt processing on the GPU is 3-9% behind llama.cpp's tile on the small models and level on the rest; on the CPU at 4 threads brisk is 10-30% ahead on the K-quant files, level on Llama and Phi, and 6-12% behind on the Q4_0 and LFM2 files.
 
-### Raspberry Pi 4 (4 threads, medians of 3)
+### Raspberry Pi 4 (4 threads; brisk medians of 3, llama-bench one repetition; every run started below 55 C)
 
 | File | brisk | llama.cpp |
 |---|---:|---:|
-| Qwen3-0.6B pure Q4_0 | 30.6 / 10.6 | 18.0 / 9.8 |
-| Qwen3-1.7B pure Q4_0 | 11.0 / 3.6 | 5.7 / 3.4 |
-| BitNet 2B4T TQ2_0 | 8.5 / 4.6 | 7.2 / 4.4 |
-| Llama-3.2-1B Q4_K_M | 12.6 / 4.6 | 8.6 / 4.3 |
-| Llama-3.2-3B Q4_K_M | 3.8 / 1.8 | 2.8 / 1.7 |
-| Qwen2.5-1.5B Q4_K_M | 9.1 / 3.7 | 6.0 / 3.4 |
-| DeepSeek-R1-Distill-Qwen 1.5B Q4_K_M | 9.0 / 3.7 | 6.0 / 3.4 |
-| SmolLM2-1.7B Q4_K_M | 7.0 / 3.4 | 4.9 / 3.2 |
-| Gemma-3-1B pure Q4_0 | 21.5 / 6.2 | 11.4 / 5.9 |
-| Gemma-3-1B Q4_K_M | 16.0 / 4.4 | 9.4 / 4.3 |
-| LFM2-1.2B Q4_0 | 15.5 / 5.2 | 8.0 / 4.9 |
-| Gemma-4-E2B Q4_0 | 7.1 / 2.2 | 3.7 / 2.1 |
-| SmolLM3-3B Q4_K_M | 3.9 / 1.9 | 3.1 / 1.8 |
+| Qwen3-0.6B pure Q4_0 | 30.6 / 10.6 | 18.9 / 10.1 |
+| Qwen3-0.6B Q4_0 | 29.8 / 9.6 | 19.0 / 9.3 |
+| Qwen3-1.7B pure Q4_0 | 11.0 / 3.7 | 6.7 / 3.7 |
+| Qwen3-1.7B Q4_0 | 10.6 / 3.4 | 6.7 / 3.4 |
+| Qwen3-1.7B Q4_K_M | 8.6 / 3.3 | 7.0 / 3.2 |
+| BitNet 2B4T TQ2_0 (e4) | 8.6 / 4.8 | 8.0 / 4.8 |
+| BitNet 2B4T TQ2_0 | 8.6 / 4.4 | 8.0 / 4.4 |
+| Llama-3.2-1B Q4_K_M | 12.7 / 4.5 | 10.8 / 4.5 |
+| Llama-3.2-3B Q4_K_M | 4.3 / 1.8 | 3.4 / 1.8 |
+| Qwen2.5-1.5B Q4_K_M | 9.3 / 3.7 | 7.6 / 3.6 |
+| DeepSeek-R1-Distill-Qwen 1.5B Q4_K_M | 9.2 / 3.7 | 7.6 / 3.7 |
+| SmolLM2-1.7B Q4_K_M | 7.5 / 3.4 | 6.3 / 3.3 |
+| Gemma-3-1B pure Q4_0 | 21.8 / 6.2 | 13.1 / 6.2 |
+| Gemma-3-1B Q4_K_M | 16.3 / 4.5 | 11.1 / 4.4 |
+| LFM2-1.2B Q4_0 | 15.6 / 5.2 | 9.7 / 5.1 |
+| Gemma-4-E2B Q4_0 | 7.3 / 2.3 | 4.5 / 2.3 |
+| SmolLM3-3B Q4_K_M | 4.3 / 1.9 | 3.3 / 1.9 |
 
-Reading: brisk is ahead on every file for both prompts (1.2-1.9x; the Q4_0 files 1.7-1.9x, the K-quant files 1.3-1.5x, BitNet 1.2x through the lookup-table kernel) and generation (2-9%, both engines at the bandwidth ceiling).
+Reading (2026-11-04, steady state at 1500 MHz with the heat sink): brisk is ahead on prompt processing for every file, 1.2-1.7x (the Q4_0 files 1.6x, the K-quant files 1.2-1.5x, BitNet 1.08x), and generation is level — within 2% on every file, both engines at the memory-bandwidth ceiling. The October table's generation lead of 2-9% was llama.cpp's longer runs being thermally throttled; its prompt numbers were depressed too (Gemma 3 Q4_0 11.4 then, 13.1 now), which is why the prompt ratios here are smaller than the 1.2-1.9x stated before.
 
 ## MacBook Air M4 (4 performance + 6 efficiency cores, 32 GB)
 
@@ -234,7 +238,35 @@ Measured along the way: a 128x64 tile with 8 simdgroups ran 3x slower (register 
 
 Thermal note: the board got a heat sink on 2026-11-03. Since then four minutes of 4-thread generation plateau at 74-76 C with the clock steady at 1500 MHz and no throttling (idle 44 C); before it, long runs reached 80-83 C and throttled, so the numbers below taken over several minutes (llama-bench passes in particular) may be a few percent low.
 
-### Pi, all families (2026-10-24, brisk `03a337a`)
+### Pi, all families (2026-11-04, steady state after the heat sink)
+
+Every file brisk runs on the Pi, with the current engine, measured for the first time without thermal throttling: each run (every brisk repetition and each llama-bench pass) waited for the SoC to drop below 55 C, and the row's end temperature and `vcgencmd get_throttled` were recorded (62-66 C, soft limit never active). brisk: medians of 3 (`prompt512.txt` for the prompt, 32 generated tokens), 4 threads; llama.cpp `8216c84`: `llama-bench -p 512 -n 32 -t 4 -r 1`, pp512 and tg32 as separate passes. Raw rows in `bench/results/pi_sweep_20261104.tsv`. Tokens/s.
+
+| File | brisk prompt | llama.cpp prompt | brisk generation | llama.cpp generation |
+|---|---:|---:|---:|---:|
+| Qwen3-0.6B pure Q4_0 | 30.6 | 18.9 | 10.6 | 10.1 |
+| Qwen3-0.6B Q4_0 | 29.8 | 19.0 | 9.6 | 9.3 |
+| Qwen3-1.7B pure Q4_0 | 11.0 | 6.7 | 3.7 | 3.7 |
+| Qwen3-1.7B Q4_0 | 10.6 | 6.7 | 3.4 | 3.4 |
+| Qwen3-1.7B Q4_K_M | 8.6 | 7.0 | 3.3 | 3.2 |
+| BitNet 2B4T TQ2_0 (e4) | 8.6 | 8.0 | 4.8 | 4.8 |
+| BitNet 2B4T TQ2_0 | 8.6 | 8.0 | 4.4 | 4.4 |
+| Llama-3.2-1B Q4_K_M | 12.7 | 10.8 | 4.5 | 4.5 |
+| Llama-3.2-3B Q4_K_M | 4.3 | 3.4 | 1.8 | 1.8 |
+| Qwen2.5-1.5B Q4_K_M | 9.3 | 7.6 | 3.7 | 3.6 |
+| DeepSeek-R1-Distill-Qwen 1.5B Q4_K_M | 9.2 | 7.6 | 3.7 | 3.7 |
+| SmolLM2-1.7B Q4_K_M | 7.5 | 6.3 | 3.4 | 3.3 |
+| Gemma-3-1B pure Q4_0 | 21.8 | 13.1 | 6.2 | 6.2 |
+| Gemma-3-1B Q4_K_M | 16.3 | 11.1 | 4.5 | 4.4 |
+| LFM2-1.2B Q4_0 | 15.6 | 9.7 | 5.2 | 5.1 |
+| Gemma-4-E2B Q4_0 | 7.3 | 4.5 | 2.3 | 2.3 |
+| SmolLM3-3B Q4_K_M | 4.3 | 3.3 | 1.9 | 1.9 |
+
+Generation is level: both engines at the memory-bandwidth ceiling, within 2% on every file (brisk +5% on the 0.6B, where the per-token overhead outside the matmuls is the larger share). Prompt processing: brisk is 1.2-1.7x llama.cpp on every file (BitNet 1.08x through the lookup-table kernel). The 2026-10-24 table below this one was taken without the heat sink: llama.cpp's generation numbers there (0.1-0.4 lower per file) and its prompt numbers (up to 15% lower) were throttled during its longer passes, which is where the earlier "generation 2-9% ahead" came from.
+
+#### The 2026-10-24 table (before the heat sink; llama.cpp's runs throttled)
+
+Pi, all families (2026-10-24, brisk `03a337a`)
 
 Every file brisk runs on the Pi, with the current engine (half-precision K/V cache, banded Q5_0/Q8_0 kernels, the Phase 7 families): `bench/run_brisk_bench.sh`, 4 threads, medians of 3 (`raspberrypi-brisk-03a337a.md`); llama.cpp `8216c84` by `run_llama_bench.sh` on the same files (`raspberrypi-llama.cpp-8216c84-2026-10-24.md`). Prompt = 492-513 tokens; generation = 128 tokens. Tokens/s; in brackets the earlier number where there is one (18 October, or for the Q4_K_M files the figure before the wide Q4_K kernel the same evening, `raspberrypi-brisk-f18813e-kquant.md`). The Pi reached 77 C and its soft throttle (`0xe0000`) during the brisk run and 57 C during llama-bench, so brisk's prompt numbers are, if anything, pessimistic.
 

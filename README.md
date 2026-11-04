@@ -100,7 +100,7 @@ Phases 0-6 of the roadmap are done on both machines (the CPU engine, the Metal b
 
 Against llama.cpp on the same files (`bench/RESULTS.md`, Summary):
 
-- **Raspberry Pi 4:** ahead on every file. Prompt processing 1.2-1.9x (Q4_0 files 1.7-1.9x, K-quant files 1.3-1.5x, BitNet 1.2x), generation 2-9% ahead with both engines at the memory-bandwidth ceiling.
+- **Raspberry Pi 4:** prompt processing 1.2-1.7x llama.cpp on every file (Q4_0 files 1.6x, K-quant files 1.2-1.5x, BitNet 1.08x); generation level, within 2% on every file, both engines at the memory-bandwidth ceiling (measured unthrottled, with a heat sink, on 2026-11-04).
 - **M4 CPU (4 threads):** level on generation everywhere (bandwidth-bound); prompts 10-30% ahead on the K-quant files, level on Llama and Phi, 6-12% behind on the Q4_0 and LFM2 files. With all ten cores brisk's generation is 40% ahead because the pool uses the efficiency cores.
 - **M4 GPU:** generation within a few percent either way (ahead on the K-quant files and BitNet, 10% behind on Qwen3-0.6B); prompts 3-9% behind on the small models, level on the rest. The batched matmul runs at 85-90% of the GPU's measured matrix peak.
 
