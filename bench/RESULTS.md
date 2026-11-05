@@ -50,6 +50,7 @@ Reading: generation is at the memory-bandwidth ceiling for both engines on both 
 | LFM2-1.2B Q4_0 | 15.6 / 5.2 | 9.7 / 5.1 |
 | Gemma-4-E2B Q4_0 | 7.3 / 2.3 | 4.5 / 2.3 |
 | SmolLM3-3B Q4_K_M | 4.3 / 1.9 | 3.3 / 1.9 |
+| Qwen3.5-0.8B Q4_0 | 23.1 / 5.8 | 15.1 / 5.3 |
 
 Reading (2026-11-04, steady state at 1500 MHz with the heat sink): brisk is ahead on prompt processing for every file, 1.2-1.7x (the Q4_0 files 1.6x, the K-quant files 1.2-1.5x, BitNet 1.08x), and generation is level — within 2% on every file, both engines at the memory-bandwidth ceiling. The October table's generation lead of 2-9% was llama.cpp's longer runs being thermally throttled; its prompt numbers were depressed too (Gemma 3 Q4_0 11.4 then, 13.1 now), which is why the prompt ratios here are smaller than the 1.2-1.9x stated before.
 
@@ -261,6 +262,7 @@ Every file brisk runs on the Pi, with the current engine, measured for the first
 | LFM2-1.2B Q4_0 | 15.6 | 9.7 | 5.2 | 5.1 |
 | Gemma-4-E2B Q4_0 | 7.3 | 4.5 | 2.3 | 2.3 |
 | SmolLM3-3B Q4_K_M | 4.3 | 3.3 | 1.9 | 1.9 |
+| Qwen3.5-0.8B Q4_0 | 23.1 | 15.1 | 5.8 | 5.3 |
 
 Generation is level: both engines at the memory-bandwidth ceiling, within 2% on every file (brisk +5% on the 0.6B, where the per-token overhead outside the matmuls is the larger share). Prompt processing: brisk is 1.2-1.7x llama.cpp on every file (BitNet 1.08x through the lookup-table kernel). The 2026-10-24 table below this one was taken without the heat sink: llama.cpp's generation numbers there (0.1-0.4 lower per file) and its prompt numbers (up to 15% lower) were throttled during its longer passes, which is where the earlier "generation 2-9% ahead" came from.
 

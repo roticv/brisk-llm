@@ -525,6 +525,97 @@ std::string render_gemma4(const std::vector<ChatMessage>& messages, const ChatOp
     return out;
 }
 
+// Qwen3.5: ChatML with every message's content trimmed, thinking off unless
+// asked for (the generation prompt then opens a <think> block the model
+// continues, otherwise prefills an empty one), the reasoning of answers after
+// the last user query kept, and tools in an XML calling format:
+// <tool_call>\n<function=name>\n<parameter=k>\nv\n</parameter>\n</function>\n</tool_call>.
+std::string render_qwen35(const std::vector<ChatMessage>& messages, const ChatOptions& o) {
+    std::string out;
+    std::size_t first = 0;
+    if (!o.tools.empty()) {
+        out += "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>";
+        for (const std::string& t : o.tools) out += "\n" + python_json(t);
+        out += "\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n"
+               "<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n"
+               "<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n"
+               "</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n"
+               "- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n"
+               "- Required parameters MUST be specified\n"
+               "- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n"
+               "- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n"
+               "</IMPORTANT>";
+        if (!messages.empty() && messages[0].role == "system") {
+            const std::string_view content = trim(messages[0].content);
+            if (!content.empty()) out += "\n\n" + std::string(content);
+            first = 1;
+        }
+        out += "<|im_end|>\n";
+    } else if (!messages.empty() && messages[0].role == "system") {
+        out += "<|im_start|>system\n" + std::string(trim(messages[0].content)) + "<|im_end|>\n";
+        first = 1;
+    }
+    std::size_t last_query = messages.empty() ? 0 : messages.size() - 1;
+    for (std::size_t i = messages.size(); i-- > 0;) {
+        const std::string_view c = trim(messages[i].content);
+        if (messages[i].role == "user" && !(c.starts_with("<tool_response>") && c.ends_with("</tool_response>"))) {
+            last_query = i;
+            break;
+        }
+    }
+    for (std::size_t i = first; i < messages.size(); ++i) {
+        const ChatMessage& m = messages[i];
+        check_role(m, true);
+        std::string content(trim(m.content));
+        if (m.role == "system") throw std::runtime_error("chat: Qwen3.5 takes a system message only first");
+        if (m.role == "user") {
+            out += "<|im_start|>user\n" + content + "<|im_end|>\n";
+        } else if (m.role == "assistant") {
+            std::string reasoning = m.reasoning;
+            if (m.reasoning.empty()) {
+                const std::size_t end = content.find("</think>");
+                if (end != std::string::npos) {
+                    std::string_view r = strip_newlines(std::string_view(content).substr(0, end), false, true);
+                    const std::size_t open = r.rfind("<think>");
+                    if (open != std::string_view::npos) r = strip_newlines(r.substr(open + 7), true, false);
+                    reasoning = std::string(r);
+                    content = std::string(strip_newlines(std::string_view(content).substr(end + 8), true, false));
+                }
+            }
+            reasoning = std::string(trim(reasoning));
+            out += "<|im_start|>assistant\n";
+            if (i > last_query) out += "<think>\n" + reasoning + "\n</think>\n\n";
+            out += content;
+            for (std::size_t c = 0; c < m.tool_calls.size(); ++c) {
+                const ToolCall& call = m.tool_calls[c];
+                out += (c == 0 ? (content.empty() ? "" : "\n\n") : "\n") + std::string("<tool_call>\n<function=") + call.name + ">\n";
+                const ojson args = ojson::parse(call.arguments, nullptr, false);
+                if (args.is_object()) {
+                    for (const auto& [key, value] : args.items()) {
+                        out += "<parameter=" + key + ">\n";
+                        if (value.is_string()) out += value.get<std::string>();
+                        else if (value.is_object() || value.is_array()) out += python_json(value.dump());
+                        else if (value.is_boolean()) out += value.get<bool>() ? "True" : "False";
+                        else out += value.dump();
+                        out += "\n</parameter>\n";
+                    }
+                }
+                out += "</function>\n</tool_call>";
+            }
+            out += "<|im_end|>\n";
+        } else {  // tool: consecutive results share one user turn
+            if (i == first || messages[i - 1].role != "tool") out += "<|im_start|>user";
+            out += "\n<tool_response>\n" + content + "\n</tool_response>";
+            if (i + 1 == messages.size() || messages[i + 1].role != "tool") out += "<|im_end|>\n";
+        }
+    }
+    if (o.generation_prompt) {
+        out += "<|im_start|>assistant\n";
+        out += o.think && o.think_requested ? "<think>\n" : "<think>\n\n</think>\n\n";
+    }
+    return out;
+}
+
 // SmolLM3: ChatML with a system turn the template composes (a metadata block
 // with the knowledge cutoff, today's date and the reasoning mode, then custom
 // instructions or the default persona). The file's template leaves that turn
@@ -659,6 +750,7 @@ ChatFormat chat_format_of(const GgufFile& file) {
     const std::string_view tmpl = file.get<std::string_view>("tokenizer.chat_template").value_or("");
     if (tmpl.find("<|im_start|>") != std::string_view::npos) {
         if (tmpl.find("Reasoning Mode:") != std::string_view::npos) return ChatFormat::SmolLM3;
+        if (tmpl.find("<function=") != std::string_view::npos) return ChatFormat::Qwen35;
         return tmpl.find("<think>") != std::string_view::npos ? ChatFormat::Qwen3 : ChatFormat::ChatML;
     }
     if (tmpl.find("<|start_header_id|>") != std::string_view::npos) return ChatFormat::Llama3;
@@ -678,6 +770,7 @@ ChatFormat chat_format_of(const GgufFile& file) {
         case Architecture::Phi3: return ChatFormat::Phi;
         case Architecture::LFM2: return ChatFormat::ChatML;
         case Architecture::SmolLM3: return ChatFormat::SmolLM3;
+        case Architecture::Qwen35: return ChatFormat::Qwen35;
     }
     throw std::runtime_error("chat: no template for this file");
 }
@@ -811,7 +904,8 @@ std::string gemma4_arguments_to_json(std::string_view text) {
 }
 
 bool chat_format_has_tools(ChatFormat format) {
-    return format == ChatFormat::ChatML || format == ChatFormat::Qwen3 || format == ChatFormat::Llama3 || format == ChatFormat::Gemma4;
+    return format == ChatFormat::ChatML || format == ChatFormat::Qwen3 || format == ChatFormat::Llama3 || format == ChatFormat::Gemma4 ||
+           format == ChatFormat::Qwen35;
 }
 
 std::string render_chat(ChatFormat format, const std::vector<ChatMessage>& messages, const ChatOptions& options) {
@@ -834,6 +928,7 @@ std::string render_chat(ChatFormat format, const std::vector<ChatMessage>& messa
         case ChatFormat::Phi: return render_phi(messages, options);
         case ChatFormat::BitNet: return render_bitnet(messages, options);
         case ChatFormat::SmolLM3: return render_smollm3(messages, options);
+        case ChatFormat::Qwen35: return render_qwen35(messages, options);
     }
     throw std::runtime_error("chat: unknown format");
 }

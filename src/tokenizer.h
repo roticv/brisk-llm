@@ -18,7 +18,7 @@ using Token = std::int32_t;
 // Qwen2 and Llama3 are llama.cpp's hand-written matchers for those models'
 // regexes; Gpt2 is the original GPT-2 pattern; SmolLM is Gpt2 after every
 // digit has been cut into its own piece.
-enum class PreTokenizer { Qwen2, Llama3, Gpt2, SmolLM, Gpt4o };
+enum class PreTokenizer { Qwen2, Llama3, Gpt2, SmolLM, Gpt4o, Qwen35 };  // Qwen35: Llama 3's pattern with marks as letters and single digits
 
 // Splits text into the words that byte-pair encoding is applied to, following
 // the Qwen2 pre-tokenizer regex:

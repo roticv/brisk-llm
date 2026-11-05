@@ -145,8 +145,9 @@ Architecture architecture_of(const GgufFile& file) {
     if (architecture == "phi3") return Architecture::Phi3;
     if (architecture == "lfm2") return Architecture::LFM2;
     if (architecture == "smollm3") return Architecture::SmolLM3;
+    if (architecture == "qwen35") return Architecture::Qwen35;
     fail("unsupported architecture '" + std::string(architecture.value_or("(none)")) +
-         "'; qwen3, qwen2, llama, gemma3, gemma4, bitnet, phi3, lfm2 and smollm3 are supported");
+         "'; qwen3, qwen2, llama, gemma3, gemma4, bitnet, phi3, lfm2, smollm3 and qwen35 are supported");
 }
 
 // A float32 tensor of the file, in place (the config's rope factors).
@@ -250,9 +251,30 @@ ModelConfig Model::parse_config(const GgufFile& file) {
         config.conv_taps = file.get<std::uint32_t>(prefix + "shortconv.l_cache").value_or(0);
         if (config.conv_taps < 2 || config.conv_taps > 8) fail("unsupported short-convolution width");
     }
+    if (config.architecture == Architecture::Qwen35) {
+        const std::uint32_t interval = file.get<std::uint32_t>(prefix + "full_attention_interval").value_or(0);
+        if (interval == 0) fail("qwen35: full_attention_interval is missing");
+        config.ssm_state = require_u32(file, prefix + "ssm.state_size");
+        config.ssm_k_heads = require_u32(file, prefix + "ssm.group_count");
+        config.ssm_v_heads = require_u32(file, prefix + "ssm.time_step_rank");
+        config.ssm_inner = require_u32(file, prefix + "ssm.inner_size");
+        config.ssm_conv = require_u32(file, prefix + "ssm.conv_kernel");
+        if (config.ssm_v_heads == 0 || config.ssm_inner % config.ssm_v_heads != 0 || config.ssm_v_dim() != config.ssm_state ||
+            config.ssm_k_heads != config.ssm_v_heads || config.ssm_conv < 2 || config.ssm_conv > 8) {
+            fail("qwen35: unsupported DeltaNet shape (equal key and value heads of state_size values are supported)");
+        }
+        if (config.kv_head_counts.empty()) {
+            config.kv_head_counts.assign(config.layer_count, 0);
+            for (std::size_t l = 0; l < config.layer_count; ++l) {
+                if ((l + 1) % interval == 0) config.kv_head_counts[l] = config.kv_head_count;
+            }
+        }
+        config.attention_gate = true;
+        config.rope_dim = file.get<std::uint32_t>(prefix + "rope.dimension_count").value_or(0);
+    }
     for (std::size_t l = 0; l < config.layer_count; ++l) {
         const std::uint32_t kv = config.kv_head_count_of(l);
-        if (kv == 0 && config.architecture == Architecture::LFM2) continue;  // a convolution layer
+        if (kv == 0 && (config.architecture == Architecture::LFM2 || config.architecture == Architecture::Qwen35)) continue;  // a convolution or recurrent layer
         if (kv == 0 || config.head_count % kv != 0) fail("head_count is not a multiple of head_count_kv");
         if (config.head_count / kv > kMaxHeadsPerKv) fail("more than 16 query heads per key/value head is not supported");
     }
@@ -318,6 +340,23 @@ Model::Model(const GgufFile& file, bool repack) : repack_(repack) {
         const std::size_t ff_l = config_.ff_dim_of(i);
         const bool own_kv = config_.kv_layer_of(i) == i;
         layer.attention_norm = load(file, block + "attn_norm.weight", embd);
+        if (config_.layer_is_recurrent(i)) {
+            const std::size_t qkv = config_.ssm_qkv_dim();
+            layer.ssm_qkv = load_matrix(file, block + "attn_qkv.weight", qkv, embd);
+            layer.ssm_gate = load_matrix(file, block + "attn_gate.weight", config_.ssm_inner, embd);
+            layer.ssm_alpha = load_matrix(file, block + "ssm_alpha.weight", config_.ssm_v_heads, embd);
+            layer.ssm_beta = load_matrix(file, block + "ssm_beta.weight", config_.ssm_v_heads, embd);
+            layer.ssm_a = load(file, block + "ssm_a", config_.ssm_v_heads);
+            layer.ssm_dt_bias = load(file, block + "ssm_dt.bias", config_.ssm_v_heads);
+            layer.ssm_conv_weight = load(file, block + "ssm_conv1d.weight", std::size_t{config_.ssm_conv} * qkv);
+            layer.ssm_norm = load(file, block + "ssm_norm.weight", config_.ssm_v_dim());
+            layer.ssm_out = load_matrix(file, block + "ssm_out.weight", embd, config_.ssm_inner);
+            layer.feed_forward_norm = load(file, block + "post_attention_norm.weight", embd);
+            layer.gate = load_matrix(file, block + "ffn_gate.weight", ff_l, embd);
+            layer.up = load_matrix(file, block + "ffn_up.weight", ff_l, embd);
+            layer.down = load_matrix(file, block + "ffn_down.weight", embd, ff_l);
+            continue;
+        }
         if (config_.layer_is_conv(i)) {
             layer.conv_in = load_matrix(file, block + "shortconv.in_proj.weight", 3 * embd, embd);
             layer.conv_out = load_matrix(file, block + "shortconv.out_proj.weight", embd, embd);
@@ -341,7 +380,8 @@ Model::Model(const GgufFile& file, bool repack) : repack_(repack) {
             layer.down = load_matrix(file, block + "ffn_down.weight", embd, ff_l);
             continue;
         }
-        layer.query = load_matrix(file, block + "attn_q.weight", query_dim_l, embd);
+        // Qwen3.5: the query projection carries a sigmoid gate after each head's query.
+        layer.query = load_matrix(file, block + "attn_q.weight", config_.attention_gate ? 2 * query_dim_l : query_dim_l, embd);
         if (own_kv) {
             layer.key = load_matrix(file, block + "attn_k.weight", kv_dim_l, embd);
             // Gemma 4 global layers may have no V projection: K serves as V.
@@ -351,7 +391,8 @@ Model::Model(const GgufFile& file, bool repack) : repack_(repack) {
         if (bitnet) {
             layer.attention_sub_norm = load(file, block + "attn_sub_norm.weight", embd);
             layer.feed_forward_sub_norm = load(file, block + "ffn_sub_norm.weight", ff);
-        } else if (config_.architecture == Architecture::Qwen3 || config_.architecture == Architecture::LFM2 || gemma) {
+        } else if (config_.architecture == Architecture::Qwen3 || config_.architecture == Architecture::LFM2 || gemma ||
+                   config_.architecture == Architecture::Qwen35) {
             layer.query_norm = load(file, block + "attn_q_norm.weight", head_dim_l);
             if (own_kv) layer.key_norm = load(file, block + "attn_k_norm.weight", head_dim_l);
         }
@@ -374,7 +415,7 @@ Model::Model(const GgufFile& file, bool repack) : repack_(repack) {
             layer.value_bias = load(file, block + "attn_v.bias", kv_dim);
         }
         layer.attention_output = load_matrix(file, block + "attn_output.weight", embd, query_dim_l);
-        layer.feed_forward_norm = load(file, block + "ffn_norm.weight", embd);
+        layer.feed_forward_norm = load(file, block + (config_.architecture == Architecture::Qwen35 ? "post_attention_norm.weight" : "ffn_norm.weight"), embd);
         layer.gate = load_matrix(file, block + "ffn_gate.weight", ff_l, embd);
         layer.up = load_matrix(file, block + "ffn_up.weight", ff_l, embd);
         layer.down = load_matrix(file, block + "ffn_down.weight", embd, ff_l);
@@ -630,6 +671,23 @@ Session::Session(const Model& model, std::size_t threads, std::size_t max_contex
         conv_.resize(kMaxBatch * 3 * c.embedding_dim);
         conv_cache_.resize(c.layer_count);
     }
+    if (c.architecture == Architecture::Qwen35) {
+        if (c.ssm_state > kMaxSsmState) fail("qwen35: a DeltaNet state wider than 256 is not supported");
+        ssm_state_.resize(c.layer_count);
+        ssm_ring_.resize(c.layer_count);
+        for (std::size_t l = 0; l < c.layer_count; ++l) {
+            if (!c.layer_is_recurrent(l)) continue;
+            ssm_state_[l].assign(std::size_t{c.ssm_v_heads} * c.ssm_state * c.ssm_state, 0.0f);
+            ssm_ring_[l].assign((c.ssm_conv - 1) * c.ssm_qkv_dim(), 0.0f);
+        }
+        ssm_qkv_.resize(kMaxBatch * c.ssm_qkv_dim());
+        ssm_conv_out_.resize(kMaxBatch * c.ssm_qkv_dim());
+        ssm_z_.resize(kMaxBatch * c.ssm_inner);
+        ssm_ab_.resize(kMaxBatch * 2 * c.ssm_v_heads);
+        attended_.resize(kMaxBatch * std::max<std::size_t>(query_dim, c.ssm_inner));
+        query_gate_.resize(kMaxBatch * 2 * query_dim);
+        attention_gate_.resize(kMaxBatch * query_dim);
+    }
     rope_factors_ = c.rope_factors;
     if (!c.rope_factors_long.empty() && c.rope_original_context != 0 && max_context_ > c.rope_original_context) {
         rope_factors_ = c.rope_factors_long;  // LongRoPE: the long-context factors past the original context
@@ -668,9 +726,142 @@ std::span<const float> Session::eval_all(std::span<const Token> tokens) {
     return std::span<const float>(logits_.data(), tokens.size() * c.vocab_size);
 }
 
+void Session::reset_recurrent() {
+    for (std::vector<float>& st : ssm_state_) std::fill(st.begin(), st.end(), 0.0f);
+    for (std::vector<float>& ring : ssm_ring_) std::fill(ring.begin(), ring.end(), 0.0f);
+    snapshot_.valid = false;
+}
+
 void Session::rollback(std::size_t position) {
     if (position > position_) fail("cannot roll forward");
+    if (model_.config().architecture == Architecture::Qwen35 && position != position_) {
+        // The recurrent layers' states absorb every token: they can step back to
+        // the snapshot taken before the latest batch's last token, or start over.
+        // Any other position becomes a restart; position() tells the caller.
+        if (snapshot_.valid && snapshot_.position == position) {
+            ssm_state_ = snapshot_.state;
+            ssm_ring_ = snapshot_.ring;
+            snapshot_.valid = false;
+        } else {
+            reset_recurrent();
+            position = 0;
+        }
+    }
     position_ = position;  // the caches keep their storage; later entries are simply overwritten
+}
+
+// Qwen3.5's Gated DeltaNet layer for the batch's n tokens at position_:
+// q|k|v = W_qkv norm(h) through a causal conv over the last ssm_conv inputs
+// and a SiLU; per head, q and k are L2-normalised and the state S (values x
+// keys) takes the delta rule S = exp(g) S + k (v - S k)^T beta, o = S q, with
+// g = softplus(alpha + dt_bias) * A and beta = sigmoid(beta); the output is
+// RMS-normalised per head, gated by SiLU(W_gate norm(h)), and projected.
+// Tokens run in order (the recurrence), heads in parallel.
+void Session::forward_recurrent(std::size_t l, std::size_t n) {
+    const ModelConfig& c = model_.config();
+    const Model::Layer& layer = model_.layers()[l];
+    const std::size_t embd = c.embedding_dim;
+    const std::size_t qkv_dim = c.ssm_qkv_dim();
+    const std::size_t heads = c.ssm_v_heads, dim = c.ssm_state, taps = c.ssm_conv;
+    const std::size_t k_off = std::size_t{c.ssm_k_heads} * dim, v_off = 2 * k_off;
+    std::vector<float>& state = ssm_state_[l];
+    std::vector<float>& ring = ssm_ring_[l];
+    auto rows = [](std::vector<float>& v, std::size_t t, std::size_t width) {
+        return std::span<float>(v.data() + t * width, width);
+    };
+
+    {
+        const Timed timed(profile_.norm_rope);
+        pool_.run(n, [&](std::size_t t) {
+            rms_norm(rows(hidden_, t, embd), layer.attention_norm, c.rms_epsilon, rows(normed_, t, embd));
+        });
+    }
+    const Target targets[4] = {{&layer.ssm_qkv, ssm_qkv_.data()}, {&layer.ssm_gate, ssm_z_.data()},
+                               {&layer.ssm_alpha, ssm_ab_.data()}, {&layer.ssm_beta, ssm_ab_.data() + kMaxBatch * heads}};
+    multiply(targets, normed_.data(), n);
+
+    const Timed timed(profile_.attention);
+    // The conv: input i of token t is the batch's token t - (taps - 1) + i, or the ring's.
+    auto input_row = [&](std::ptrdiff_t t) -> const float* {
+        if (t >= 0) return ssm_qkv_.data() + static_cast<std::size_t>(t) * qkv_dim;
+        return ring.data() + (static_cast<std::size_t>(t + static_cast<std::ptrdiff_t>(taps) - 1)) * qkv_dim;
+    };
+    pool_.run(n, [&](std::size_t t) {
+        float* out = ssm_conv_out_.data() + t * qkv_dim;
+        std::fill_n(out, qkv_dim, 0.0f);
+        for (std::size_t i = 0; i < taps; ++i) {
+            const float* in = input_row(static_cast<std::ptrdiff_t>(t) - static_cast<std::ptrdiff_t>(taps - 1) + static_cast<std::ptrdiff_t>(i));
+            for (std::size_t ch = 0; ch < qkv_dim; ++ch) out[ch] += layer.ssm_conv_weight[ch * taps + i] * in[ch];
+        }
+        for (std::size_t ch = 0; ch < qkv_dim; ++ch) out[ch] = out[ch] / (1.0f + std::exp(-out[ch]));
+    });
+    // The snapshot: states as they are before the batch's last token.
+    if (snapshot_.state.size() != ssm_state_.size()) {
+        snapshot_.state.resize(ssm_state_.size());
+        snapshot_.ring.resize(ssm_ring_.size());
+    }
+    {
+        std::vector<float>& ring_before = snapshot_.ring[l];
+        ring_before.resize(ring.size());
+        for (std::size_t i = 0; i + 1 < taps; ++i) {  // the taps - 1 inputs before token n - 1
+            std::copy_n(input_row(static_cast<std::ptrdiff_t>(n) - 1 - static_cast<std::ptrdiff_t>(taps - 1) + static_cast<std::ptrdiff_t>(i)), qkv_dim,
+                        ring_before.data() + i * qkv_dim);
+        }
+    }
+    const float q_scale = 1.0f / std::sqrt(static_cast<float>(dim));
+    for (std::size_t t = 0; t < n; ++t) {
+        if (t + 1 == n) snapshot_.state[l] = state;
+        pool_.run(heads, [&](std::size_t h) {
+            const float* row = ssm_conv_out_.data() + t * qkv_dim;
+            float q[kMaxSsmState], k[kMaxSsmState], d[kMaxSsmState];
+            auto l2 = [&](const float* src, float* dst, float extra) {
+                float sum = 0.0f;
+                for (std::size_t i = 0; i < dim; ++i) sum += src[i] * src[i];
+                const float inv = extra / std::sqrt(sum + c.rms_epsilon);
+                for (std::size_t i = 0; i < dim; ++i) dst[i] = src[i] * inv;
+            };
+            l2(row + h * dim, q, q_scale);
+            l2(row + k_off + h * dim, k, 1.0f);
+            const float* v = row + v_off + h * dim;
+            const float alpha = ssm_ab_[t * heads + h] + layer.ssm_dt_bias[h];
+            const float softplus = alpha > 20.0f ? alpha : std::log1p(std::exp(alpha));
+            const float decay = std::exp(softplus * layer.ssm_a[h]);
+            const float beta = 1.0f / (1.0f + std::exp(-ssm_ab_[kMaxBatch * heads + t * heads + h]));
+            float* S = state.data() + h * dim * dim;  // S[j][i]: value j, key i
+            for (std::size_t j = 0; j < dim; ++j) {
+                float* Sj = S + j * dim;
+                float sk = 0.0f;
+                for (std::size_t i = 0; i < dim; ++i) {
+                    Sj[i] *= decay;
+                    sk += Sj[i] * k[i];
+                }
+                d[j] = (v[j] - sk) * beta;
+            }
+            float* o = attended_.data() + t * c.ssm_inner + h * dim;
+            for (std::size_t j = 0; j < dim; ++j) {
+                float* Sj = S + j * dim;
+                float oj = 0.0f;
+                for (std::size_t i = 0; i < dim; ++i) {
+                    Sj[i] += k[i] * d[j];
+                    oj += Sj[i] * q[i];
+                }
+                o[j] = oj;
+            }
+            // Gated norm: RMS over the head, the shared weight, times SiLU of the gate.
+            const std::span<float> head(o, dim);
+            rms_norm(head, layer.ssm_norm, c.rms_epsilon, head);
+            const float* z = ssm_z_.data() + t * c.ssm_inner + h * dim;
+            for (std::size_t j = 0; j < dim; ++j) o[j] *= z[j] / (1.0f + std::exp(-z[j]));
+        });
+    }
+    // The ring: the last taps - 1 inputs seen.
+    for (std::size_t i = 0; i + 1 < taps; ++i) {
+        std::copy_n(input_row(static_cast<std::ptrdiff_t>(n) - static_cast<std::ptrdiff_t>(taps - 1) + static_cast<std::ptrdiff_t>(i)), qkv_dim,
+                    ring.data() + i * qkv_dim);
+    }
+    snapshot_.position = position_ + n - 1;
+    snapshot_.valid = true;
+    multiply(layer.ssm_out, attended_.data(), n, projected_.data());
 }
 
 void Session::eval_batch(std::span<const Token> tokens, bool all_logits) {
@@ -739,7 +930,9 @@ void Session::eval_batch(std::span<const Token> tokens, bool all_logits) {
 
     for (std::size_t l = 0; l < model_.layers().size(); ++l) {
         const Model::Layer& layer = model_.layers()[l];
-        if (c.layer_is_conv(l)) {
+        if (c.layer_is_recurrent(l)) {
+            forward_recurrent(l, n);
+        } else if (c.layer_is_conv(l)) {
             // LFM2 short convolution: [b | c | x] = in_proj(norm(h)); bx = b * x is the
             // conv's state, kept per position; out = c * conv(bx) over the last
             // conv_taps positions (kernel w[d][k], oldest first), then out_proj.
@@ -806,7 +999,18 @@ void Session::eval_batch(std::span<const Token> tokens, bool all_logits) {
                     rms_norm(rows(hidden_, t, embd), layer.attention_norm, c.rms_epsilon, rows(normed_, t, embd));
                 });
             }
-            if (own_kv) {
+            if (c.attention_gate) {
+                // Qwen3.5: each head's query is followed by its gate in the projection's output.
+                const Target qkv[3] = {{&layer.query, query_gate_.data()}, {&layer.key, new_keys}, {&layer.value, new_values}};
+                multiply(qkv, normed_.data(), n);
+                pool_.run(n, [&](std::size_t t) {
+                    for (std::size_t h = 0; h < c.head_count; ++h) {
+                        const float* src = query_gate_.data() + t * 2 * query_dim + h * 2 * head_dim;
+                        std::copy_n(src, head_dim, query_.data() + t * query_dim + h * head_dim);
+                        std::copy_n(src + head_dim, head_dim, attention_gate_.data() + t * query_dim + h * head_dim);
+                    }
+                });
+            } else if (own_kv) {
                 const Target qkv[3] = {{&layer.query, query_.data()}, {&layer.key, new_keys}, {&layer.value, new_values}};
                 multiply(qkv, normed_.data(), n);
             } else {
@@ -893,6 +1097,13 @@ void Session::eval_batch(std::span<const Token> tokens, bool all_logits) {
                 pool_.run(n, [&](std::size_t t) {
                     const std::span<float> a(attended_.data() + t * query_dim, query_dim);
                     rms_norm(a, layer.attention_sub_norm, c.rms_epsilon, a);
+                });
+            }
+            if (c.attention_gate) {
+                pool_.run(n, [&](std::size_t t) {
+                    float* a = attended_.data() + t * query_dim;
+                    const float* g = attention_gate_.data() + t * query_dim;
+                    for (std::size_t i = 0; i < query_dim; ++i) a[i] *= 1.0f / (1.0f + std::exp(-g[i]));
                 });
             }
             multiply(layer.attention_output, attended_.data(), n, projected_.data());

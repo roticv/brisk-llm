@@ -27,6 +27,7 @@ enum class Architecture {
     Phi3,    // Phi-3/4-mini: fused QKV and gate/up tensors, partial rotary with LongRoPE factors
     LFM2,    // Liquid LFM2: short-convolution layers (gated 3-tap causal conv) between attention layers
     SmolLM3, // Llama-shaped, with every fourth layer attending without RoPE (NoPE)
+    Qwen35,  // Qwen3.5: Gated DeltaNet (linear attention) layers with every fourth layer gated full attention
 };
 
 // Query heads per key/value head, at most (the attention tiles size their query arrays by it).
@@ -95,6 +96,17 @@ struct ModelConfig {
     std::uint32_t conv_taps = 0;  // LFM2's shortconv.l_cache: the conv kernel's width in tokens
     // SmolLM3: every fourth layer (the 4th, 8th, ...) has no positional rotation.
     std::uint32_t no_rope_step = 0;
+    // Qwen3.5: a layer with no key/value heads is a Gated DeltaNet layer: a
+    // fused q|k|v projection of ssm_k_heads * ssm_state * 2 + ssm_inner channels
+    // through a causal conv of ssm_conv taps, then a delta-rule recurrence over
+    // a per-head ssm_state x ssm_state matrix state (ssm_v_heads heads of
+    // ssm_inner / ssm_v_heads values), gated by a SiLU of a second projection.
+    // Its attention layers carry a sigmoid gate in the query projection.
+    bool layer_is_recurrent(std::size_t layer) const { return architecture == Architecture::Qwen35 && kv_head_count_of(layer) == 0; }
+    bool attention_gate = false;
+    std::uint32_t ssm_state = 0, ssm_k_heads = 0, ssm_v_heads = 0, ssm_inner = 0, ssm_conv = 0;
+    std::size_t ssm_qkv_dim() const { return 2 * std::size_t{ssm_k_heads} * ssm_state + ssm_inner; }
+    std::size_t ssm_v_dim() const { return ssm_v_heads == 0 ? 0 : ssm_inner / ssm_v_heads; }
     bool layer_has_rope(std::size_t layer) const { return no_rope_step == 0 || (layer + 1) % no_rope_step != 0; }
     std::uint32_t head_dim_of(std::size_t layer) const {
         return head_dim_local != 0 && layer_slides(layer) ? head_dim_local : head_dim;
@@ -134,6 +146,9 @@ public:
         // conv kernel is `conv_taps` weights per channel (oldest first), out_proj follows.
         Matrix conv_in, conv_out;
         std::span<const float> conv_weight;
+        // Qwen3.5 Gated DeltaNet layers (see ModelConfig::layer_is_recurrent).
+        Matrix ssm_qkv, ssm_gate, ssm_alpha, ssm_beta, ssm_out;
+        std::span<const float> ssm_a, ssm_dt_bias, ssm_conv_weight, ssm_norm;
         Matrix query;
         Matrix key;
         Matrix value;
@@ -234,6 +249,8 @@ private:
     // `all_logits` set, logits_ receives one row per token instead of only
     // the last token's.
     void eval_batch(std::span<const Token> tokens, bool all_logits);
+    void forward_recurrent(std::size_t layer, std::size_t n);  // Qwen3.5: a Gated DeltaNet layer's attention part
+    static constexpr std::size_t kMaxSsmState = 256;
     // out = x * m^T for `n` rows of x (stride m.cols); out has stride m.rows.
     void multiply(const Matrix& m, const float* x, std::size_t n, float* out);
     // Several matrices applied to the same x in one pass (one activation
@@ -259,6 +276,17 @@ private:
     std::vector<std::vector<std::uint16_t>> value_cache_;
     std::vector<std::vector<std::uint16_t>> conv_cache_;  // LFM2: per conv layer, b*x per position (the conv's state)
     std::vector<float> conv_;                     // [token][3 * embd]: the in_proj output
+    // Qwen3.5 recurrent layers: per layer the delta-rule state (v heads x state x
+    // state) and the conv's last ssm_conv - 1 inputs; a snapshot of both from just
+    // before the last token of the latest batch, so one token can be stepped back.
+    std::vector<std::vector<float>> ssm_state_, ssm_ring_;
+    struct Snapshot {
+        std::size_t position = 0;  // the position the states belong to (tokens before it are absorbed)
+        bool valid = false;
+        std::vector<std::vector<float>> state, ring;
+    } snapshot_;
+    std::vector<float> ssm_qkv_, ssm_z_, ssm_ab_, ssm_conv_out_, attention_gate_, query_gate_;
+    void reset_recurrent();
     std::vector<float> kv_staging_;  // this batch's new keys or values, [token][kv_dim], before copying in
 
     // Scratch, with one row per token of the current batch.

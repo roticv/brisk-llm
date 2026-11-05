@@ -59,7 +59,9 @@ MemoryEstimate estimate_memory(const GgufFile& file, const ModelConfig& c, bool 
     const std::size_t context = std::min<std::size_t>(max_context == 0 ? c.context_length : max_context, c.context_length);
     for (std::size_t l = 0; l < c.layer_count; ++l) {
         // The caches hold halves.
-        if (c.layer_is_conv(l)) {
+        if (c.layer_is_recurrent(l)) {  // the delta-rule state and the conv ring, plus the snapshot of both
+            e.cache += 2 * (std::size_t{c.ssm_v_heads} * c.ssm_state * c.ssm_state + (c.ssm_conv - 1) * c.ssm_qkv_dim()) * sizeof(float);
+        } else if (c.layer_is_conv(l)) {
             e.cache += context * c.embedding_dim * 2;
         } else if (c.kv_layer_of(l) == l) {
             e.cache += 2 * std::size_t{c.kv_head_count_of(l)} * c.head_dim_of(l) * context * 2;
@@ -76,6 +78,7 @@ MemoryEstimate estimate_memory(const GgufFile& file, const ModelConfig& c, bool 
         e.scratch += 64 * c.vocab_size * sizeof(float);              // logits for scored tokens
         if (c.ple_dim != 0) e.scratch += batch * std::size_t{c.ple_dim} * c.layer_count * sizeof(float) * 2;
         if (c.conv_taps != 0) e.scratch += batch * 3 * c.embedding_dim * sizeof(float);
+        if (c.architecture == Architecture::Qwen35) e.scratch += batch * (2 * c.ssm_qkv_dim() + c.ssm_inner + 4 * std::size_t{c.head_count} * c.head_dim) * sizeof(float);
     } else {
         // MetalSession: a batch of 512 tokens with float and half copies of the activations,
         // the batched attention's scores (float) and probabilities (half) for the batch over

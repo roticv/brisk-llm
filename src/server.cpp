@@ -212,6 +212,7 @@ struct Request {
     bool stream = false;
     bool echo_prompt_tokens = false;
     bool separate_reasoning = true;  // a <think> block goes to reasoning_content rather than inline in content
+    bool thinking_open = false;      // the prompt ends inside a <think> block the model continues (Qwen3.5)
     bool tools = false;              // the request offered tools: <tool_call> blocks (Qwen) are parsed into tool_calls
     std::vector<std::string> tool_names;  // a call is only a call when it names one of these
     bool hold_content = false;       // Llama 3 with tools: the whole answer may be a call, so content waits for the end
@@ -327,6 +328,7 @@ private:
             ChatOptions co;
             std::vector<ChatMessage> messages;
             text = render_chat_request(file_, body, messages, co);
+            r.thinking_open = text.ends_with("<think>\n");
             r.tools = !co.tools.empty();
             for (const std::string& t : co.tools) {
                 const json tj = json::parse(t);
@@ -384,6 +386,7 @@ private:
         // token is evaluated again.
         if (common == prompt.size()) --common;
         engine_->rollback(common);
+        common = engine_->position();  // a recurrent model may only be able to restart (Qwen3.5)
         cached_.assign(prompt.begin(), prompt.begin() + static_cast<std::ptrdiff_t>(common));
         reused = common;
         const std::span<const float> logits = engine_->eval(std::span<const Token>(prompt).subspan(common));
@@ -416,6 +419,29 @@ private:
             return true;
         };
         for (const std::string& c : g.calls) {
+            if (c.starts_with("<function=")) {  // Qwen3.5: <function=name>\n<parameter=k>\nv\n</parameter>...</function>
+                const std::size_t name_end = c.find('>');
+                json args = json::object();
+                std::size_t at = name_end == std::string::npos ? std::string::npos : name_end + 1;
+                while (at != std::string::npos) {
+                    const std::size_t p = c.find("<parameter=", at);
+                    if (p == std::string::npos) break;
+                    const std::size_t key_end = c.find('>', p);
+                    const std::size_t v_end = c.find("</parameter>", key_end);
+                    if (key_end == std::string::npos || v_end == std::string::npos) break;
+                    const std::string key = c.substr(p + 11, key_end - p - 11);
+                    std::string value = c.substr(key_end + 1, v_end - key_end - 1);
+                    if (value.starts_with("\n")) value.erase(0, 1);
+                    if (value.ends_with("\n")) value.pop_back();
+                    const json parsed = json::parse(value, nullptr, false);  // numbers, objects and arrays keep their type
+                    args[key] = parsed.is_discarded() || parsed.is_string() ? json(value) : parsed;
+                    at = v_end + 12;
+                }
+                if (name_end != std::string::npos &&
+                    add("{\"name\": " + json(c.substr(10, name_end - 10)).dump() + ", \"arguments\": " + args.dump() + "}", "arguments")) continue;
+                g.text += std::string(g.text.empty() ? "" : "\n") + "<tool_call>\n" + c + "\n</tool_call>";
+                continue;
+            }
             if (c.starts_with("call:")) {  // Gemma 4: call:name{key:<|"|>value<|"|>,...}
                 const std::size_t brace = c.find('{');
                 const std::string args = brace == std::string::npos ? "" : gemma4_arguments_to_json(std::string_view(c).substr(brace));
@@ -448,7 +474,7 @@ private:
         std::size_t longest_stop = 0;
         for (const std::string& s : r.stop) longest_stop = std::max(longest_stop, s.size());
         bool stopped_by_string = false;
-        bool reasoning = false;     // inside a <think> block (Qwen3, DeepSeek-R1: the tags are single tokens)
+        bool reasoning = r.separate_reasoning && r.thinking_open;  // inside a <think> block (the tags are single tokens)
         bool call = false;          // inside a <tool_call> block (Qwen: also single tokens)
         bool skip_newlines = false; // the newlines the templates put after the tags are dropped
         bool skip_channel_name = false;  // Gemma 4: "thought\n" after <|channel>

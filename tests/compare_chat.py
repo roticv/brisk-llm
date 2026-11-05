@@ -8,7 +8,7 @@ Known, deliberate differences: brisk refuses tools for a template that has no
 tool format (llama.cpp renders the conversation without them: SmolLM2, LFM2,
 Gemma 3, BitNet, Mistral v0.3, Phi-4-mini and DeepSeek-R1 files). Gemma 4
 thinks only when a request asks (its template's default; llama.cpp's engine
-defaults it on), so its requests carry enable_thinking explicitly."""
+defaults it on), so its requests carry enable_thinking explicitly; Qwen3.5 the same."""
 import json, subprocess, sys, tempfile
 from pathlib import Path
 
@@ -74,7 +74,7 @@ def main():
     ok = True
     models = sorted(p for p in (ROOT / "models").glob("*.gguf") if "draft" not in p.name)
     for model in models:
-        gemma4 = "gemma-4" in model.name
+        gemma4 = "gemma-4" in model.name or "Qwen3.5" in model.name  # thinking off unless asked (llama.cpp's engine defaults it on)
         for name, request in REQUESTS.items():
             request = dict(request)
             if gemma4 and "enable_thinking" not in request:

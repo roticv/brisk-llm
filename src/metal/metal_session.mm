@@ -959,7 +959,12 @@ struct MetalSession::Impl {
 };
 
 MetalSession::MetalSession(const Model& model, std::span<const std::byte> file, std::size_t max_context)
-    : impl_(std::make_unique<Impl>(model, file, max_context)) {}
+    : impl_(nullptr) {
+    if (model.config().architecture == Architecture::Qwen35) {
+        throw std::runtime_error("the GPU backend does not run Qwen3.5's DeltaNet layers yet; use the CPU");
+    }
+    impl_ = std::make_unique<Impl>(model, file, max_context);
+}
 
 MetalSession::~MetalSession() = default;
 

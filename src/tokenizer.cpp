@@ -284,7 +284,8 @@ std::vector<std::string_view> pretokenize(std::string_view text, PreTokenizer pr
         bool letter = false;
         bool number = false;
         bool whitespace = false;
-        bool other() const { return present && !letter && !number && !whitespace; }
+        bool mark = false;  // Qwen3.5: marks join letters and are not "other"
+        bool other() const { return present && !letter && !number && !whitespace && !mark; }
     };
 
     const std::vector<Codepoint> cps = decode_utf8(text);
@@ -298,7 +299,7 @@ std::vector<std::string_view> pretokenize(std::string_view text, PreTokenizer pr
     auto flags_at = [&](std::size_t pos) -> Flags {
         if (pos >= n) return {};
         const std::uint32_t cp = cp_at(pos);
-        return {true, is_letter(cp), is_number(cp), is_whitespace(cp)};
+        return {true, is_letter(cp), is_number(cp), is_whitespace(cp), pre == PreTokenizer::Qwen35 && is_mark(cp)};
     };
     auto is_newline = [](std::uint32_t cp) { return cp == '\r' || cp == '\n'; };
 
@@ -333,10 +334,11 @@ std::vector<std::string_view> pretokenize(std::string_view text, PreTokenizer pr
             }
         }
 
-        // [^\r\n\p{L}\p{N}]?\p{L}+
-        if (!is_newline(cp) && !flags.number && (flags.letter || flags_at(pos + 1).letter)) {
+        // [^\r\n\p{L}\p{N}]?\p{L}+ (Qwen3.5: [\p{L}\p{M}]+)
+        auto wordish = [](Flags f) { return f.letter || f.mark; };
+        if (!is_newline(cp) && !flags.number && (wordish(flags) || wordish(flags_at(pos + 1)))) {
             ++pos;
-            while (flags_at(pos).letter) ++pos;
+            while (wordish(flags_at(pos))) ++pos;
             emit(begin, pos);
             continue;
         }
@@ -409,6 +411,8 @@ Tokenizer::Tokenizer(const GgufFile& file) {
         pre_ = PreTokenizer::Llama3;
     } else if (pre == "smollm") {
         pre_ = PreTokenizer::SmolLM;
+    } else if (pre == "qwen35") {
+        pre_ = PreTokenizer::Qwen35;
     } else if (pre == "gpt-2") {
         pre_ = PreTokenizer::Gpt2;
     } else if (pre == "gpt-4o") {
