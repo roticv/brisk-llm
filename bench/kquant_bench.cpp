@@ -24,7 +24,8 @@ int main(int argc, char** argv) {
     std::vector<float> x(kTokens * cols);
     for (float& v : x) v = normal(rng);
 
-    for (const brisk::WeightFormat format : {brisk::WeightFormat::Q4_0, brisk::WeightFormat::Q4_K, brisk::WeightFormat::Q6_K}) {
+    for (const brisk::WeightFormat format : {brisk::WeightFormat::Q4_0, brisk::WeightFormat::Q5_0, brisk::WeightFormat::Q8_0,
+                                             brisk::WeightFormat::Q4_K, brisk::WeightFormat::Q6_K}) {
         const std::size_t blocks = cols / brisk::block_elements(format);
         std::vector<std::uint8_t> w(rows * blocks * brisk::block_bytes(format));
         for (std::uint8_t& b : w) b = static_cast<std::uint8_t>(rng());
@@ -56,7 +57,9 @@ int main(int argc, char** argv) {
                 ++reps;
             }
             const double macs = static_cast<double>(rows) * cols * kTokens * reps;
-            std::printf("%-5s %-8.*s batched %5.2f GMAC/s\n", format == brisk::WeightFormat::Q4_0 ? "Q4_0" : format == brisk::WeightFormat::Q4_K ? "Q4_K" : "Q6_K",
+            const char* const name = format == brisk::WeightFormat::Q4_0 ? "Q4_0" : format == brisk::WeightFormat::Q5_0 ? "Q5_0"
+                                   : format == brisk::WeightFormat::Q8_0 ? "Q8_0" : format == brisk::WeightFormat::Q4_K ? "Q4_K" : "Q6_K";
+            std::printf("%-5s %-8.*s batched %5.2f GMAC/s\n", name,
                         static_cast<int>(nk.name.size()), nk.name.data(), macs / seconds(start) / 1e9);
         }
     }

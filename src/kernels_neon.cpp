@@ -23,16 +23,15 @@ inline int32x4_t dot_block(int8x16_t w_low, int8x16_t w_high, const BlockQ8_0& x
     return vpaddlq_s16(p);
 }
 
-// For 8-bit weights the 16-bit lanes would overflow (4 * 127 * 127), so each
-// 16-product partial is widened to 32 bits before the next is added.
+// For 8-bit weights four products per 16-bit lane would overflow (4 * 127 * 127),
+// but two fit (2 * 127 * 127 = 32258; weights and activations are both within
+// +-127), so the block is two pairwise accumulations widened once each.
 inline int32x4_t dot_block_wide(int8x16_t w_low, int8x16_t w_high, const BlockQ8_0& x) {
     const int8x16_t x_low = vld1q_s8(x.qs);
     const int8x16_t x_high = vld1q_s8(x.qs + 16);
-    int32x4_t acc = vpaddlq_s16(vmull_s8(vget_low_s8(w_low), vget_low_s8(x_low)));
-    acc = vpadalq_s16(acc, vmull_s8(vget_high_s8(w_low), vget_high_s8(x_low)));
-    acc = vpadalq_s16(acc, vmull_s8(vget_low_s8(w_high), vget_low_s8(x_high)));
-    acc = vpadalq_s16(acc, vmull_s8(vget_high_s8(w_high), vget_high_s8(x_high)));
-    return acc;
+    const int16x8_t p0 = vmlal_s8(vmull_s8(vget_low_s8(w_low), vget_low_s8(x_low)), vget_high_s8(w_low), vget_high_s8(x_low));
+    const int16x8_t p1 = vmlal_s8(vmull_s8(vget_low_s8(w_high), vget_low_s8(x_high)), vget_high_s8(w_high), vget_high_s8(x_high));
+    return vpadalq_s16(vpaddlq_s16(p0), p1);
 }
 
 inline int32x4_t dot16(int8x16_t w, int8x16_t x) {
