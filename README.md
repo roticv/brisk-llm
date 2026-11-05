@@ -1,6 +1,6 @@
 # brisk-llm
 
-A small LLM inference engine in C++20, built for two machines: a MacBook Air M4 (CPU and Metal GPU) and a Raspberry Pi 4. It runs Qwen3, Qwen3.5 (CPU), Qwen2.5, Llama 3.x, Gemma 3, Gemma 4, Phi-4-mini, LFM2, SmolLM3 and BitNet b1.58 models from GGUF files and aims to match or beat llama.cpp on them. `ROADMAP.md` has the plan and where it stands; `bench/RESULTS.md` has the measurements.
+A small LLM inference engine in C++20, built for two machines: a MacBook Air M4 (CPU and Metal GPU) and a Raspberry Pi 4. It runs Qwen3, Qwen3.5, Qwen2.5, Llama 3.x, Gemma 3, Gemma 4, Phi-4-mini, LFM2, SmolLM3 and BitNet b1.58 models from GGUF files and aims to match or beat llama.cpp on them. `ROADMAP.md` has the plan and where it stands; `bench/RESULTS.md` has the measurements.
 
 ## What it does
 
@@ -9,7 +9,7 @@ A small LLM inference engine in C++20, built for two machines: a MacBook Air M4 
 - NEON kernels in three variants (baseline for the Cortex-A72, `dotprod`, `i8mm`/`smmla`), chosen at startup; batched prompt processing with banded, multi-token kernels for every format; a half-precision K/V cache; a thread pool that hands out work dynamically so efficiency cores help.
 - Metal backend (`--gpu`) for all of the above formats on Apple silicon: weights used in place from the memory map, K/V cache on the GPU, simdgroup-matrix kernels for prompts, one command buffer per batch; shaders compiled at startup, so no Metal toolchain is needed.
 - An OpenAI-compatible server (`brisk serve`), a memory preflight that refuses a model that would swap, and `brisk pull` for the verified model files.
-- Models: Qwen3 (0.6B, 1.7B), Qwen2.5 (1.5B) and the DeepSeek-R1-Distill-Qwen 1.5B, Llama 3.2 (1B, 3B), Mistral 7B v0.3, SmolLM2 1.7B, Gemma 3 (1B, stock Q4_K_M and pure Q4_0 files), Gemma 4 (E2B, E4B, 12B), Phi-4-mini, LFM2 (1.2B), SmolLM3 3B, Qwen3.5 0.8B (CPU only so far: its Gated DeltaNet layers have no Metal kernels yet) and BitNet b1.58 2B4T — each checked against llama.cpp (tokenizer identical on the test corpus, perplexity, chat template) and pinned. Tokenizers: the Qwen, Llama 3, GPT-2/SmolLM and GPT-4o byte-level BPEs, the Llama/Mistral and Gemma 3 SentencePiece ones, Gemma 4's character BPE. `--chat` and the server apply each file's turn format.
+- Models: Qwen3 (0.6B, 1.7B), Qwen2.5 (1.5B) and the DeepSeek-R1-Distill-Qwen 1.5B, Llama 3.2 (1B, 3B), Mistral 7B v0.3, SmolLM2 1.7B, Gemma 3 (1B, stock Q4_K_M and pure Q4_0 files), Gemma 4 (E2B, E4B, 12B), Phi-4-mini, LFM2 (1.2B), SmolLM3 3B, Qwen3.5 0.8B and BitNet b1.58 2B4T — each checked against llama.cpp (tokenizer identical on the test corpus, perplexity, chat template) and pinned. Tokenizers: the Qwen, Llama 3, GPT-2/SmolLM and GPT-4o byte-level BPEs, the Llama/Mistral and Gemma 3 SentencePiece ones, Gemma 4's character BPE. `--chat` and the server apply each file's turn format.
 - Greedy and temperature/top-k/top-p sampling; speculative decoding with lookup (n-gram) or model drafting, exact with respect to greedy decoding.
 
 ## Build

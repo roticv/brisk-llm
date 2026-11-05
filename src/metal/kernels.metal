@@ -245,6 +245,160 @@ kernel void shortconv(device const float* in [[buffer(0)]],
     if (p.write_half) out_half[i] = half(v);
 }
 
+// ---- Qwen3.5 Gated DeltaNet ---------------------------------------------------
+//
+// The conv over the fused q|k|v projection: out[t][ch] = silu(sum_k w[ch][k] *
+// in(t - taps + 1 + k)[ch]); inputs before the batch come from the ring of the
+// last taps - 1 inputs.
+struct GdnConvParams {
+    uint n, dim, taps;
+};
+
+kernel void gdn_conv(device const float* in [[buffer(0)]],
+                     device const float* w [[buffer(1)]],
+                     device const float* ring [[buffer(2)]],
+                     device float* out [[buffer(3)]],
+                     constant GdnConvParams& p [[buffer(4)]],
+                     uint i [[thread_position_in_grid]]) {
+    if (i >= p.n * p.dim) return;
+    const uint t = i / p.dim, ch = i % p.dim;
+    float sum = 0.0f;
+    for (uint k = 0; k < p.taps; ++k) {
+        const int tt = int(t) - int(p.taps - 1) + int(k);
+        const float v = tt >= 0 ? in[uint(tt) * p.dim + ch] : ring[uint(tt + int(p.taps - 1)) * p.dim + ch];
+        sum += w[ch * p.taps + k] * v;
+    }
+    out[i] = sum / (1.0f + exp(-sum));
+}
+
+// The ring after the batch (the last taps - 1 inputs) and the snapshot ring
+// from before the batch's last token, both written fresh (the old ring is read).
+kernel void gdn_ring(device const float* in [[buffer(0)]],
+                     device const float* ring_old [[buffer(1)]],
+                     device float* ring_new [[buffer(2)]],
+                     device float* ring_snap [[buffer(3)]],
+                     constant GdnConvParams& p [[buffer(4)]],
+                     uint i [[thread_position_in_grid]]) {
+    const uint keep = p.taps - 1;
+    if (i >= keep * p.dim) return;
+    const uint r = i / p.dim, ch = i % p.dim;
+    auto input = [&](int tt) -> float {
+        return tt >= 0 ? in[uint(tt) * p.dim + ch] : ring_old[uint(tt + int(keep)) * p.dim + ch];
+    };
+    ring_new[i] = input(int(p.n) - int(keep) + int(r));
+    ring_snap[i] = input(int(p.n) - 1 - int(keep) + int(r));
+}
+
+// One threadgroup per head, dim threads (thread j owns value row j of the
+// state, stored key-major S[i][j] so a step's reads coalesce), looping over the
+// batch's tokens: q and k L2-normalised, S = exp(g) S + k (v - S k)^T beta,
+// o = S q, then the gated RMS norm. The state before the last token is copied
+// to the snapshot for a one-token rollback.
+struct GdnStepParams {
+    uint n, qkv_dim, inner, heads, dim, k_off, v_off;
+    float eps, q_scale;
+};
+
+kernel void gdn_step(device const float* conv [[buffer(0)]],
+                     device const float* z [[buffer(1)]],
+                     device const float* alpha [[buffer(2)]],
+                     device const float* beta [[buffer(3)]],
+                     device const float* A [[buffer(4)]],
+                     device const float* dt_bias [[buffer(5)]],
+                     device const float* norm_w [[buffer(6)]],
+                     device float* state [[buffer(7)]],
+                     device float* snap [[buffer(8)]],
+                     device float* out [[buffer(9)]],
+                     device half* out_h [[buffer(10)]],
+                     constant GdnStepParams& p [[buffer(11)]],
+                     uint h [[threadgroup_position_in_grid]],
+                     uint j [[thread_index_in_threadgroup]],
+                     uint lane [[thread_index_in_simdgroup]],
+                     uint sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float q[256], k[256], v[256], red[3 * 8];
+    const uint dim = p.dim, groups = (dim + 31) / 32;
+    device float* S = state + h * dim * dim;
+    auto reduce = [&](float x, uint slot) -> float {  // the threadgroup's sum of x
+        x = simd_sum(x);
+        if (lane == 0) red[slot * 8 + sg] = x;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float total = 0.0f;
+        for (uint g = 0; g < groups; ++g) total += red[slot * 8 + g];
+        return total;
+    };
+    for (uint t = 0; t < p.n; ++t) {
+        device const float* row = conv + t * p.qkv_dim;
+        q[j] = row[h * dim + j];
+        k[j] = row[p.k_off + h * dim + j];
+        v[j] = row[p.v_off + h * dim + j];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const float qq = reduce(q[j] * q[j], 0), kk = reduce(k[j] * k[j], 1);
+        const float qs = p.q_scale * rsqrt(qq + p.eps), ks = rsqrt(kk + p.eps);
+        threadgroup_barrier(mem_flags::mem_threadgroup);  // every thread has read red before it is reused
+        q[j] *= qs;
+        k[j] *= ks;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const float a = alpha[t * p.heads + h] + dt_bias[h];
+        const float softplus = a > 20.0f ? a : log(1.0f + exp(a));
+        const float decay = exp(softplus * A[h]);
+        const float b = 1.0f / (1.0f + exp(-beta[t * p.heads + h]));
+        if (t + 1 == p.n) {
+            device float* Ss = snap + h * dim * dim;
+            for (uint i = 0; i < dim; ++i) Ss[i * dim + j] = S[i * dim + j];
+        }
+        float sk = 0.0f;
+        for (uint i = 0; i < dim; ++i) {
+            const float s = S[i * dim + j] * decay;
+            S[i * dim + j] = s;
+            sk += s * k[i];
+        }
+        const float d = (v[j] - sk) * b;
+        float o = 0.0f;
+        for (uint i = 0; i < dim; ++i) {
+            const float s = S[i * dim + j] + k[i] * d;
+            S[i * dim + j] = s;
+            o += s * q[i];
+        }
+        const float oo = reduce(o * o, 2);
+        const float rms = rsqrt(oo / float(dim) + p.eps);
+        const float zz = z[t * p.inner + h * dim + j];
+        const float val = o * rms * norm_w[j] * (zz / (1.0f + exp(-zz)));
+        out[t * p.inner + h * dim + j] = val;
+        out_h[t * p.inner + h * dim + j] = half(val);
+        threadgroup_barrier(mem_flags::mem_threadgroup);  // before the next token's q/k/v loads
+    }
+}
+
+// Qwen3.5's gated attention: the query projection gives each head's query
+// then its gate; the attention output is multiplied by the gate's sigmoid.
+struct GateParams {
+    uint n, heads, head_dim;
+};
+
+kernel void split_qgate(device const float* qg [[buffer(0)]],
+                        device float* q [[buffer(1)]],
+                        device float* gate [[buffer(2)]],
+                        constant GateParams& p [[buffer(3)]],
+                        uint i [[thread_position_in_grid]]) {
+    const uint qdim = p.heads * p.head_dim;
+    if (i >= p.n * qdim) return;
+    const uint t = i / qdim, r = i % qdim, h = r / p.head_dim, d = r % p.head_dim;
+    device const float* src = qg + t * 2 * qdim + h * 2 * p.head_dim;
+    q[i] = src[d];
+    gate[i] = src[p.head_dim + d];
+}
+
+kernel void sigmoid_mul(device float* a [[buffer(0)]],
+                        device const float* g [[buffer(1)]],
+                        device half* a_h [[buffer(2)]],
+                        constant uint& count [[buffer(3)]],
+                        uint i [[thread_position_in_grid]]) {
+    if (i >= count) return;
+    const float v = a[i] / (1.0f + exp(-g[i]));
+    a[i] = v;
+    a_h[i] = half(v);
+}
+
 // Gemma 4's per-layer embedding inputs: ple[l][t][d] = (proj[t][l][d] + table[t][l][d] * table_scale) / sqrt(2),
 // where proj has already been scaled and normalised per layer slice.
 struct PleParams {

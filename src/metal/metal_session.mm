@@ -59,6 +59,16 @@ struct PleParams {
     uint32_t n, layers, dim;
     float table_scale;
 };
+struct GdnConvParams {
+    uint32_t n, dim, taps;
+};
+struct GdnStepParams {
+    uint32_t n, qkv_dim, inner, heads, dim, k_off, v_off;
+    float eps, q_scale;
+};
+struct GateParams {
+    uint32_t n, heads, head_dim;
+};
 struct ConvParams {
     uint32_t n, dim, taps, position0, write_half;
 };
@@ -125,6 +135,7 @@ struct MetalSession::Impl {
     id<MTLCommandQueue> queue = nil;
     id<MTLComputePipelineState> embed = nil, embed_q4k = nil, embed_q5k = nil, embed_q6k = nil, embed_q41 = nil, embed_q50 = nil,
                                 embed_q80 = nil, rms_norm = nil, matmul_kq = nil, ple_combine = nil, to_half = nil, softcap = nil, shortconv = nil,
+                                gdn_conv = nil, gdn_ring = nil, gdn_step = nil, split_qgate = nil, sigmoid_mul = nil,
                                 attention_by_kind[2] = {nil, nil}, attention_small_by_kind[2] = {nil, nil}, matmul = nil, matmul_tq2 = nil, matmul_q4k = nil,
                                 matmul_q6k = nil, matmul_q41 = nil, matmul_mm = nil, matmul_mm_tq2 = nil,
                                 matmul_mm_q4k = nil, matmul_mm_q5k = nil, matmul_mm_q6k = nil, matmul_mm_q41 = nil, matmul_mm_q50 = nil,
@@ -142,6 +153,9 @@ struct MetalSession::Impl {
     }
     id<MTLBuffer> ple_proj_out = nil, ple_table_out = nil, ple_in = nil, ple_gate_out = nil, ple_gate_h = nil, x_h = nil;  // Gemma 4
     id<MTLBuffer> conv_buf = nil;  // LFM2: [token][3 * embd] from in_proj
+    id<MTLBuffer> qkv_buf = nil, qkv_conv = nil, z_buf = nil, alpha_buf = nil, beta_buf = nil, qgate = nil, agate = nil;  // Qwen3.5
+    std::size_t snap_position = 0;  // Qwen3.5: the position the snapshots belong to
+    bool snap_valid = false;
     bool tiles_fit = false;  // every matrix has rows and columns in multiples of 64, as the tiled kernel needs
 
     id<MTLBuffer> weights = nil;  // the whole mapped file, no copy
@@ -153,6 +167,11 @@ struct MetalSession::Impl {
         Buf ple_gate, ple_proj, ple_post_norm;  // Gemma 4
         Buf conv_in, conv_out, conv_w;          // LFM2 short-convolution layers
         id<MTLBuffer> conv_cache = nil;         // [max_context][embd] of b*x
+        // Qwen3.5 Gated DeltaNet layers: projections, the small per-head vectors, the
+        // state (heads x dim x dim, key-major), the conv ring (taps - 1 inputs) and
+        // the snapshots of both from before the latest batch's last token.
+        Buf ssm_qkv, ssm_gate, ssm_alpha, ssm_beta, ssm_out, ssm_a, ssm_dt, ssm_conv_w, ssm_norm;
+        id<MTLBuffer> ssm_state = nil, ssm_ring = nil, ssm_ring_next = nil, ssm_state_snap = nil, ssm_ring_snap = nil;
         float out_scale = 1.0f;
         std::size_t cache_offset = 0;  // byte offset of this layer's (or its shared source's) K/V cache
         bool own_kv = true;
@@ -237,6 +256,11 @@ struct MetalSession::Impl {
         ple_combine = pipeline("ple_combine");
         to_half = pipeline("to_half");
         shortconv = pipeline("shortconv");
+        gdn_conv = pipeline("gdn_conv");
+        gdn_ring = pipeline("gdn_ring");
+        gdn_step = pipeline("gdn_step");
+        split_qgate = pipeline("split_qgate");
+        sigmoid_mul = pipeline("sigmoid_mul");
         softcap = pipeline("softcap");
         attention_combine = pipeline("attention_combine");
     }
@@ -285,6 +309,24 @@ struct MetalSession::Impl {
             Layer g;
             g.own_kv = c.kv_layer_of(li) == li;
             g.attn_norm = floats(l.attention_norm);
+            if (c.layer_is_recurrent(li)) {
+                g.ssm_qkv = matrix(l.ssm_qkv, "attn_qkv");
+                g.ssm_gate = matrix(l.ssm_gate, "attn_gate");
+                g.ssm_alpha = matrix(l.ssm_alpha, "ssm_alpha");
+                g.ssm_beta = matrix(l.ssm_beta, "ssm_beta");
+                g.ssm_out = matrix(l.ssm_out, "ssm_out");
+                g.ssm_a = floats(l.ssm_a);
+                g.ssm_dt = floats(l.ssm_dt_bias);
+                g.ssm_conv_w = floats(l.ssm_conv_weight);
+                g.ssm_norm = floats(l.ssm_norm);
+                g.ffn_norm = floats(l.feed_forward_norm);
+                g.gate = matrix(l.gate, "ffn_gate");
+                g.up = matrix(l.up, "ffn_up");
+                g.down = matrix(l.down, "ffn_down");
+                g.own_kv = false;
+                layers.push_back(g);
+                continue;
+            }
             if (c.layer_is_conv(li)) {
                 g.conv_in = matrix(l.conv_in, "shortconv.in_proj");
                 g.conv_out = matrix(l.conv_out, "shortconv.out_proj");
@@ -368,6 +410,28 @@ struct MetalSession::Impl {
         const std::size_t embd = c.embedding_dim, qdim = std::size_t{c.head_count} * c.head_dim,
                           kvdim = std::size_t{c.kv_head_count} * c.head_dim, ff = c.feed_forward_dim;
         tokens = make(kMaxBatch * sizeof(int32_t));
+        if (c.architecture == Architecture::Qwen35) {
+            const std::size_t qkv_dim = c.ssm_qkv_dim();
+            qkv_buf = make(kMaxBatch * qkv_dim * 4);
+            qkv_conv = make(kMaxBatch * qkv_dim * 4);
+            z_buf = make(kMaxBatch * c.ssm_inner * 4);
+            alpha_buf = make(kMaxBatch * c.ssm_v_heads * 4);
+            beta_buf = make(kMaxBatch * c.ssm_v_heads * 4);
+            qgate = make(kMaxBatch * 2 * qdim * 4);
+            agate = make(kMaxBatch * qdim * 4);
+            for (std::size_t l = 0; l < layers.size(); ++l) {
+                if (!c.layer_is_recurrent(l)) continue;
+                const std::size_t state_bytes = std::size_t{c.ssm_v_heads} * c.ssm_state * c.ssm_state * 4;
+                const std::size_t ring_bytes = (c.ssm_conv - 1) * qkv_dim * 4;
+                layers[l].ssm_state = make(state_bytes);
+                layers[l].ssm_state_snap = make(state_bytes);
+                layers[l].ssm_ring = make(ring_bytes);
+                layers[l].ssm_ring_next = make(ring_bytes);
+                layers[l].ssm_ring_snap = make(ring_bytes);
+                std::memset(layers[l].ssm_state.contents, 0, state_bytes);
+                std::memset(layers[l].ssm_ring.contents, 0, ring_bytes);
+            }
+        }
         if (c.conv_taps != 0) {
             conv_buf = make(kMaxBatch * 3 * embd * 4);
             for (std::size_t l = 0; l < layers.size(); ++l) {
@@ -388,13 +452,15 @@ struct MetalSession::Impl {
         q = make(kMaxBatch * qdim * 4);
         k_stage = make(kMaxBatch * kvdim * 4);
         v_stage = make(kMaxBatch * kvdim * 4);
-        attended = make(kMaxBatch * qdim * 4);
+        const std::size_t attended_width = std::max<std::size_t>(qdim, c.ssm_inner);  // Qwen3.5's DeltaNet output shares it
+        attended = make(kMaxBatch * attended_width * 4);
         gate = make(kMaxBatch * ff * 4);
         proj = make(kMaxBatch * embd * 4);  // projections that a post-norm reads before the residual add (Gemma)
         normed_h = make(kMaxBatch * embd * 2);
-        attended_h = make(kMaxBatch * qdim * 2);
+        attended_h = make(kMaxBatch * attended_width * 2);
         gate_h = make(kMaxBatch * ff * 2);
-        tiles_fit = embd % 64 == 0 && qdim % 64 == 0 && kvdim % 64 == 0 && ff % 64 == 0 && c.vocab_size % 64 == 0;
+        tiles_fit = embd % 64 == 0 && qdim % 64 == 0 && kvdim % 64 == 0 && ff % 64 == 0 && c.vocab_size % 64 == 0 &&
+                    (c.architecture != Architecture::Qwen35 || (c.ssm_qkv_dim() % 64 == 0 && c.ssm_inner % 64 == 0));
         if (c.head_dim > 512 || c.head_dim % 8 != 0) fail("attention kernel supports head_dim <= 512, a multiple of 8");
         // The batched kernel holds 16 query rows (8 at 512 wide): a threadgroup takes
         // as many of a kv head's query heads as fit (several threadgroups per kv head
@@ -477,13 +543,15 @@ struct MetalSession::Impl {
         }
     }
 
+    // In a batch the norm writes the half copy the tiled matmuls read; with
+    // `force_float` it writes the float rows instead (for a gemv that reads them).
     void encode_norm(id<MTLComputeCommandEncoder> enc, id<MTLBuffer> in, const Buf& w, Act out, std::size_t rows,
-                     std::size_t dim, NSUInteger in_offset = 0, NSUInteger out_offset = 0) {
+                     std::size_t dim, NSUInteger in_offset = 0, NSUInteger out_offset = 0, bool force_float = false) {
         [enc setComputePipelineState:rms_norm];
         [enc setBuffer:in offset:in_offset atIndex:0];
         set(enc, w, 1);
         [enc setBuffer:out.f offset:out_offset atIndex:2];
-        const NormParams p{static_cast<uint32_t>(dim), model.config().rms_epsilon, tiled(rows) ? 1u : 0u, 0, 0, 1.0f, 0};
+        const NormParams p{static_cast<uint32_t>(dim), model.config().rms_epsilon, tiled(rows) && !force_float ? 1u : 0u, 0, 0, 1.0f, 0};
         bytes(enc, p, 3);
         [enc setBuffer:out.h offset:out_offset / 2 atIndex:4];
         [enc setBuffer:out.f offset:0 atIndex:5];
@@ -564,8 +632,9 @@ struct MetalSession::Impl {
 
     // `aux` is the epilogue's second operand (a residual or a gate), read at `aux_offset` bytes.
     void encode_matmul(id<MTLComputeCommandEncoder> enc, std::initializer_list<Target> targets, std::size_t cols,
-                       Act in, std::size_t n, Mode mode = kStore, id<MTLBuffer> aux = nil, std::size_t aux_offset = 0) {
-        if (tiled(n)) {
+                       Act in, std::size_t n, Mode mode = kStore, id<MTLBuffer> aux = nil, std::size_t aux_offset = 0,
+                       bool force_gemv = false) {
+        if (tiled(n) && !force_gemv) {
             for (const Target& t : targets) {
                 [enc setComputePipelineState:tile_for(t.w->format)];
                 set(enc, *t.w, 0);
@@ -713,6 +782,64 @@ struct MetalSession::Impl {
             bool next_prenormed = false;  // the previous layer's fused post-norm already wrote this layer's pre-norm
             for (std::size_t l = 0; l < std::min(layers.size(), layer_cap); ++l) {
                 const Layer& g = layers[l];
+                if (g.ssm_state != nil) {
+                    // Qwen3.5 Gated DeltaNet layer: norm; the q|k|v, gate, alpha and beta projections;
+                    // the conv (and the ring for the next batch); the per-head recurrence with its
+                    // gated norm; the output projection into the residual; then the FFN.
+                    const std::size_t ff_l = c.ff_dim_of(l), qkv_dim = c.ssm_qkv_dim();
+                    const std::size_t heads = c.ssm_v_heads, dim = c.ssm_state;
+                    // The 16-row alpha/beta projections take the gemv, which reads the float norm; the
+                    // tiled projections read its half copy, so in a batch both are written.
+                    encode_norm(enc, x, g.attn_norm, normed_a, n, embd);
+                    if (tiled(n)) encode_norm(enc, x, g.attn_norm, normed_a, n, embd, 0, 0, true);
+                    encode_matmul(enc, {Target{&g.ssm_qkv, qkv_dim, Act{qkv_buf, nil}}, Target{&g.ssm_gate, c.ssm_inner, Act{z_buf, nil}}},
+                                  embd, normed_a, n);
+                    encode_matmul(enc, {Target{&g.ssm_alpha, heads, Act{alpha_buf, nil}}, Target{&g.ssm_beta, heads, Act{beta_buf, nil}}},
+                                  embd, normed_a, n, kStore, nil, 0, true);  // 16 rows: no tile
+                    checkpoint("matmul");
+                    const GdnConvParams cp{static_cast<uint32_t>(n), static_cast<uint32_t>(qkv_dim), c.ssm_conv};
+                    [enc setComputePipelineState:gdn_conv];
+                    set(enc, qkv_buf, 0);
+                    set(enc, g.ssm_conv_w, 1);
+                    set(enc, g.ssm_ring, 2);
+                    set(enc, qkv_conv, 3);
+                    bytes(enc, cp, 4);
+                    [enc dispatchThreads:MTLSizeMake(n * qkv_dim, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                    [enc setComputePipelineState:gdn_ring];
+                    set(enc, qkv_buf, 0);
+                    set(enc, g.ssm_ring, 1);
+                    set(enc, g.ssm_ring_next, 2);
+                    set(enc, g.ssm_ring_snap, 3);
+                    bytes(enc, cp, 4);
+                    [enc dispatchThreads:MTLSizeMake((c.ssm_conv - 1) * qkv_dim, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                    const GdnStepParams sp{static_cast<uint32_t>(n), static_cast<uint32_t>(qkv_dim), c.ssm_inner,
+                                           static_cast<uint32_t>(heads), static_cast<uint32_t>(dim),
+                                           static_cast<uint32_t>(std::size_t{c.ssm_k_heads} * dim), static_cast<uint32_t>(2 * std::size_t{c.ssm_k_heads} * dim),
+                                           c.rms_epsilon, 1.0f / std::sqrt(static_cast<float>(dim))};
+                    [enc setComputePipelineState:gdn_step];
+                    set(enc, qkv_conv, 0);
+                    set(enc, z_buf, 1);
+                    set(enc, alpha_buf, 2);
+                    set(enc, beta_buf, 3);
+                    set(enc, g.ssm_a, 4);
+                    set(enc, g.ssm_dt, 5);
+                    set(enc, g.ssm_norm, 6);
+                    set(enc, g.ssm_state, 7);
+                    set(enc, g.ssm_state_snap, 8);
+                    set(enc, attended, 9);
+                    set(enc, attended_h, 10);
+                    bytes(enc, sp, 11);
+                    [enc dispatchThreadgroups:MTLSizeMake(heads, 1, 1) threadsPerThreadgroup:MTLSizeMake(dim, 1, 1)];
+                    checkpoint("attention");
+                    encode_matmul(enc, {Target{&g.ssm_out, embd, x_a}}, c.ssm_inner, attended_a, n, kResidual, x);
+                    encode_norm(enc, x, g.ffn_norm, normed_a, n, embd);
+                    checkpoint("matmul_o");
+                    encode_gated(enc, g.gate, g.up, ff_l, embd, normed_a, n, kSiluMul, gate_a);
+                    checkpoint("matmul_gateup");
+                    encode_matmul(enc, {Target{&g.down, embd, x_a}}, ff_l, gate_a, n, kResidual, x);
+                    checkpoint("matmul_down");
+                    continue;
+                }
                 if (g.conv_in.buffer != nil) {
                     // LFM2 short-convolution layer: norm, in_proj, the conv, out_proj into the residual.
                     const std::size_t ff_l = c.ff_dim_of(l);
@@ -749,7 +876,18 @@ struct MetalSession::Impl {
                 if (!next_prenormed) encode_norm(enc, x, g.attn_norm, normed_a, n, embd);
                 next_prenormed = false;
                 checkpoint("norm");
-                if (g.own_kv) {
+                if (c.attention_gate) {
+                    // Qwen3.5: the query projection's rows alternate a head's query and its gate.
+                    encode_matmul(enc, {Target{&g.q, 2 * qdim, Act{qgate, nil}}, Target{&g.k, kvdim, k_a}, Target{&g.v, kvdim, v_a}},
+                                  embd, normed_a, n);
+                    const GateParams gp{static_cast<uint32_t>(n), c.head_count, static_cast<uint32_t>(head_dim)};
+                    [enc setComputePipelineState:split_qgate];
+                    set(enc, qgate, 0);
+                    set(enc, q, 1);
+                    set(enc, agate, 2);
+                    bytes(enc, gp, 3);
+                    [enc dispatchThreads:MTLSizeMake(n * qdim, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                } else if (g.own_kv) {
                     encode_matmul(enc, {Target{&g.q, qdim, q_a}, Target{&g.k, kvdim, k_a}, Target{&g.v, kvdim, v_a}}, embd,
                                   normed_a, n);
                 } else {
@@ -844,6 +982,15 @@ struct MetalSession::Impl {
                 checkpoint("attention");
 
                 if (bitnet) encode_norm(enc, attended, g.attn_sub_norm, attended_a, n, qdim);
+                if (c.attention_gate) {
+                    const uint32_t count = static_cast<uint32_t>(n * qdim);
+                    [enc setComputePipelineState:sigmoid_mul];
+                    set(enc, attended, 0);
+                    set(enc, agate, 1);
+                    set(enc, attended_h, 2);
+                    bytes(enc, count, 3);
+                    [enc dispatchThreads:MTLSizeMake(n * qdim, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                }
                 checkpoint("norm");
                 if (g.attn_post_norm.buffer != nil) {
                     // Gemma: x += post_norm(o(attended)), then the FFN's pre-norm in the same pass.
@@ -954,17 +1101,19 @@ struct MetalSession::Impl {
         const std::size_t count = (all_logits ? n : 1) * c.vocab_size;
         logits_out.resize(count);
         std::memcpy(logits_out.data(), logits.contents, count * sizeof(float));
+        if (c.architecture == Architecture::Qwen35) {
+            for (Layer& g : layers) {
+                if (g.ssm_state != nil) std::swap(g.ssm_ring, g.ssm_ring_next);  // the ring the conv wrote for the next batch
+            }
+            snap_position = position + n - 1;
+            snap_valid = true;
+        }
         position += n;
     }
 };
 
 MetalSession::MetalSession(const Model& model, std::span<const std::byte> file, std::size_t max_context)
-    : impl_(nullptr) {
-    if (model.config().architecture == Architecture::Qwen35) {
-        throw std::runtime_error("the GPU backend does not run Qwen3.5's DeltaNet layers yet; use the CPU");
-    }
-    impl_ = std::make_unique<Impl>(model, file, max_context);
-}
+    : impl_(std::make_unique<Impl>(model, file, max_context)) {}
 
 MetalSession::~MetalSession() = default;
 
@@ -994,6 +1143,23 @@ std::span<const float> MetalSession::eval_all(std::span<const Token> tokens) {
 
 void MetalSession::rollback(std::size_t position) {
     if (position > impl_->position) fail("cannot roll forward");
+    const ModelConfig& c = impl_->model.config();
+    if (c.architecture == Architecture::Qwen35 && position != impl_->position) {
+        // As on the CPU: step back one token from the snapshots, or start over.
+        const bool restore = impl_->snap_valid && impl_->snap_position == position;
+        for (auto& g : impl_->layers) {
+            if (g.ssm_state == nil) continue;
+            if (restore) {
+                std::memcpy(g.ssm_state.contents, g.ssm_state_snap.contents, g.ssm_state.length);
+                std::memcpy(g.ssm_ring.contents, g.ssm_ring_snap.contents, g.ssm_ring.length);
+            } else {
+                std::memset(g.ssm_state.contents, 0, g.ssm_state.length);
+                std::memset(g.ssm_ring.contents, 0, g.ssm_ring.length);
+            }
+        }
+        impl_->snap_valid = false;
+        if (!restore) position = 0;
+    }
     impl_->position = position;
 }
 

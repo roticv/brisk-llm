@@ -133,10 +133,12 @@ int main() {
     ok &= check(WeightFormat::Q4_0, 128, 2048, 64, true);
     ok &= check(WeightFormat::Q4_0, 256, 1024, 100, true);
     ok &= check(WeightFormat::Q4_0, 384, 96, 130, true);
+    ok &= check(WeightFormat::Q4_0, 130, 1280, 100, false);
     for (const WeightFormat f : {WeightFormat::Q4_1, WeightFormat::Q5_0, WeightFormat::Q8_0, WeightFormat::Q4_K, WeightFormat::Q5_K, WeightFormat::Q6_K}) {
         const std::size_t cols = (f == WeightFormat::Q4_1 || f == WeightFormat::Q5_0 || f == WeightFormat::Q8_0) ? 1056 : 1280;
         ok &= check(f, 66, cols, 1, false);
         ok &= check(f, 130, cols, 3, false);
+        ok &= check(f, 16, cols, 100, false);  // the gemv at a batch size the tile would normally take (Qwen3.5's 16-row projections)
         ok &= check(f, 128, cols, 70, true);
     }
     std::printf("metal_test: %s\n", ok ? "ok" : "FAILED");
